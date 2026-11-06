@@ -8,7 +8,9 @@
 //! `--demo` opens the demo project instead (also Help ▸ Open Demo Project).
 //!
 //! `--control <port>` (or `EFFECTCRAFT_CONTROL_PORT`) starts a localhost JSON-lines control server;
-//! see `effectcraft_ui_egui::control` for the methods.
+//! see `effectcraft_ui_egui::control` for the methods. An app started for an agent opens without
+//! taking keyboard focus and skips crash recovery, the Home screen (unless `--home`) and the
+//! startup update check.
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 #![cfg_attr(all(target_os = "windows", not(debug_assertions)), windows_subsystem = "windows")]
 
@@ -110,6 +112,13 @@ fn parse_args(args: impl IntoIterator<Item = String>, env_port: Result<String, s
         };
     }
     Ok(Some(out))
+}
+
+/// Whether the app looks for a newer release when it starts. Not when started for an agent
+/// (`--control`): the "update available" prompt is modal and would block the run until a person
+/// dismisses it. Help ▸ Check for Updates still works.
+fn startup_update_check(control_port: Option<u16>) -> bool {
+    control_port.is_none()
 }
 
 /// A control-channel port from 1 to 65535 (0 would listen on a port nobody is told); `name` is
@@ -292,7 +301,7 @@ fn main() -> eframe::Result {
             // reported in a toast and forgotten).
             let _ = session.execute("window.restoreScriptPanels", json!({}));
             let mut app = EffectcraftApp::new(session);
-            app.set_startup_update_check(true);
+            app.set_startup_update_check(startup_update_check(control_port));
             app.set_gpu_failure_bridge(gpu_failures);
             app.ui.start_screen = show_home;
             if let Some(n) = notice {
