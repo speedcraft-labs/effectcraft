@@ -9,12 +9,6 @@ use super::{
 };
 use effectcraft_keyframe::Value;
 use effectcraft_project::LayerId;
-use std::sync::OnceLock;
-
-fn large_comp_pool() -> Option<&'static rayon::ThreadPool> {
-    static POOL: OnceLock<Option<rayon::ThreadPool>> = OnceLock::new();
-    POOL.get_or_init(|| rayon::ThreadPoolBuilder::new().num_threads(4).build().ok()).as_ref()
-}
 
 /// Coordinate space and stack range shared by CPU and accelerated effect evaluation.
 #[derive(Clone, Copy)]
@@ -434,16 +428,6 @@ impl<'a> Renderer<'a> {
 
     /// [`Self::comp_frame`] on the CPU compositor only.
     pub fn comp_frame_cpu(&self, comp_id: ItemId, t: Tick) -> Image {
-        if self.depth == 0
-            && rayon::current_thread_index().is_none()
-            && self.active_accel().is_none()
-            && self.project.comp(comp_id).is_some_and(|comp| comp.layers.len() >= 1024)
-            && let Some(pool) = large_comp_pool()
-        {
-            // Large CPU frames contain many row-parallel stages. Cap them at four workers so a
-            // single memory-bound frame doesn't spread work across every host core.
-            return pool.install(|| self.comp_frame_cpu(comp_id, t));
-        }
         let Some(comp) = self.project.comp(comp_id) else { return Image::new(1, 1) };
         let s = self.opts.scale;
         let (w, h) = frame_size(comp.width, comp.height, s);
