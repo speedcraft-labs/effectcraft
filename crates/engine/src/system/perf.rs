@@ -244,6 +244,10 @@ pub struct Measure {
     pub note: String,
 }
 
+fn stable_hash(bytes: impl IntoIterator<Item = u8>) -> u64 {
+    bytes.into_iter().fold(0xcbf29ce484222325, |hash, byte| (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3))
+}
+
 impl Measure {
     pub fn json(&self) -> Value {
         json!({"name": self.name, "ms": (self.ms * 1000.0).round() / 1000.0, "note": self.note})
@@ -346,6 +350,40 @@ pub fn ops_bench(spec: &LargeSpec, dir: &std::path::Path, fresh: &dyn Fn() -> Se
     s.autosave.background = false;
     let _ = s.autosave_wait();
     (out, s)
+}
+
+/// One isolated operation on the generated workload, for paired journey measurements. The
+/// project generation and file preparation stay outside the timed interval.
+pub fn operation_bench(spec: &LargeSpec, dir: &std::path::Path, fresh: &dyn Fn() -> Session, operation: &str, scale: f64) -> Vec<Measure> {
+    let project = large_project(spec);
+    let path = dir.join("bench-large.ecproj");
+    let path_s = path.to_string_lossy().to_string();
+    let mut session = fresh();
+    session.replace_project(project, None);
+    session.execute("file.saveAs", json!({"path": path_s})).expect("save generated journey project");
+    let bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+    match operation {
+        "open" => {
+            let (ms, opened) = time_best(3, || {
+                let mut s = fresh();
+                s.execute("file.open", json!({"path": path_s})).expect("open generated journey project");
+                s
+            });
+            let active = opened.state.active_comp.map_or(0, |id| id.0);
+            let project_hash = stable_hash(opened.project.to_json_compact().bytes());
+            vec![Measure { name: "open", ms, note: format!("{} bytes; active comp {active}; project {project_hash:016x}", bytes) }]
+        }
+        "firstFrame" => {
+            let cid = session.active_comp_id().expect("generated main comp");
+            let (ms, image) = time_best(1, || {
+                let opts = crate::render::RenderOpts { scale, ..Default::default() };
+                session.render(cid, Tick::ZERO, opts)
+            });
+            let output_hash = stable_hash(image.data.iter().flatten().flat_map(|channel| channel.to_bits().to_le_bytes()));
+            vec![Measure { name: "firstFrame", ms, note: format!("Main at {:.2}×, cold; {} bytes; pixels {output_hash:016x}", scale, bytes) }]
+        }
+        _ => vec![],
+    }
 }
 
 #[cfg(test)]
