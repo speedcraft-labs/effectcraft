@@ -193,6 +193,7 @@ const VALUED: &[&str] = &[
     // mcp
     "--automation-read-root",
     "--automation-write-root",
+    "--measure",
 ];
 
 /// Options without a value. Any other `--option` is a usage error.
@@ -1147,6 +1148,23 @@ fn bench_ops(args: &Args) -> Result<(), Failure> {
     }
     let dir = std::env::temp_dir().join(format!("effectcraft-bench-ops-{}", std::process::id()));
     std::fs::create_dir_all(&dir).map_err(|e| Failure::Error(format!("{}: {e}", dir.display())))?;
+    if let Some(measure) = args.opt("--measure") {
+        if !matches!(measure, "open" | "firstFrame") {
+            return Err(Failure::Error("--measure must be open or firstFrame".into()));
+        }
+        let scale = args.num("--scale")?.unwrap_or(1.0);
+        if !scale.is_finite() || !(0.01..=4.0).contains(&scale) {
+            return Err(Failure::Error("--scale must be between 0.01 and 4".into()));
+        }
+        let m = perf::operation_bench(&spec, &dir, &effectcraft_host::session, measure, scale);
+        if args.flag("--json") {
+            emit(&json!({"spec": format!("{spec:?}"), "measures": m.iter().map(perf::Measure::json).collect::<Vec<_>>()}), true);
+        } else if let Some(x) = m.first() {
+            say!("{}: {:.2} ms ({})", x.name, x.ms, x.note);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        return Ok(());
+    }
     let t0 = std::time::Instant::now();
     drop(effectcraft_host::session());
     let host_ms = t0.elapsed().as_secs_f64() * 1000.0;
