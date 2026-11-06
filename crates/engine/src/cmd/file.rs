@@ -43,18 +43,23 @@ fn demo(s: &mut Session, _: &Value) -> Result<Value> {
 pub(crate) fn open(s: &mut Session, p: &Value) -> Result<Value> {
     let path = str_p(p, "path").ok_or_else(|| bad("file.open", "missing `path`"))?;
     let bytes = s.services.read_file(path).map_err(|e| EngineError::Other(format!("cannot read {path}: {e}")))?;
-    let text = String::from_utf8(bytes).map_err(|_| EngineError::Other("not a text project file".into()))?;
-    // XML copies (File ▸ Save a Copy As XML…) open like the JSON project.
-    let text = if crate::xml_project::is_xml(&text) { crate::xml_project::from_xml(&text).map_err(EngineError::Other)? } else { text };
-    let (mut proj, repaired) =
-        Project::from_json_repaired(&text).map_err(|e| EngineError::Other(format!("{path} is not a project EffectCraft can open: {e}")))?;
+    // XML copies (File ▸ Save a Copy As XML…) open like the JSON project. Keep JSON as bytes so
+    // serde parses it directly without first allocating and validating a second full-size String.
+    let (mut proj, repaired, view, saved_by) = if is_xml_bytes(&bytes) {
+        let text = String::from_utf8(bytes).map_err(|_| EngineError::Other("not a text project file".into()))?;
+        let json = crate::xml_project::from_xml(&text).map_err(EngineError::Other)?;
+        Project::from_file_json_repaired(json.as_bytes())
+    } else {
+        Project::from_file_json_repaired(&bytes)
+    }
+    .map_err(|e| EngineError::Other(format!("{path} is not a project EffectCraft can open: {e}")))?;
     // Footage saved with a relative path (imported by the CLI or an agent as `clip.mp4`, or
     // written by hand) is found next to the project file, as After Effects looks for footage
     // relative to the project (#652).
     let refused = crate::doc_path::resolve_footage(&mut proj, Some(path));
     s.replace_project(proj, Some(path.to_string()));
     s.stored_paths.add(&s.project, Some(path));
-    s.restore_view(&effectcraft_project::saved_view(&text));
+    s.restore_view(&view);
     s.note_project_path(path);
     // Values past the limits (a corrupt or hostile file) were brought within them (#788).
     if !repaired.is_empty() {
@@ -68,7 +73,6 @@ pub(crate) fn open(s: &mut Session, p: &Value) -> Result<Value> {
         s.toast(format!("{n} footage item{} marked missing: {}.", if n == 1 { "" } else { "s" }, crate::doc_path::refusal(first, *why)));
     }
     // Written by a newer EffectCraft: what this version doesn't know would be lost on saving.
-    let saved_by = effectcraft_project::saved_by(&text);
     if let Some(v) = saved_by.as_deref().filter(|v| effectcraft_project::is_newer_version(v, effectcraft_project::APP_VERSION)) {
         s.toast(format!(
             "This project was saved by EffectCraft {v}, newer than this version ({}). Settings this version doesn't know are lost if you save it.",
@@ -81,6 +85,11 @@ pub(crate) fn open(s: &mut Session, p: &Value) -> Result<Value> {
         crate::footage_check::start(s, None, false)?;
     }
     Ok(json!({"path": path, "savedBy": saved_by, "repaired": repaired}))
+}
+
+fn is_xml_bytes(bytes: &[u8]) -> bool {
+    let bytes = bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(bytes).trim_ascii_start();
+    bytes.starts_with(b"<?xml") || bytes.starts_with(b"<EffectCraftProject")
 }
 
 /// The project file's text for `path`: `.ecproj` JSON, or XML for `.ecprojx` / `.xml` (a
