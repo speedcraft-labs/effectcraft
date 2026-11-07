@@ -175,7 +175,7 @@ fn import_sequence(paths: &[String]) -> (Footage, MediaPool) {
         let bytes: Arc<[u8]> = std::fs::read(p).expect("read").into();
         pool.add_bytes(p, bytes);
     }
-    let mut footage = Footage { kind: FootageKind::Sequence, sequence: paths.to_vec(), ..first };
+    let mut footage = Footage { kind: FootageKind::Sequence, sequence: paths.to_vec().into(), ..first };
     footage.sync_sequence_duration();
     (footage, pool)
 }
