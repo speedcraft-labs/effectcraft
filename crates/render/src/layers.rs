@@ -7,7 +7,7 @@ use super::{
 use effectcraft_geom::Rect;
 use effectcraft_project::ItemKind;
 
-const OCCLUSION_TILE: usize = 8;
+const OCCLUSION_TILE: usize = 4;
 
 #[derive(Clone, Copy)]
 struct OpaqueBounds {
