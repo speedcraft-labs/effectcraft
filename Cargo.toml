@@ -12,11 +12,13 @@ repository = "https://github.com/storytold/effectcraft"
 
 [workspace.dependencies]
 craft-blur = { package = "craft-blur", git = "https://github.com/speedcraft-labs/craft-libs", rev = "fc15099447756b34714f46e86712fb91913c8405" }
-craft-resample = { git = "https://github.com/storytold/craft-libs", rev = "e6d994496a6d11cfb4b42a46847933f837c46afd", features = ["rayon"] }
+craft-resample = { git = "https://github.com/speedcraft-labs/craft-libs", branch = "algo/161-image-resample", features = ["rayon"] }
 craft-pdf = { git = "https://github.com/storytold/craft-libs", rev = "e11f9d9aebea5f6b8e74643c1ea1ed172ba5f545", version = "=0.1.0", default-features = false, features = ["read"] }
 craft-docpath = { version = "0.1.0", git = "https://github.com/storytold/craft-libs", rev = "e11f9d9aebea5f6b8e74643c1ea1ed172ba5f545" }
 craft-quit = { version = "0.1.0", git = "https://github.com/storytold/craft-libs", rev = "e11f9d9aebea5f6b8e74643c1ea1ed172ba5f545" }
-
+craft-ecproj-format = { version = "0.1.0", git = "https://github.com/storytold/craft-libs", rev = "ca1b5e2edb8568335c6c14f390307bd5beae8238" }
+# craft-update: app-specific pretend versions apply to startup and manual checks.
+craft-update = { git = "https://github.com/storytold/craft-libs", version = "=0.1.0", rev = "1b34eba41e62138fc2438d2734523b302840b45d", features = ["egui"] }
 # internal
 effectcraft-time = { path = "crates/time" }
 effectcraft-geom = { path = "crates/geom" }
@@ -57,7 +59,7 @@ effectcraft-helper-host = { path = "crates/helper-host" }
 # foundation
 thiserror = "2"
 serde = { version = "1", features = ["derive", "rc"] }
-serde_json = { version = "1", features = ["float_roundtrip", "raw_value"] }
+serde_json = { version = "1", features = ["float_roundtrip"] }
 log = "0.4"
 # All date/time conversion goes through chrono (no hand-rolled calendar code beyond the 400-year range extension; AGENTS.md).
 chrono = { version = "0.4.45", default-features = false, features = ["std"] }
