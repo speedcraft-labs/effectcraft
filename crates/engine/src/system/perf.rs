@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use effectcraft_keyframe::Value as KValue;
 use effectcraft_project::build::{self, Ids};
-use effectcraft_project::{AlphaMode, Comp, Expression, Footage, FootageKind, ItemId, ItemKind, Layer, LayerSource, Project, Solid};
+use effectcraft_project::{AlphaMode, Comp, Expression, Footage, FootageKind, ItemId, ItemKind, Layer, LayerSource, MaskMode, Project, Solid};
 use effectcraft_time::{FrameRate, Tick};
 use serde_json::{Value, json};
 
@@ -36,6 +36,8 @@ pub struct LargeSpec {
     pub expression_every: usize,
     /// Folder the footage paths point into (the files need not exist).
     pub media_dir: String,
+    /// Make frame-zero layers draw actual content rather than using the mostly-empty scaling mix.
+    pub realistic: bool,
 }
 
 impl Default for LargeSpec {
@@ -52,6 +54,7 @@ impl Default for LargeSpec {
             nest_depth: 20,
             expression_every: 4,
             media_dir: "/nonexistent/effectcraft-bench-media".into(),
+            realistic: false,
         }
     }
 }
@@ -75,7 +78,8 @@ fn base_comp(name: &str) -> Comp {
 
 fn footage_item(spec: &LargeSpec, i: usize) -> Footage {
     let dir = &spec.media_dir;
-    let base = Footage { width: 1920, height: 1080, pixel_aspect: 1.0, has_video: true, alpha: AlphaMode::Straight, ..Default::default() };
+    let (width, height) = if spec.realistic { (640, 360) } else { (1920, 1080) };
+    let base = Footage { width, height, pixel_aspect: 1.0, has_video: true, alpha: AlphaMode::Straight, ..Default::default() };
     match i % 3 {
         0 => {
             let frames: Vec<String> = (0..spec.sequence_frames).map(|f| format!("{dir}/seq{i:03}/shot{i:03}_{f:05}.png")).collect();
@@ -108,18 +112,96 @@ fn set_expr(l: &mut Layer, path: &str, text: &str) {
     }
 }
 
+/// Place realistic content as cards across the composition instead of making every asset a
+/// full-frame fill. Source images/solids stay full resolution; their transforms bound the draw.
+fn place_realistic(layer: &mut Layer, n: usize) {
+    let scale = match layer.source {
+        LayerSource::Solid { .. } | LayerSource::Footage { .. } => 25.0 + (n % 6) as f64 * 5.0,
+        LayerSource::Comp { .. } => 22.0 + (n % 5) as f64 * 4.0,
+        LayerSource::Text => 80.0 + (n % 5) as f64 * 10.0,
+        LayerSource::Shape => 70.0 + (n % 5) as f64 * 12.0,
+        _ => 100.0,
+    };
+    let x = 40.0 + (n.wrapping_mul(251) % 1840) as f64;
+    let y = 40.0 + (n.wrapping_mul(127) % 1000) as f64;
+    if let Some(position) = layer.props.prop_mut("transform/position") {
+        position.value = KValue::Vec3([x, y, 0.0]);
+    }
+    if let Some(size) = layer.props.prop_mut("transform/scale") {
+        size.value = KValue::Vec3([scale, scale, 100.0]);
+    }
+}
+
 /// One layer of a varied mix: solids, footage, text, shapes, nulls, some with an effect, some
 /// with expressions, parented to the layer above every 7th.
 fn make_layer(p: &mut Project, comp: &Comp, spec: &LargeSpec, n: usize, solid: ItemId, footage: &[ItemId], prev: Option<&Layer>) -> Layer {
-    let (src, size) = match n % 5 {
-        0 => (LayerSource::Solid { item: solid }, (1920, 1080)),
-        1 if !footage.is_empty() => (LayerSource::Footage { item: footage[n % footage.len()] }, (1920, 1080)),
-        2 => (LayerSource::Text, (0, 0)),
-        3 => (LayerSource::Shape, (0, 0)),
-        _ => (LayerSource::Null, (100, 100)),
+    let image = footage.get(2).copied().unwrap_or_else(|| footage.first().copied().unwrap_or(solid));
+    let (src, size) = if spec.realistic {
+        match n % 5 {
+            0 | 4 => (LayerSource::Solid { item: solid }, (640, 360)),
+            1 => (LayerSource::Footage { item: image }, (640, 360)),
+            2 => (LayerSource::Text, (0, 0)),
+            _ => (LayerSource::Shape, (0, 0)),
+        }
+    } else {
+        match n % 5 {
+            0 => (LayerSource::Solid { item: solid }, (1920, 1080)),
+            1 if !footage.is_empty() => (LayerSource::Footage { item: footage[n % footage.len()] }, (1920, 1080)),
+            2 => (LayerSource::Text, (0, 0)),
+            3 => (LayerSource::Shape, (0, 0)),
+            _ => (LayerSource::Null, (100, 100)),
+        }
     };
     let mut l = build::layer(p, comp, &format!("Layer {n}"), src, size, None);
-    if n.is_multiple_of(6)
+    if spec.realistic {
+        place_realistic(&mut l, n);
+        // Reproduce the survey's ordinary motion-graphics mix: visible image, text and vector
+        // content, with masks and non-normal compositing. All spans include the first frame.
+        l.in_point = Tick::ZERO;
+        if let Some(opacity) = l.props.prop_mut("transform/opacity") {
+            opacity.value = KValue::Scalar(if n % 10 == 1 {
+                80.0
+            } else if n % 10 == 2 {
+                60.0
+            } else {
+                100.0
+            });
+        }
+        const MODES: [effectcraft_color::BlendMode; 6] = [
+            effectcraft_color::BlendMode::Normal,
+            effectcraft_color::BlendMode::Multiply,
+            effectcraft_color::BlendMode::Screen,
+            effectcraft_color::BlendMode::Overlay,
+            effectcraft_color::BlendMode::Add,
+            effectcraft_color::BlendMode::Darken,
+        ];
+        if n % 10 == 0 {
+            l.blend_mode = MODES[n % MODES.len()];
+        }
+        if matches!(l.source, LayerSource::Text)
+            && let Some(text) = l.props.prop_mut("text/sourceText")
+        {
+            text.value = KValue::Text(Box::new(effectcraft_keyframe::TextDoc::plain(&format!("Survey title {n:04}"))));
+        }
+        if matches!(l.source, LayerSource::Shape) {
+            let mut ids = Ids(&mut p.next_id);
+            if let Some(contents) = l.props.sub_mut("contents") {
+                let shape = build::shape_rect(&mut ids, [240.0 + (n % 4) as f64 * 80.0, 120.0 + (n % 3) as f64 * 40.0], [0.0, 0.0], 12.0);
+                let fill = build::shape_fill(&mut ids, [0.15 + (n % 5) as f64 * 0.16, 0.35, 0.75, 1.0]);
+                contents.children.push(build::shape_group(&mut ids, "Survey Shape", vec![shape, fill]).into());
+            }
+        }
+        if n % 40 == 0
+            && let Some(masks) = l.props.sub_mut("masks")
+        {
+            let mut ids = Ids(&mut p.next_id);
+            let w = size.0.max(1) as f64;
+            let h = size.1.max(1) as f64;
+            let path = effectcraft_keyframe::ShapePath::polygon(&[[0.0, 0.0], [w * 0.82, 0.0], [w * 0.82, h], [0.0, h]], true);
+            masks.children.push(build::mask(&mut ids, "Survey Mask", path, MaskMode::Add, build::MASK_COLORS[n % build::MASK_COLORS.len()]).into());
+        }
+    }
+    if n.is_multiple_of(if spec.realistic { 100 } else { 6 })
         && let Some(fx) = crate::effects::find("ec.blur.gaussian")
     {
         let mut next = p.next_id;
@@ -132,20 +214,24 @@ fn make_layer(p: &mut Project, comp: &Comp, spec: &LargeSpec, n: usize, solid: I
             e.children.push(g.into());
         }
     }
-    if spec.expression_every > 0 && n.is_multiple_of(spec.expression_every) {
+    let expression_every = if spec.realistic { 50 } else { spec.expression_every };
+    if expression_every > 0 && n.is_multiple_of(expression_every) {
         set_expr(&mut l, "transform/position", "wiggle(2, 20)");
         set_expr(&mut l, "transform/rotation", "time * 30 + index");
         set_expr(&mut l, "transform/opacity", "50 + 50 * Math.sin(time * 2)");
     }
-    if n.is_multiple_of(7)
+    if !spec.realistic
+        && n.is_multiple_of(7)
         && let Some(prev) = prev
     {
         l.parent = Some(prev.id);
     }
     // Stagger the bars so the timeline isn't one block.
-    let span = comp.duration.0.max(1);
-    let off = (n as i64 * 7919) % span;
-    l.in_point = Tick(off / 2);
+    if !spec.realistic {
+        let span = comp.duration.0.max(1);
+        let off = (n as i64 * 7919) % span;
+        l.in_point = Tick(off / 2);
+    }
     l
 }
 
@@ -167,7 +253,12 @@ pub fn large_project(spec: &LargeSpec) -> Project {
         "Bench Solid",
         crate::color::Label::None,
         Some(media),
-        ItemKind::Solid(Solid { color: [0.2, 0.4, 0.8], width: 1920, height: 1080, pixel_aspect: 1.0 }),
+        ItemKind::Solid(Solid {
+            color: [0.2, 0.4, 0.8],
+            width: if spec.realistic { 640 } else { 1920 },
+            height: if spec.realistic { 360 } else { 1080 },
+            pixel_aspect: 1.0,
+        }),
     );
 
     // Leaf comps and the nesting chain are built bottom-up so each precomp layer can point at
@@ -190,7 +281,10 @@ pub fn large_project(spec: &LargeSpec) -> Project {
         let mut c = template.clone();
         fill(&mut p, &mut c, spec.comp_layers.saturating_sub(1), &mut n);
         if let Some(b) = below {
-            let l = build::layer(&mut p, &c, &format!("Nest {}", d + 1), LayerSource::Comp { item: b }, (1920, 1080), None);
+            let mut l = build::layer(&mut p, &c, &format!("Nest {}", d + 1), LayerSource::Comp { item: b }, (1920, 1080), None);
+            if spec.realistic {
+                place_realistic(&mut l, d);
+            }
             c.layers.insert(0, l);
         }
         below = Some(p.add_item(&format!("Nest {d}"), crate::color::Label::None, Some(comps_folder), ItemKind::Comp(Arc::new(c))));
@@ -205,10 +299,18 @@ pub fn large_project(spec: &LargeSpec) -> Project {
     let mut main = template;
     let mut layers = vec![];
     if let Some(b) = below {
-        layers.push(build::layer(&mut p, &main, "Nest 1", LayerSource::Comp { item: b }, (1920, 1080), None));
+        let mut l = build::layer(&mut p, &main, "Nest 1", LayerSource::Comp { item: b }, (1920, 1080), None);
+        if spec.realistic {
+            place_realistic(&mut l, 0);
+        }
+        layers.push(l);
     }
     for (k, leaf) in leaves.iter().take(spec.main_layers.saturating_sub(1) / 10).enumerate() {
-        layers.push(build::layer(&mut p, &main, &format!("Shot {:03}", k + 1), LayerSource::Comp { item: *leaf }, (1920, 1080), None));
+        let mut l = build::layer(&mut p, &main, &format!("Shot {:03}", k + 1), LayerSource::Comp { item: *leaf }, (1920, 1080), None);
+        if spec.realistic {
+            place_realistic(&mut l, k + 1);
+        }
+        layers.push(l);
     }
     while layers.len() < spec.main_layers {
         let l = make_layer(&mut p, &main, spec, n, solid, &footage, layers.last());
@@ -355,7 +457,22 @@ pub fn ops_bench(spec: &LargeSpec, dir: &std::path::Path, fresh: &dyn Fn() -> Se
 /// One isolated operation on the generated workload, for paired journey measurements. The
 /// project generation and file preparation stay outside the timed interval.
 pub fn operation_bench(spec: &LargeSpec, dir: &std::path::Path, fresh: &dyn Fn() -> Session, operation: &str, scale: f64) -> Vec<Measure> {
-    let project = large_project(spec);
+    let mut generated_spec = spec.clone();
+    if spec.realistic {
+        let media_dir = dir.join("media");
+        generated_spec.media_dir = media_dir.to_string_lossy().into_owned();
+        if std::fs::create_dir_all(&media_dir).is_ok() {
+            let image_path = media_dir.join("still002.png");
+            if !image_path.exists() {
+                let mut image = image::RgbImage::new(640, 360);
+                for (x, y, px) in image.enumerate_pixels_mut() {
+                    *px = image::Rgb([((x * 13 + y * 3) % 256) as u8, ((x * 5 + y * 11) % 256) as u8, ((x * 7 + y * 17) % 256) as u8]);
+                }
+                let _ = image.save(&image_path);
+            }
+        }
+    }
+    let project = large_project(&generated_spec);
     let path = dir.join("bench-large.ecproj");
     let path_s = path.to_string_lossy().to_string();
     let mut session = fresh();
@@ -380,7 +497,12 @@ pub fn operation_bench(spec: &LargeSpec, dir: &std::path::Path, fresh: &dyn Fn()
                 session.render(cid, Tick::ZERO, opts)
             });
             let output_hash = stable_hash(image.data.iter().flatten().flat_map(|channel| channel.to_bits().to_le_bytes()));
-            vec![Measure { name: "firstFrame", ms, note: format!("Main at {:.2}×, cold; {} bytes; pixels {output_hash:016x}", scale, bytes) }]
+            let covered_pixels = image.data.iter().filter(|px| px[3] > 0.0).count();
+            vec![Measure {
+                name: "firstFrame",
+                ms,
+                note: format!("Main at {:.2}×, cold; {} bytes; {covered_pixels} nontransparent pixels; pixels {output_hash:016x}", scale, bytes),
+            }]
         }
         _ => vec![],
     }
@@ -417,6 +539,37 @@ mod tests {
             });
         }
         assert_eq!(depth, spec.nest_depth);
+    }
+
+    #[test]
+    fn realistic_project_has_visible_frame_zero_content() {
+        let spec = LargeSpec { realistic: true, ..LargeSpec::small() };
+        let p = large_project(&spec);
+        let main = p
+            .items
+            .values()
+            .find_map(|item| match &item.kind {
+                ItemKind::Comp(comp) if item.name == "Main" => Some(comp),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(main.layers.len(), spec.main_layers);
+        assert!(main.layers.iter().all(|layer| layer.is_active_at(Tick::ZERO)));
+        assert!(main.layers.iter().any(|layer| matches!(layer.source, LayerSource::Footage { .. })));
+        assert!(main.layers.iter().any(|layer| matches!(layer.source, LayerSource::Text) && layer.props.prop("text/sourceText").is_some()));
+        assert!(
+            main.layers.iter().any(|layer| matches!(layer.source, LayerSource::Shape) && layer.props.sub("contents").is_some_and(|g| !g.children.is_empty()))
+        );
+        assert!(main.layers.iter().any(|layer| layer.masks().is_some_and(|g| !g.children.is_empty())));
+        assert!(main.layers.iter().any(|layer| layer.blend_mode != effectcraft_color::BlendMode::Normal));
+        assert!(main.layers.iter().any(|layer| layer.props.prop("transform/opacity").is_some_and(|p| matches!(p.value, KValue::Scalar(v) if v < 100.0))));
+        assert!(main.layers.iter().any(|layer| layer.effects().is_some_and(|g| g.groups().any(|fx| fx.enabled))));
+        assert!(main.layers.iter().any(|layer| layer.source.item().is_some_and(|id| p.comp(id).is_some_and(|nested| !nested.layers.is_empty()))));
+        let mut session = Session::default();
+        session.replace_project(p, None);
+        let cid = session.active_comp_id().unwrap();
+        let frame = session.render(cid, Tick::ZERO, crate::render::RenderOpts { scale: 0.1, ..Default::default() });
+        assert!(frame.data.iter().any(|px| px[3] > 0.0), "the frame must draw pixels");
     }
 
     #[test]

@@ -25,7 +25,7 @@
 //! effectcraft-cli render F.ecproj --queue                    render the project's Render Queue
 //! effectcraft-cli bench [--comp C] [--time S] [--scale K] [--n N] [--play N] [--gpu [--adv3d]]   render timings
 //!     (--gpu: CPU vs GPU ms/frame for every comp at Full and Half)
-//! effectcraft-cli bench --ops [--small] [--layers N] [--comps N] [--footage N]   everyday-operation timings
+//! effectcraft-cli bench --ops [--small] [--layers N] [--comps N] [--footage N] [--realistic]   everyday-operation timings
 //!     on a large generated project (open, save, auto-save, undo/redo, timeline, Project panel)
 //! effectcraft-cli bench --roto [--frames N] [--sam2 model.safetensors] [--mobilesam mobile_sam.pt] [--fixes] [--clip FRAMES --truth MASKS] [--json]   Roto Brush trackers on synthetic clips with known mattes
 //!     (classical engine, MobileSAM and SAM 2.1 (any installed size) when installed; IoU, flicker, re-appearance, seconds per frame)
@@ -124,7 +124,7 @@ const USAGE: &str = "usage: effectcraft-cli <info|commands|exec|run|props|get|se
   bench [--comp C] [--time S] [--scale K] [--n N] [--play N] [--gpu [--adv3d]]   per-layer/effect render timings;
                                            --play N renders N consecutive frames with/without the layer cache;
                                            --gpu compares CPU and GPU ms/frame for every comp at Full and Half
-  bench --ops [--small] [--layers N] [--comps N] [--footage N]
+  bench --ops [--small] [--layers N] [--comps N] [--footage N] [--realistic]
                                            everyday operations on a large generated project: startup, open,
                                            save, auto-save, edits + undo/redo, timeline, Project panel
   bench --roto [--frames N] [--sam2 FILE] [--mobilesam FILE] [--fixes] [--clip FRAMES_DIR --truth MASKS_DIR] [--json]
@@ -212,6 +212,7 @@ const FLAGS: &[&str] = &[
     "--work-area",
     "--queue",
     "--ops",
+    "--realistic",
     "--roto",
     "--small",
     "--adv3d",
@@ -1145,6 +1146,9 @@ fn bench_ops(args: &Args) -> Result<(), Failure> {
     }
     if let Some(n) = args.num("--footage")? {
         spec.footage = n.max(0.0) as usize;
+    }
+    if args.flag("--realistic") {
+        spec.realistic = true;
     }
     let dir = std::env::temp_dir().join(format!("effectcraft-bench-ops-{}", std::process::id()));
     std::fs::create_dir_all(&dir).map_err(|e| Failure::Error(format!("{}: {e}", dir.display())))?;
