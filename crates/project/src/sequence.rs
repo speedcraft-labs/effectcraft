@@ -224,7 +224,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn plain_absolute_sequence_paths_are_classified_without_materializing() -> Result<(), Box<dyn std::error::Error>> {
+    fn plain_absolute_paths_are_classified_and_serialization_materializes() -> Result<(), Box<dyn std::error::Error>> {
         let mut value = serde_json::to_value(Footage::default())?;
         value["sequence"] = serde_json::json!(["/media/shot_0001.exr", "/media/shot_0002.exr"]);
         let json = serde_json::to_string(&value)?;
@@ -233,7 +233,7 @@ mod tests {
         assert!(footage.sequence.has_plain_absolute_local_paths());
         assert!(!footage.sequence.is_materialized());
         assert_eq!(serde_json::to_value(&footage)?["sequence"], value["sequence"]);
-        assert!(!footage.sequence.is_materialized());
+        assert!(footage.sequence.is_materialized());
 
         footage.sequence[0] = "relative/frame.exr".into();
         assert!(!footage.sequence.has_plain_absolute_local_paths());

@@ -222,7 +222,12 @@ fn plain_absolute_local(path: &str) -> bool {
         return false;
     }
     components.split('/').all(|component| {
-        !component.is_empty() && component != "." && component != ".." && !component.chars().all(|ch| ch == '.' || ch == ' ') && !dos_device(component)
+        !component.is_empty()
+            && component != "."
+            && component != ".."
+            && !component.contains(['?', '*'])
+            && !component.chars().all(|ch| ch == '.' || ch == ' ')
+            && !dos_device(component)
     })
 }
 
