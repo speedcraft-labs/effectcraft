@@ -280,7 +280,7 @@ fn gradient_json(j: &serde_json::Value) -> Option<Gradient> {
 }
 
 /// The value of a property.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(tag = "t", content = "v")]
 pub enum Value {
     Scalar(f64),
@@ -297,6 +297,179 @@ pub enum Value {
     Layer(Option<u64>),
     Gradient(Gradient),
     Str(String),
+}
+
+#[derive(Clone, Copy)]
+enum ValueDataSeed {
+    Scalar,
+    Vec2,
+    Vec3,
+    Color,
+    Bool,
+    Enum,
+    Path,
+    Text,
+    Layer,
+    Gradient,
+    Str,
+}
+
+impl<'de> serde::de::DeserializeSeed<'de> for ValueDataSeed {
+    type Value = Value;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        match self {
+            ValueDataSeed::Scalar => f64::deserialize(deserializer).map(Value::Scalar),
+            ValueDataSeed::Vec2 => <[f64; 2]>::deserialize(deserializer).map(Value::Vec2),
+            ValueDataSeed::Vec3 => <[f64; 3]>::deserialize(deserializer).map(Value::Vec3),
+            ValueDataSeed::Color => <[f64; 4]>::deserialize(deserializer).map(Value::Color),
+            ValueDataSeed::Bool => bool::deserialize(deserializer).map(Value::Bool),
+            ValueDataSeed::Enum => u32::deserialize(deserializer).map(Value::Enum),
+            ValueDataSeed::Path => ShapePath::deserialize(deserializer).map(Value::Path),
+            ValueDataSeed::Text => Box::<TextDoc>::deserialize(deserializer).map(Value::Text),
+            ValueDataSeed::Layer => Option::<u64>::deserialize(deserializer).map(Value::Layer),
+            ValueDataSeed::Gradient => Gradient::deserialize(deserializer).map(Value::Gradient),
+            ValueDataSeed::Str => String::deserialize(deserializer).map(Value::Str),
+        }
+    }
+}
+
+fn value_data_seed(tag: &str) -> Option<ValueDataSeed> {
+    match tag {
+        "Scalar" => Some(ValueDataSeed::Scalar),
+        "Vec2" => Some(ValueDataSeed::Vec2),
+        "Vec3" => Some(ValueDataSeed::Vec3),
+        "Color" => Some(ValueDataSeed::Color),
+        "Bool" => Some(ValueDataSeed::Bool),
+        "Enum" => Some(ValueDataSeed::Enum),
+        "Path" => Some(ValueDataSeed::Path),
+        "Text" => Some(ValueDataSeed::Text),
+        "Layer" => Some(ValueDataSeed::Layer),
+        "Gradient" => Some(ValueDataSeed::Gradient),
+        "Str" => Some(ValueDataSeed::Str),
+        _ => None,
+    }
+}
+
+fn deserialize_tagged_value<'de, A>(mut map: A, tag: String) -> Result<Value, A::Error>
+where
+    A: serde::de::MapAccess<'de>,
+{
+    use serde::de::Error as _;
+
+    let Some(seed) = value_data_seed(&tag) else {
+        return Err(A::Error::unknown_variant(&tag, &["Scalar", "Vec2", "Vec3", "Color", "Bool", "Enum", "Path", "Text", "Layer", "Gradient", "Str"]));
+    };
+    let mut value = None;
+    while let Some(key) = map.next_key::<String>()? {
+        match key.as_str() {
+            "v" => {
+                if value.is_some() {
+                    return Err(A::Error::duplicate_field("v"));
+                }
+                value = Some(map.next_value_seed(seed)?);
+            }
+            "t" => return Err(A::Error::duplicate_field("t")),
+            _ => {
+                let _: serde::de::IgnoredAny = map.next_value()?;
+            }
+        }
+    }
+    value.ok_or_else(|| A::Error::missing_field("v"))
+}
+
+fn deserialize_unordered_value<'de, A>(mut map: A, first_key: String) -> Result<Value, A::Error>
+where
+    A: serde::de::MapAccess<'de>,
+{
+    use serde::de::Error as _;
+
+    // Keep the derived enum's order-independent compatibility path for older or hand-authored
+    // JSON. The common serde_json representation has `t` first and avoids this temporary map.
+    let mut fields = serde_json::Map::new();
+    let first_value = map.next_value::<serde_json::Value>()?;
+    fields.insert(first_key, first_value);
+    while let Some(key) = map.next_key::<String>()? {
+        let value = map.next_value::<serde_json::Value>()?;
+        if fields.insert(key.clone(), value).is_some() {
+            return Err(A::Error::custom(format!("duplicate field `{key}`")));
+        }
+    }
+    let tagged: TaggedValue = serde_json::from_value(serde_json::Value::Object(fields)).map_err(A::Error::custom)?;
+    Ok(tagged.into())
+}
+
+impl<'de> Deserialize<'de> for Value {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct ValueVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for ValueVisitor {
+            type Value = Value;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a tagged property value")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::MapAccess<'de>,
+            {
+                use serde::de::Error as _;
+
+                let Some(first_key) = map.next_key::<String>()? else {
+                    return Err(A::Error::custom("missing property value tag"));
+                };
+                if first_key == "t" {
+                    let tag = map.next_value::<String>()?;
+                    deserialize_tagged_value(map, tag)
+                } else {
+                    deserialize_unordered_value(map, first_key)
+                }
+            }
+        }
+
+        deserializer.deserialize_map(ValueVisitor)
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "t", content = "v")]
+enum TaggedValue {
+    Scalar(f64),
+    Vec2([f64; 2]),
+    Vec3([f64; 3]),
+    Color([f64; 4]),
+    Bool(bool),
+    Enum(u32),
+    Path(ShapePath),
+    Text(Box<TextDoc>),
+    Layer(Option<u64>),
+    Gradient(Gradient),
+    Str(String),
+}
+
+impl From<TaggedValue> for Value {
+    fn from(value: TaggedValue) -> Self {
+        match value {
+            TaggedValue::Scalar(v) => Value::Scalar(v),
+            TaggedValue::Vec2(v) => Value::Vec2(v),
+            TaggedValue::Vec3(v) => Value::Vec3(v),
+            TaggedValue::Color(v) => Value::Color(v),
+            TaggedValue::Bool(v) => Value::Bool(v),
+            TaggedValue::Enum(v) => Value::Enum(v),
+            TaggedValue::Path(v) => Value::Path(v),
+            TaggedValue::Text(v) => Value::Text(v),
+            TaggedValue::Layer(v) => Value::Layer(v),
+            TaggedValue::Gradient(v) => Value::Gradient(v),
+            TaggedValue::Str(v) => Value::Str(v),
+        }
+    }
 }
 
 impl Value {
