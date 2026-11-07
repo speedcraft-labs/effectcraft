@@ -493,6 +493,7 @@ impl<'a> Renderer<'a> {
     fn draw_comp(&self, ctx: &EvalCtx<'a>, canvas: &mut Image, mut blank: bool) {
         // Bottom-to-top, with runs of consecutive 3D layers depth-sorted (farthest first).
         let visible = self.visible_layers(ctx);
+        let occluded = self.occluded_solid_layers(ctx, &visible, canvas.width, canvas.height);
         let mut i = 0;
         while i < visible.len() {
             if visible[i].is_3d() {
@@ -505,9 +506,13 @@ impl<'a> Renderer<'a> {
                 self.pipe.quantize(canvas);
                 blank = false;
             } else {
-                let changed = match self.collapsed(ctx, visible[i]) {
-                    Some(collapsed) => self.draw_collapsed(ctx, visible[i], &collapsed, canvas, blank),
-                    None => self.draw_layer(ctx, visible[i], canvas, blank),
+                let changed = if occluded[i] {
+                    Region::Empty
+                } else {
+                    match self.collapsed(ctx, visible[i]) {
+                        Some(collapsed) => self.draw_collapsed(ctx, visible[i], &collapsed, canvas, blank),
+                        None => self.draw_layer(ctx, visible[i], canvas, blank),
+                    }
                 };
                 i += 1;
                 // 8/16 bpc: the comp is an integer buffer after every layer (only the pixels the

@@ -4,6 +4,18 @@ use super::{
     Arc, BlendMode, Buf, Comp, EvalCtx, Image, IndexedParallelIterator, IntoParallelRefIterator, IntoParallelRefMutIterator, Layer, LayerSource, Mat3,
     MatteKind, ParallelIterator, Quality, Region, Renderer, Sampling, Tick, WarpOpts, cache, color, composite_warp_changed, masks, styles, vec2,
 };
+use effectcraft_geom::Rect;
+use effectcraft_project::ItemKind;
+
+const OCCLUSION_TILE: usize = 8;
+
+#[derive(Clone, Copy)]
+struct OpaqueBounds {
+    /// Draw bounds, conservatively expanded for bilinear sampling and clipped to the output.
+    draw: [usize; 4],
+    /// Interior that remains opaque with bilinear sampling.
+    opaque: [f64; 4],
+}
 
 /// Blend policy for placing a layer, including optional output-depth quantization.
 struct PlacementBlend {
@@ -439,6 +451,83 @@ impl<'a> Renderer<'a> {
             }
         }
         changed
+    }
+
+    /// Skip simple solid layers whose complete draw footprint is covered by later opaque solids.
+    /// The input is in bottom-to-top order; coverage is accumulated from top to bottom.
+    pub(crate) fn occluded_solid_layers(&self, ctx: &EvalCtx, layers: &[&Layer], width: u32, height: u32) -> Vec<bool> {
+        let mut culled = vec![false; layers.len()];
+        if layers.len() < 64 || width == 0 || height == 0 {
+            return culled;
+        }
+        let cols = (width as usize).div_ceil(OCCLUSION_TILE);
+        let rows = (height as usize).div_ceil(OCCLUSION_TILE);
+        let Some(cells) = cols.checked_mul(rows).filter(|&n| n <= 1 << 20) else { return culled };
+        let mut covered = vec![false; cells];
+
+        for (index, layer) in layers.iter().enumerate().rev() {
+            let Some(bounds) = self.opaque_solid_bounds(ctx, layer, width, height) else { continue };
+            if bounds.draw[0] >= bounds.draw[2] || bounds.draw[1] >= bounds.draw[3] {
+                culled[index] = true;
+                continue;
+            }
+            let tx0 = bounds.draw[0] / OCCLUSION_TILE;
+            let tx1 = bounds.draw[2].div_ceil(OCCLUSION_TILE).min(cols);
+            let ty0 = bounds.draw[1] / OCCLUSION_TILE;
+            let ty1 = bounds.draw[3].div_ceil(OCCLUSION_TILE).min(rows);
+            if (ty0..ty1).all(|y| (tx0..tx1).all(|x| covered[y * cols + x])) {
+                culled[index] = true;
+                continue;
+            }
+
+            let tile = OCCLUSION_TILE as f64;
+            let ox0 = ((bounds.opaque[0].max(0.0) / tile).ceil() as usize).min(cols);
+            let ox1 = ((bounds.opaque[2].min(width as f64) / tile).floor() as usize).min(cols);
+            let oy0 = ((bounds.opaque[1].max(0.0) / tile).ceil() as usize).min(rows);
+            let oy1 = ((bounds.opaque[3].min(height as f64) / tile).floor() as usize).min(rows);
+            for y in oy0..oy1 {
+                for x in ox0..ox1 {
+                    covered[y * cols + x] = true;
+                }
+            }
+        }
+        culled
+    }
+
+    /// Conservative output-space bounds for a solid guaranteed to composite opaque source-over
+    /// pixels. Other layer kinds and compositing features are ineligible.
+    fn opaque_solid_bounds(&self, ctx: &EvalCtx, layer: &Layer, width: u32, height: u32) -> Option<OpaqueBounds> {
+        let LayerSource::Solid { item } = &layer.source else { return None };
+        let ItemKind::Solid(solid) = &self.project.item(*item)?.kind else { return None };
+        if layer.is_3d()
+            || layer.switches.adjustment
+            || layer.blend_mode != BlendMode::Normal
+            || layer.track_matte.is_some()
+            || layer.preserve_transparency
+            || self.mb_on(ctx, layer)
+            || ctx.opacity(layer) as f32 * self.opacity_mul != 1.0
+            || self.quality(layer) == Quality::Wireframe
+            || layer.masks().is_some_and(|m| !m.children.is_empty())
+            || layer.effects().is_some_and(|g| g.groups().any(|e| e.enabled))
+            || styles::active(ctx, layer)
+        {
+            return None;
+        }
+
+        let (layer_to_comp, _) = ctx.layer_to_comp(layer);
+        let layer_to_output = self.outer.map_or(layer_to_comp, |outer| outer * layer_to_comp);
+        let matrix = self.out_matrix() * Mat3::scale(vec2(self.opts.scale, self.opts.scale)) * layer_to_output;
+        if !matrix.is_affine() || matrix.0[0][1] != 0.0 || matrix.0[1][0] != 0.0 {
+            return None;
+        }
+        let bounds = matrix.map_rect(&Rect::from_size(solid.width as f64, solid.height as f64));
+        let [x0, y0, x1, y1] = [bounds.x0, bounds.y0, bounds.x1, bounds.y1];
+        if ![x0, y0, x1, y1].into_iter().all(f64::is_finite) {
+            return None;
+        }
+        let to_px = |v: f64, max: u32| (v as i64).clamp(0, max as i64) as usize;
+        let draw = [to_px((x0 - 1.0).floor(), width), to_px((y0 - 1.0).floor(), height), to_px((x1 + 1.0).ceil(), width), to_px((y1 + 1.0).ceil(), height)];
+        Some(OpaqueBounds { draw, opaque: [x0 + 1.0, y0 + 1.0, x1 - 1.0, y1 - 1.0] })
     }
 
     /// Composite a styled layer: exterior passes with their own modes, then the body with the
