@@ -7,7 +7,7 @@
 // as in tests and benches (AGENTS.md, "Never crash"). Nothing here runs in the app.
 #![allow(clippy::expect_used)]
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use effectcraft_keyframe::Value as KValue;
 use effectcraft_project::build::{self, Ids};
@@ -132,6 +132,24 @@ fn place_realistic(layer: &mut Layer, n: usize) {
     }
 }
 
+/// Keep the 5,000-layer first-frame workload honest: no solid layer is fully opaque, so the
+/// compositor cannot skip lower layers as hidden behind later opaque solids. Other source kinds
+/// retain a mix that includes full opacity.
+fn realistic_opacity(layer: &mut Layer, n: usize) {
+    let opacity = if matches!(layer.source, LayerSource::Solid { .. }) {
+        [62.0, 74.0, 86.0, 96.0][n % 4]
+    } else {
+        match n % 10 {
+            1 => 80.0,
+            2 => 60.0,
+            _ => 100.0,
+        }
+    };
+    if let Some(prop) = layer.props.prop_mut("transform/opacity") {
+        prop.value = KValue::Scalar(opacity);
+    }
+}
+
 /// One layer of a varied mix: solids, footage, text, shapes, nulls, some with an effect, some
 /// with expressions, parented to the layer above every 7th.
 fn make_layer(p: &mut Project, comp: &Comp, spec: &LargeSpec, n: usize, solid: ItemId, footage: &[ItemId], prev: Option<&Layer>) -> Layer {
@@ -158,15 +176,7 @@ fn make_layer(p: &mut Project, comp: &Comp, spec: &LargeSpec, n: usize, solid: I
         // Reproduce the survey's ordinary motion-graphics mix: visible image, text and vector
         // content, with masks and non-normal compositing. All spans include the first frame.
         l.in_point = Tick::ZERO;
-        if let Some(opacity) = l.props.prop_mut("transform/opacity") {
-            opacity.value = KValue::Scalar(if n % 10 == 1 {
-                80.0
-            } else if n % 10 == 2 {
-                60.0
-            } else {
-                100.0
-            });
-        }
+        realistic_opacity(&mut l, n);
         const MODES: [effectcraft_color::BlendMode; 6] = [
             effectcraft_color::BlendMode::Normal,
             effectcraft_color::BlendMode::Multiply,
@@ -284,6 +294,7 @@ pub fn large_project(spec: &LargeSpec) -> Project {
             let mut l = build::layer(&mut p, &c, &format!("Nest {}", d + 1), LayerSource::Comp { item: b }, (1920, 1080), None);
             if spec.realistic {
                 place_realistic(&mut l, d);
+                realistic_opacity(&mut l, d);
             }
             c.layers.insert(0, l);
         }
@@ -309,6 +320,7 @@ pub fn large_project(spec: &LargeSpec) -> Project {
         let mut l = build::layer(&mut p, &main, &format!("Shot {:03}", k + 1), LayerSource::Comp { item: *leaf }, (1920, 1080), None);
         if spec.realistic {
             place_realistic(&mut l, k + 1);
+            realistic_opacity(&mut l, k + 1);
         }
         layers.push(l);
     }
@@ -498,10 +510,29 @@ pub fn operation_bench(spec: &LargeSpec, dir: &std::path::Path, fresh: &dyn Fn()
             });
             let output_hash = stable_hash(image.data.iter().flatten().flat_map(|channel| channel.to_bits().to_le_bytes()));
             let covered_pixels = image.data.iter().filter(|px| px[3] > 0.0).count();
+            // Collect the per-layer count in a separate, untimed pass so the journey can prove
+            // that its 5,000 main-comp layers reached rendering without contaminating latency.
+            let profile = Mutex::new(Vec::new());
+            let mut renderer = crate::render::Renderer::new(
+                &session.project,
+                session.footage.as_ref(),
+                session.render_opts(crate::render::RenderOpts { scale, ..Default::default() }),
+            );
+            renderer.expr = session.expr.as_deref();
+            renderer.cache = Some(&session.layer_cache);
+            renderer.profile = Some(&profile);
+            let profiled = renderer.comp_frame(cid, Tick::ZERO);
+            let main_draws = profile.lock().map(|rows| rows.iter().filter(|row| row.depth == 0).count()).unwrap_or(0);
+            let profiled_hash = stable_hash(profiled.data.iter().flatten().flat_map(|channel| channel.to_bits().to_le_bytes()));
             vec![Measure {
                 name: "firstFrame",
                 ms,
-                note: format!("Main at {:.2}×, cold; {} bytes; {covered_pixels} nontransparent pixels; pixels {output_hash:016x}", scale, bytes),
+                note: format!(
+                    "Main at {:.2}×, cold; {} bytes; {covered_pixels} nontransparent pixels; main layers drawn {main_draws}; pixels {output_hash:016x}; profile matches {profile_match}",
+                    scale,
+                    bytes,
+                    profile_match = profiled_hash == output_hash
+                ),
             }]
         }
         _ => vec![],
@@ -511,6 +542,16 @@ pub fn operation_bench(spec: &LargeSpec, dir: &std::path::Path, fresh: &dyn Fn()
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct DrawFootage;
+
+    impl crate::render::FootageSource for DrawFootage {
+        fn frame(&self, _item: ItemId, footage: &Footage, _time: Tick) -> Option<Arc<crate::render::Image>> {
+            let mut frame = crate::render::Image::new(footage.width, footage.height);
+            frame.data.fill([0.25, 0.5, 0.75, 1.0]);
+            Some(Arc::new(frame))
+        }
+    }
 
     #[test]
     fn large_project_round_trips_and_opens_main() {
@@ -563,13 +604,24 @@ mod tests {
         assert!(main.layers.iter().any(|layer| layer.masks().is_some_and(|g| !g.children.is_empty())));
         assert!(main.layers.iter().any(|layer| layer.blend_mode != effectcraft_color::BlendMode::Normal));
         assert!(main.layers.iter().any(|layer| layer.props.prop("transform/opacity").is_some_and(|p| matches!(p.value, KValue::Scalar(v) if v < 100.0))));
+        assert!(
+            main.layers
+                .iter()
+                .filter(|layer| matches!(layer.source, LayerSource::Solid { .. }))
+                .all(|layer| { layer.props.prop("transform/opacity").is_some_and(|p| matches!(p.value, KValue::Scalar(v) if v < 100.0)) })
+        );
         assert!(main.layers.iter().any(|layer| layer.effects().is_some_and(|g| g.groups().any(|fx| fx.enabled))));
         assert!(main.layers.iter().any(|layer| layer.source.item().is_some_and(|id| p.comp(id).is_some_and(|nested| !nested.layers.is_empty()))));
         let mut session = Session::default();
         session.replace_project(p, None);
+        session.footage = Arc::new(DrawFootage);
         let cid = session.active_comp_id().unwrap();
-        let frame = session.render(cid, Tick::ZERO, crate::render::RenderOpts { scale: 0.1, ..Default::default() });
+        let profile = Mutex::new(Vec::new());
+        let mut renderer = session.renderer(crate::render::RenderOpts { scale: 0.1, ..Default::default() });
+        renderer.profile = Some(&profile);
+        let frame = renderer.comp_frame(cid, Tick::ZERO);
         assert!(frame.data.iter().any(|px| px[3] > 0.0), "the frame must draw pixels");
+        assert_eq!(profile.lock().unwrap().iter().filter(|row| row.depth == 0).count(), spec.main_layers, "every main-comp layer must draw");
     }
 
     #[test]
