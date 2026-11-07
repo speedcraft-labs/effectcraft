@@ -69,7 +69,7 @@ pub fn configure_parallelism() {
     if std::env::var_os("RAYON_NUM_THREADS").is_some() {
         return;
     }
-    let threads = std::thread::available_parallelism().map_or(1, |n| n.get().min(8));
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get().min(4));
     let _ = rayon::ThreadPoolBuilder::new().num_threads(threads).build_global();
 }
 
