@@ -464,8 +464,17 @@ impl<'a> Renderer<'a> {
         let rows = (height as usize).div_ceil(OCCLUSION_TILE);
         let Some(cells) = cols.checked_mul(rows).filter(|&n| n <= 1 << 20) else { return culled };
         let mut covered = vec![false; cells];
+        let mut uncovered = cells;
 
         for (index, layer) in layers.iter().enumerate().rev() {
+            // Later opaque layers cover every output tile. No earlier 2D layer can then change
+            // the final frame, regardless of its source type, effects, matte or blend mode.
+            if uncovered == 0 {
+                if !layer.is_3d() {
+                    culled[index] = true;
+                }
+                continue;
+            }
             let Some(bounds) = self.simple_layer_bounds(ctx, layer, width, height) else { continue };
             if bounds.draw[0] >= bounds.draw[2] || bounds.draw[1] >= bounds.draw[3] {
                 culled[index] = true;
@@ -488,7 +497,11 @@ impl<'a> Renderer<'a> {
                 let oy1 = ((bounds.opaque[3].min(height as f64) / tile).floor() as usize).min(rows);
                 for y in oy0..oy1 {
                     for x in ox0..ox1 {
-                        covered[y * cols + x] = true;
+                        let cell = y * cols + x;
+                        if !covered[cell] {
+                            covered[cell] = true;
+                            uncovered -= 1;
+                        }
                     }
                 }
             }
