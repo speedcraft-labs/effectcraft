@@ -902,6 +902,36 @@ impl<'a> Renderer<'a> {
         Some(buf)
     }
 
+    /// Directly build the minified source for a plain solid. The normal raster path first fills
+    /// the full-resolution solid, then box-filters it for minification; every level of that box
+    /// filter is the same uniform pixel, so these allocations and copies are redundant.
+    pub(crate) fn plain_solid_mip(&self, ctx: &EvalCtx, layer: &Layer) -> Option<Buf> {
+        if self.accel.is_some()
+            || layer.is_3d()
+            || layer.switches.adjustment
+            || layer.switches.collapse
+            || self.blurred(ctx, layer)
+            || layer.masks().is_some_and(|m| !m.children.is_empty())
+            || (layer.switches.effects && layer.effects().is_some_and(|fx| fx.groups().any(|g| g.enabled)))
+            || styles::active(ctx, layer)
+            || layer.track_matte.is_some()
+            || layer.preserve_transparency
+        {
+            return None;
+        }
+        let LayerSource::Solid { item } = &layer.source else { return None };
+        let ItemKind::Solid(sol) = &self.project.item(*item)?.kind else { return None };
+        let scale = self.opts.scale;
+        let (full_w, full_h) = (((sol.width as f64 * scale).ceil() as u32).max(1), ((sol.height as f64 * scale).ceil() as u32).max(1));
+        let (factor, width, height) = self.solid_mip(ctx, layer, full_w, full_h, scale)?;
+        let mut color = sol.color;
+        if let Some(conv) = self.pipe.authored_in() {
+            color = conv.apply(color);
+        }
+        let px = self.pipe.quantize_px([color[0], color[1], color[2], 1.0]);
+        Some(Buf { img: Image::filled(width, height, px), offset: [0.0; 2], scale: scale * factor })
+    }
+
     /// Fully processed layer buffer (source → masks → effects → layer styles, flattened).
     /// Served from the layer cache when the layer's content key matches.
     pub fn layer_buf(&self, ctx: &EvalCtx, layer: &Layer) -> Option<Arc<Buf>> {
