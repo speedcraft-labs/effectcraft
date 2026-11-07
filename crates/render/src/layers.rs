@@ -517,7 +517,7 @@ impl<'a> Renderer<'a> {
                 continue;
             }
 
-            if Self::can_occlude_solid(ctx, layer, self) {
+            if Self::can_occlude_layer(ctx, layer, self) {
                 let tile = OCCLUSION_TILE as f64;
                 let ox0 = ((bounds.opaque[0].max(0.0) / tile).ceil() as usize).min(cols);
                 let ox1 = ((bounds.opaque[2].min(width as f64) / tile).floor() as usize).min(cols);
@@ -571,10 +571,19 @@ impl<'a> Renderer<'a> {
         Some(OpaqueBounds { draw, opaque: [x0 + 1.0, y0 + 1.0, x1 - 1.0, y1 - 1.0] })
     }
 
-    /// Only simple normal solids with unit opacity can add covered tiles for later culling.
-    fn can_occlude_solid(ctx: &EvalCtx, layer: &Layer, r: &Renderer<'_>) -> bool {
-        let LayerSource::Solid { item } = &layer.source else { return false };
-        matches!(r.project.item(*item).map(|i| &i.kind), Some(ItemKind::Solid(_)))
+    /// Simple normal solids and footage explicitly interpreted without alpha can add covered
+    /// tiles for later culling. This only uses source metadata, so the culling pass doesn't decode
+    /// media it would otherwise never need.
+    fn can_occlude_layer(ctx: &EvalCtx, layer: &Layer, r: &Renderer<'_>) -> bool {
+        let opaque_source = match &layer.source {
+            LayerSource::Solid { item } => matches!(r.project.item(*item).map(|i| &i.kind), Some(ItemKind::Solid(_))),
+            LayerSource::Footage { item } => matches!(
+                r.project.item(*item).map(|i| &i.kind),
+                Some(ItemKind::Footage(f)) if f.alpha == effectcraft_project::AlphaMode::Ignore
+            ),
+            _ => false,
+        };
+        opaque_source
             && !layer.is_3d()
             && !layer.switches.adjustment
             && !layer.switches.collapse
