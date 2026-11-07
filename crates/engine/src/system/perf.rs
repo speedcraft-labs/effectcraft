@@ -140,19 +140,10 @@ fn place_realistic(layer: &mut Layer, n: usize) {
     }
 }
 
-/// Keep the 5,000-layer first-frame workload honest: no solid layer is fully opaque, so the
-/// compositor cannot skip lower layers as hidden behind later opaque solids. Other source kinds
-/// retain a mix that includes full opacity.
+/// Keep all 5,000 first-frame layers live in the draw path. The card stack still exercises varied
+/// opacity, but no solid or opaque-footage layer fully hides lower content from the compositor.
 fn realistic_opacity(layer: &mut Layer, n: usize) {
-    let opacity = if matches!(layer.source, LayerSource::Solid { .. }) {
-        [62.0, 74.0, 86.0, 96.0][n % 4]
-    } else {
-        match n % 10 {
-            1 => 80.0,
-            2 => 60.0,
-            _ => 100.0,
-        }
-    };
+    let opacity = [62.0, 74.0, 86.0, 96.0][n % 4];
     if let Some(prop) = layer.props.prop_mut("transform/opacity") {
         prop.value = KValue::Scalar(opacity);
     }
@@ -194,7 +185,7 @@ fn make_layer(p: &mut Project, comp: &Comp, spec: &LargeSpec, n: usize, solid: I
             effectcraft_color::BlendMode::Darken,
         ];
         if n % 10 == 0 {
-            l.blend_mode = MODES[n % MODES.len()];
+            l.blend_mode = MODES[(n / 10) % MODES.len()];
         }
         if matches!(l.source, LayerSource::Text)
             && let Some(text) = l.props.prop_mut("text/sourceText")
@@ -611,11 +602,20 @@ mod tests {
         );
         assert!(main.layers.iter().any(|layer| layer.masks().is_some_and(|g| !g.children.is_empty())));
         assert!(main.layers.iter().any(|layer| layer.blend_mode != effectcraft_color::BlendMode::Normal));
+        for mode in [
+            effectcraft_color::BlendMode::Multiply,
+            effectcraft_color::BlendMode::Screen,
+            effectcraft_color::BlendMode::Overlay,
+            effectcraft_color::BlendMode::Add,
+            effectcraft_color::BlendMode::Darken,
+        ] {
+            assert!(main.layers.iter().any(|layer| layer.blend_mode == mode), "missing {mode:?}");
+        }
         assert!(main.layers.iter().any(|layer| layer.props.prop("transform/opacity").is_some_and(|p| matches!(p.value, KValue::Scalar(v) if v < 100.0))));
         assert!(
             main.layers
                 .iter()
-                .filter(|layer| matches!(layer.source, LayerSource::Solid { .. }))
+                .filter(|layer| matches!(layer.source, LayerSource::Solid { .. } | LayerSource::Footage { .. }))
                 .all(|layer| { layer.props.prop("transform/opacity").is_some_and(|p| matches!(p.value, KValue::Scalar(v) if v < 100.0)) })
         );
         assert!(main.layers.iter().any(|layer| layer.effects().is_some_and(|g| g.groups().any(|fx| fx.enabled))));
@@ -625,7 +625,7 @@ mod tests {
         session.footage = Arc::new(DrawFootage);
         let cid = session.active_comp_id().unwrap();
         let profile = Mutex::new(Vec::new());
-        let mut renderer = session.renderer(crate::render::RenderOpts { scale: 0.1, ..Default::default() });
+        let mut renderer = session.renderer(crate::render::RenderOpts { scale: 1.0, ..Default::default() });
         renderer.profile = Some(&profile);
         let frame = renderer.comp_frame(cid, Tick::ZERO);
         assert!(frame.data.iter().any(|px| px[3] > 0.0), "the frame must draw pixels");
