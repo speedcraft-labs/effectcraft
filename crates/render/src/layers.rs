@@ -137,6 +137,28 @@ impl<'a> Renderer<'a> {
         self.place_matrix(self.outer.map_or(l2c, |o| o * l2c), buf)
     }
 
+    /// The raster mip dimensions a plain solid would use for its current transform. Solid pixels
+    /// are uniform, so a caller can construct the final mip directly instead of filling and then
+    /// halving the full-resolution source image.
+    pub(crate) fn solid_mip(&self, ctx: &EvalCtx, layer: &Layer, width: u32, height: u32, source_scale: f64) -> Option<(f64, u32, u32)> {
+        let buf = Buf { img: Image::new(width, height), offset: [0.0; 2], scale: source_scale };
+        let m = self.buf_matrix(ctx, layer, &buf);
+        let mut scale = m.mean_scale();
+        if !m.is_affine() || scale >= 0.5 {
+            return None;
+        }
+        let (mut w, mut h) = (width.div_ceil(2).max(1), height.div_ceil(2).max(1));
+        let mut factor = 0.5;
+        scale *= 2.0;
+        while scale < 0.5 && w > 1 && h > 1 {
+            w = w.div_ceil(2).max(1);
+            h = h.div_ceil(2).max(1);
+            factor *= 0.5;
+            scale *= 2.0;
+        }
+        Some((factor, w, h))
+    }
+
     /// Buffer pixel → output pixel matrix for a layer → (top-level) comp matrix.
     fn place_matrix(&self, l2c: Mat3, buf: &Buf) -> Mat3 {
         let s = self.opts.scale;
@@ -170,7 +192,7 @@ impl<'a> Renderer<'a> {
 
     /// Whether a layer moves within the shutter: its own motion blur, or that of a collapsed
     /// precomp layer it is drawn through.
-    fn blurred(&self, ctx: &EvalCtx, layer: &Layer) -> bool {
+    pub(crate) fn blurred(&self, ctx: &EvalCtx, layer: &Layer) -> bool {
         self.mb_on(ctx, layer) || (!self.through_lost && self.links().any(|l| l.blur))
     }
 
@@ -427,7 +449,13 @@ impl<'a> Renderer<'a> {
         }
         let mut timing = self.profile.map(|_| LayerTiming { depth: self.depth, layer: layer.name.clone(), ..Default::default() });
         let t0 = web_time::Instant::now();
-        let Some(st) = self.styled(ctx, layer, timing.as_mut()) else { return Region::Empty };
+        let st = if let Some(buf) = self.plain_solid_mip(ctx, layer) {
+            let body = Arc::new(buf);
+            StyledLayer { passes: vec![], body: body.clone(), content: body, key: None, ckey: None, plain: true }
+        } else {
+            let Some(st) = self.styled(ctx, layer, timing.as_mut()) else { return Region::Empty };
+            st
+        };
         let st = self.styled_to_blend(st);
         let t1 = web_time::Instant::now();
         let changed = if st.plain {
