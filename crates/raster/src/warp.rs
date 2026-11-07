@@ -45,7 +45,7 @@ fn half(src: &Image) -> Image {
 /// bilinear without bounds checks, integer-translation copies, inlined Normal blending); it
 /// matches [`composite_warp_reference`] to float rounding.
 pub fn composite_warp(dst: &mut Image, src: &Image, m: &Mat3, opts: &WarpOpts) {
-    composite_warp_impl(dst, src, m, opts, true, None, None);
+    composite_warp_impl::<false>(dst, src, m, opts, true, None, None);
 }
 
 /// [`composite_warp`], also returning the destination pixels it changed when it knows them:
@@ -53,7 +53,15 @@ pub fn composite_warp(dst: &mut Image, src: &Image, m: &Mat3, opts: &WarpOpts) {
 /// `None` otherwise. With `quantize` (an 8/16 bpc destination's levels), the fast path also
 /// quantises each pixel it blends ([`crate::quantize_px`]): exactly when this returns `Some`.
 pub fn composite_warp_changed(dst: &mut Image, src: &Image, m: &Mat3, opts: &WarpOpts, quantize: Option<f32>) -> Option<[u32; 4]> {
-    composite_warp_impl(dst, src, m, opts, true, None, quantize)
+    composite_warp_impl::<true>(dst, src, m, opts, true, None, quantize)
+}
+
+/// [`composite_warp`] with inline quantisation on the affine fast path. The caller can skip a
+/// later quantisation pass when this returns `true`; it does not return changed bounds because
+/// that reduction is unnecessary for this use. A no-op also returns `true`, since no later
+/// quantisation is needed.
+pub fn composite_warp_quantized(dst: &mut Image, src: &Image, m: &Mat3, opts: &WarpOpts, levels: f32) -> bool {
+    composite_warp_impl::<false>(dst, src, m, opts, true, None, Some(levels)).is_some()
 }
 
 /// `dst += warp(src) · weight` (plain sum, no blending): motion-blur sub-samples accumulate
@@ -61,7 +69,7 @@ pub fn composite_warp_changed(dst: &mut Image, src: &Image, m: &Mat3, opts: &War
 pub fn accumulate_warp(dst: &mut Image, src: &Image, m: &Mat3, sampling: Sampling, weight: f32) {
     let opts = WarpOpts { sampling, ..Default::default() };
     if m.is_affine() && m.inverse().is_some_and(|i| i.is_affine()) {
-        composite_warp_impl(dst, src, m, &opts, true, Some(weight), None);
+        composite_warp_impl::<false>(dst, src, m, &opts, true, Some(weight), None);
         return;
     }
     let mut tmp = Image::new(dst.width, dst.height);
@@ -75,7 +83,7 @@ pub fn accumulate_warp(dst: &mut Image, src: &Image, m: &Mat3, sampling: Samplin
 
 /// The straightforward per-pixel implementation (reference for the fast path's tests).
 pub fn composite_warp_reference(dst: &mut Image, src: &Image, m: &Mat3, opts: &WarpOpts) {
-    composite_warp_impl(dst, src, m, opts, false, None, None);
+    composite_warp_impl::<false>(dst, src, m, opts, false, None, None);
 }
 
 /// Bilinear blend of four taps (same operation order as [`Image::sample_bilinear`]).
@@ -199,8 +207,14 @@ struct AffineRows {
     bounds: [usize; 4],
 }
 
-/// Blend visible source samples and return the rectangle of changed pixels.
-fn affine_rows(dst: &mut Image, img: &Image, inv: &Mat3, rows: AffineRows, blend: impl Fn(Px, Px, u32, u32) -> Px + Sync) -> [usize; 4] {
+/// Blend visible source samples, optionally returning the rectangle of changed pixels.
+fn affine_rows<const TRACK_CHANGES: bool>(
+    dst: &mut Image,
+    img: &Image,
+    inv: &Mat3,
+    rows: AffineRows,
+    blend: impl Fn(Px, Px, u32, u32) -> Px + Sync,
+) -> [usize; 4] {
     let AffineRows { sampling, opacity: op, quantize, bounds: [x0, x1, y0, y1] } = rows;
     let levels = quantize.map(|l| (l, 1.0 / l));
     let w = dst.width as usize;
@@ -214,89 +228,122 @@ fn affine_rows(dst: &mut Image, img: &Image, inv: &Mat3, rows: AffineRows, blend
     // glow-padded layer's buffer) without reading them.
     let clear = (sampling == Sampling::Bilinear && !int_tx).then(|| ClearTiles::new(img));
     let empty = [usize::MAX, usize::MAX, 0, 0];
-    let workers = rayon::current_num_threads().clamp(1, 8);
-    dst.data
-        .par_chunks_mut(w)
-        .enumerate()
-        .skip(y0)
-        .take(y1 - y0)
-        .with_min_len((y1 - y0).div_ceil(workers).max(1))
-        .map(|(y, row)| {
-            let mut changed = RowSpan::NONE;
-            let fy = y as f64 + 0.5;
-            let p0 = vec2(m[0][0] * (x0 as f64 + 0.5) + m[0][1] * fy + m[0][2], m[1][0] * (x0 as f64 + 0.5) + m[1][1] * fy + m[1][2]);
-            let n = x1 - x0;
-            let (ax, bx) = span(p0.x, step.x, -1.0, iw + 1.0, n);
-            let (ay, by) = span(p0.y, step.y, -1.0, ih + 1.0, n);
-            let (lo, hi) = (ax.max(ay), bx.min(by));
-            if lo >= hi {
+    let draw_row = |y, row| {
+        let mut changed = RowSpan::NONE;
+        let fy = y as f64 + 0.5;
+        let p0 = vec2(m[0][0] * (x0 as f64 + 0.5) + m[0][1] * fy + m[0][2], m[1][0] * (x0 as f64 + 0.5) + m[1][1] * fy + m[1][2]);
+        let n = x1 - x0;
+        let (ax, bx) = span(p0.x, step.x, -1.0, iw + 1.0, n);
+        let (ay, by) = span(p0.y, step.y, -1.0, ih + 1.0, n);
+        let (lo, hi) = (ax.max(ay), bx.min(by));
+        if lo >= hi {
+            return empty;
+        }
+        if int_tx {
+            let sy = y as i64 + m[1][2] as i64;
+            if sy < 0 || sy >= img.height as i64 {
                 return empty;
             }
-            if int_tx {
-                let sy = y as i64 + m[1][2] as i64;
-                if sy < 0 || sy >= img.height as i64 {
-                    return empty;
+            let dx = m[0][2] as i64;
+            let srow = &img.data[sy as usize * img.width as usize..(sy as usize + 1) * img.width as usize];
+            let xa = (x0 as i64 + lo as i64).max(-dx).max(0) as usize;
+            let xb = ((x0 + hi) as i64).min(img.width as i64 - dx).max(0) as usize;
+            for x in xa..xb.max(xa) {
+                let mut s = srow[(x as i64 + dx) as usize];
+                if sampling == Sampling::Bicubic {
+                    s = [s[0].max(0.0), s[1].max(0.0), s[2].max(0.0), s[3].max(0.0)];
                 }
-                let dx = m[0][2] as i64;
-                let srow = &img.data[sy as usize * img.width as usize..(sy as usize + 1) * img.width as usize];
-                let xa = (x0 as i64 + lo as i64).max(-dx).max(0) as usize;
-                let xb = ((x0 + hi) as i64).min(img.width as i64 - dx).max(0) as usize;
-                for x in xa..xb.max(xa) {
-                    let mut s = srow[(x as i64 + dx) as usize];
-                    if sampling == Sampling::Bicubic {
-                        s = [s[0].max(0.0), s[1].max(0.0), s[2].max(0.0), s[3].max(0.0)];
-                    }
-                    if s[3] <= 0.0 {
-                        continue;
-                    }
-                    if op < 1.0 {
-                        for c in s.iter_mut() {
-                            *c *= op;
-                        }
-                    }
-                    row[x] = blend(row[x], s, x as u32, y as u32);
-                    if let Some((l, inv)) = levels {
-                        crate::quantize_px(&mut row[x], l, inv);
-                    }
-                    changed.add(x);
+                if s[3] <= 0.0 {
+                    continue;
                 }
-            } else {
-                for i in lo..hi {
-                    let x = x0 + i;
-                    let p = vec2(p0.x + step.x * i as f64, p0.y + step.y * i as f64);
-                    if p.x < -1.0 || p.y < -1.0 || p.x > iw + 1.0 || p.y > ih + 1.0 {
-                        continue;
+                if op < 1.0 {
+                    for c in s.iter_mut() {
+                        *c *= op;
                     }
-                    let mut s = match (sampling, &clear) {
-                        (Sampling::Nearest, _) => img.get(p.x.floor() as i64, p.y.floor() as i64),
-                        (Sampling::Bilinear, Some(clear)) => match sample_bilinear_fast(img, clear, p.x, p.y) {
-                            Some(s) => s,
-                            None => continue,
-                        },
-                        (Sampling::Bilinear, None) => img.sample_bilinear(p.x, p.y),
-                        (Sampling::Bicubic, _) => img.sample_bicubic(p.x, p.y),
-                    };
-                    if s[3] <= 0.0 {
-                        continue;
-                    }
-                    if op < 1.0 {
-                        for c in s.iter_mut() {
-                            *c *= op;
-                        }
-                    }
-                    row[x] = blend(row[x], s, x as u32, y as u32);
-                    if let Some((l, inv)) = levels {
-                        crate::quantize_px(&mut row[x], l, inv);
-                    }
+                }
+                row[x] = blend(row[x], s, x as u32, y as u32);
+                if let Some((l, inv)) = levels {
+                    crate::quantize_px(&mut row[x], l, inv);
+                }
+                if TRACK_CHANGES {
                     changed.add(x);
                 }
             }
-            if changed.a < changed.b { [changed.a, y, changed.b, y + 1] } else { empty }
-        })
-        .reduce(|| empty, union)
+        } else {
+            for i in lo..hi {
+                let x = x0 + i;
+                let p = vec2(p0.x + step.x * i as f64, p0.y + step.y * i as f64);
+                if p.x < -1.0 || p.y < -1.0 || p.x > iw + 1.0 || p.y > ih + 1.0 {
+                    continue;
+                }
+                let mut s = match (sampling, &clear) {
+                    (Sampling::Nearest, _) => img.get(p.x.floor() as i64, p.y.floor() as i64),
+                    (Sampling::Bilinear, Some(clear)) => match sample_bilinear_fast(img, clear, p.x, p.y) {
+                        Some(s) => s,
+                        None => continue,
+                    },
+                    (Sampling::Bilinear, None) => img.sample_bilinear(p.x, p.y),
+                    (Sampling::Bicubic, _) => img.sample_bicubic(p.x, p.y),
+                };
+                if s[3] <= 0.0 {
+                    continue;
+                }
+                if op < 1.0 {
+                    for c in s.iter_mut() {
+                        *c *= op;
+                    }
+                }
+                row[x] = blend(row[x], s, x as u32, y as u32);
+                if let Some((l, inv)) = levels {
+                    crate::quantize_px(&mut row[x], l, inv);
+                }
+                if TRACK_CHANGES {
+                    changed.add(x);
+                }
+            }
+        }
+        if changed.a < changed.b { [changed.a, y, changed.b, y + 1] } else { empty }
+    };
+    let workers = rayon::current_num_threads().clamp(1, 8);
+    let rows = dst.data.par_chunks_mut(w).enumerate().skip(y0).take(y1 - y0).with_min_len((y1 - y0).div_ceil(workers).max(1));
+    if TRACK_CHANGES {
+        rows.map(|(y, row)| draw_row(y, row)).reduce(|| empty, union)
+    } else {
+        rows.for_each(|(y, row)| {
+            draw_row(y, row);
+        });
+        empty
+    }
 }
 
-fn composite_warp_impl(
+fn composite_affine<const TRACK_CHANGES: bool>(
+    dst: &mut Image,
+    img: &Image,
+    inv: &Mat3,
+    opts: &WarpOpts,
+    bounds: [usize; 4],
+    quantize: Option<f32>,
+) -> [usize; 4] {
+    match opts.mode {
+        BlendMode::Normal => {
+            affine_rows::<TRACK_CHANGES>(dst, img, inv, AffineRows { sampling: opts.sampling, opacity: opts.opacity, quantize, bounds }, |d, s, _, _| {
+                let k = 1.0 - s[3];
+                [s[0] + d[0] * k, s[1] + d[1] * k, s[2] + d[2] * k, s[3] + d[3] * k]
+            })
+        }
+        BlendMode::Dissolve | BlendMode::DancingDissolve => {
+            let seed = opts.seed;
+            affine_rows::<TRACK_CHANGES>(dst, img, inv, AffineRows { sampling: opts.sampling, opacity: opts.opacity, quantize, bounds }, |d, s, x, y| {
+                blend_pixel(opts.mode, d, s, hash_noise(x, y, seed))
+            })
+        }
+        _ => affine_rows::<TRACK_CHANGES>(dst, img, inv, AffineRows { sampling: opts.sampling, opacity: opts.opacity, quantize, bounds }, |d, s, _, _| {
+            blend_pixel(opts.mode, d, s, 0.5)
+        }),
+    }
+}
+
+fn composite_warp_impl<const TRACK_CHANGES: bool>(
     dst: &mut Image,
     src: &Image,
     m: &Mat3,
@@ -348,30 +395,18 @@ fn composite_warp_impl(
     if let Some(k) = accumulate
         && affine
     {
-        let r = affine_rows(dst, img, &inv, AffineRows { sampling: opts.sampling, opacity: 1.0, quantize: None, bounds: [x0, x1, y0, y1] }, |d, s, _, _| {
-            [d[0] + s[0] * k, d[1] + s[1] * k, d[2] + s[2] * k, d[3] + s[3] * k]
-        });
-        return changed(r);
+        let r = affine_rows::<TRACK_CHANGES>(
+            dst,
+            img,
+            &inv,
+            AffineRows { sampling: opts.sampling, opacity: 1.0, quantize: None, bounds: [x0, x1, y0, y1] },
+            |d, s, _, _| [d[0] + s[0] * k, d[1] + s[1] * k, d[2] + s[2] * k, d[3] + s[3] * k],
+        );
+        return if TRACK_CHANGES { changed(r) } else { Some([0; 4]) };
     }
     if allow_fast && affine && !mode.is_stencil() {
-        let r = match mode {
-            BlendMode::Normal => {
-                affine_rows(dst, img, &inv, AffineRows { sampling: opts.sampling, opacity: op, quantize, bounds: [x0, x1, y0, y1] }, |d, s, _, _| {
-                    let k = 1.0 - s[3];
-                    [s[0] + d[0] * k, s[1] + d[1] * k, s[2] + d[2] * k, s[3] + d[3] * k]
-                })
-            }
-            BlendMode::Dissolve | BlendMode::DancingDissolve => {
-                let seed = opts.seed;
-                affine_rows(dst, img, &inv, AffineRows { sampling: opts.sampling, opacity: op, quantize, bounds: [x0, x1, y0, y1] }, |d, s, x, y| {
-                    blend_pixel(mode, d, s, hash_noise(x, y, seed))
-                })
-            }
-            _ => affine_rows(dst, img, &inv, AffineRows { sampling: opts.sampling, opacity: op, quantize, bounds: [x0, x1, y0, y1] }, |d, s, _, _| {
-                blend_pixel(mode, d, s, 0.5)
-            }),
-        };
-        return changed(r);
+        let r = composite_affine::<TRACK_CHANGES>(dst, img, &inv, opts, [x0, x1, y0, y1], quantize);
+        return if TRACK_CHANGES { changed(r) } else { Some([0; 4]) };
     }
     dst.data.par_chunks_mut(w).enumerate().skip(y0).take(y1 - y0).for_each(|(y, row)| {
         let fy = y as f64 + 0.5;
@@ -603,8 +638,13 @@ mod tests {
                     let mut fused = before.clone();
                     let r = composite_warp_changed(&mut fused, &src, m, &opts, Some(levels));
                     assert_eq!(r, Some([x0, y0, x1, y1]));
+                    let mut untracked = before.clone();
+                    assert!(composite_warp_quantized(&mut untracked, &src, m, &opts, levels));
                     for (i, (p, q)) in fused.data.iter().zip(&after.data).enumerate() {
                         assert_eq!(p.map(f32::to_bits), q.map(f32::to_bits), "{mode:?} {levels} px {i}");
+                    }
+                    for (i, (p, q)) in untracked.data.iter().zip(&fused.data).enumerate() {
+                        assert_eq!(p.map(f32::to_bits), q.map(f32::to_bits), "untracked {mode:?} {levels} px {i}");
                     }
                 }
             }

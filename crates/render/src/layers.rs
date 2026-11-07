@@ -396,7 +396,10 @@ impl<'a> Renderer<'a> {
         let pl = self.placement(ctx, layer, buf);
         let opts = WarpOpts { sampling: pl.sampling, opacity, mode, seed: pl.seed, clip: None };
         if let [m] = pl.matrices.as_slice() {
-            return composite_warp_changed(target, &buf.img, m, &opts, quantize);
+            return match quantize {
+                Some(levels) => effectcraft_raster::composite_warp_quantized(target, &buf.img, m, &opts, levels).then_some([0; 4]),
+                None => composite_warp_changed(target, &buf.img, m, &opts, None),
+            };
         }
         // Sub-samples sum straight into one buffer (each warp is row-parallel).
         let mut acc = Image::new(target.width, target.height);
