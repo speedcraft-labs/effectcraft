@@ -14,6 +14,7 @@
 
 use std::sync::{Arc, OnceLock};
 
+use craft_resample::downsample2_floor_rgba;
 use effectcraft_color::{BlendMode, ColorSpace, Label};
 use effectcraft_keyframe::{Keyframe, ShapePath, Value};
 use effectcraft_project::build::{self, Ids};
@@ -885,8 +886,8 @@ fn backend_selection_and_display_frames() {
     }
 }
 
-/// The display texture carries a full mip chain, each level the 2 × 2 mean of the one above, so the
-/// viewer minifies a frame without aliasing (#417).
+/// The display texture carries a full mip chain matching the shared floor-sized RGBA reducer, so
+/// the viewer minifies a frame without aliasing (#417).
 #[test]
 fn display_frames_are_mipmapped() {
     let Some(g) = gpu() else { return };
@@ -917,13 +918,16 @@ fn display_frames_are_mipmapped() {
     );
     let level1 = e.read_texture(&tex, w1, h1, 4).expect("level 1");
     let at = |x: u32, y: u32, c: usize| base[((y * f.width + x) * 4) as usize + c] as f32;
+    let pixels = base.chunks_exact(4).map(|px| [px[0] as f32, px[1] as f32, px[2] as f32, px[3] as f32]).collect::<Vec<_>>();
+    let (expected_w, expected_h, expected) = downsample2_floor_rgba(&pixels, f.width as usize, f.height as usize).expect("base image");
+    assert_eq!((w1 as usize, h1 as usize), (expected_w, expected_h));
     let mut varied = false;
     for y in 0..h1 {
         for x in 0..w1 {
             for c in 0..4 {
-                let want = (at(2 * x, 2 * y, c) + at(2 * x + 1, 2 * y, c) + at(2 * x, 2 * y + 1, c) + at(2 * x + 1, 2 * y + 1, c)) / 4.0;
-                let got = level1[((y * w1 + x) * 4) as usize + c] as f32;
-                assert!((want - got).abs() <= 1.0, "({x}, {y}) channel {c}: {got} against the mean {want}");
+                let want = expected[(y as usize) * expected_w as usize + x as usize][c];
+                let got = level1[((y * w1 + x) * 4) as usize + c];
+                assert!((want.round() as i32 - got as i32).abs() <= 1, "({x}, {y}) channel {c}: {got} against the shared mean {want}");
                 varied |= want != at(2 * x, 2 * y, c);
             }
         }
