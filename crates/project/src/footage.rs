@@ -1,6 +1,6 @@
 use super::settings::{Marker, yes};
 use super::{ColorSpace, Deserialize, FrameRate, Serialize, Tick};
-use serde::de::{Error as _, Visitor};
+use serde::de::{Error as _, MapAccess, SeqAccess, Visitor};
 use serde::{Deserializer, Serializer};
 use std::ops::{Deref, DerefMut};
 use std::sync::{Arc, OnceLock};
@@ -9,11 +9,11 @@ use std::sync::{Arc, OnceLock};
 ///
 /// Large projects can contain tens of thousands of sequence paths that the first rendered frame
 /// never reads. Keeping the valid JSON array here defers per-path string allocation until a
-/// sequence is inspected or used. Serialization writes the original array directly while it is
-/// still deferred.
+/// sequence is inspected or used. Serialization materializes the paths for compatibility with
+/// all Serde serializers.
 #[derive(Clone, Debug)]
 pub struct SequenceFiles {
-    raw: Option<Arc<Box<serde_json::value::RawValue>>>,
+    raw: Option<Arc<str>>,
     parsed: OnceLock<Vec<String>>,
     plain_absolute_local: OnceLock<bool>,
 }
@@ -23,9 +23,7 @@ impl SequenceFiles {
         if let Some(paths) = self.parsed.get() {
             return paths.is_empty();
         }
-        self.raw
-            .as_ref()
-            .is_none_or(|raw| raw.get().trim().strip_prefix('[').and_then(|value| value.strip_suffix(']')).is_some_and(|value| value.trim().is_empty()))
+        self.raw.as_ref().is_none_or(|raw| raw.trim().strip_prefix('[').and_then(|value| value.strip_suffix(']')).is_some_and(|value| value.trim().is_empty()))
     }
 
     /// Whether this list has been expanded into path strings yet.
@@ -41,7 +39,7 @@ impl SequenceFiles {
     }
 
     fn paths(&self) -> &[String] {
-        self.parsed.get_or_init(|| self.raw.as_ref().and_then(|raw| serde_json::from_str::<Vec<String>>(raw.get()).ok()).unwrap_or_default())
+        self.parsed.get_or_init(|| self.raw.as_ref().and_then(|raw| serde_json::from_str::<Vec<String>>(raw).ok()).unwrap_or_default())
     }
 }
 
@@ -76,7 +74,7 @@ impl DerefMut for SequenceFiles {
     fn deref_mut(&mut self) -> &mut Self::Target {
         self.plain_absolute_local.take();
         if self.parsed.get().is_none() {
-            let paths = self.raw.as_ref().and_then(|raw| serde_json::from_str::<Vec<String>>(raw.get()).ok()).unwrap_or_default();
+            let paths = self.raw.as_ref().and_then(|raw| serde_json::from_str::<Vec<String>>(raw).ok()).unwrap_or_default();
             self.parsed = OnceLock::from(paths);
         }
         self.raw = None;
@@ -118,11 +116,6 @@ impl Serialize for SequenceFiles {
     where
         S: Serializer,
     {
-        if self.parsed.get().is_none()
-            && let Some(raw) = &self.raw
-        {
-            return raw.as_ref().serialize(serializer);
-        }
         self.paths().serialize(serializer)
     }
 }
@@ -165,12 +158,56 @@ impl<'de> Deserialize<'de> for SequenceFiles {
     where
         D: Deserializer<'de>,
     {
-        let raw = Box::<serde_json::value::RawValue>::deserialize(deserializer)?;
-        // Validate the array and its element types now, retaining only a small fast-path flag per
-        // frame instead of allocating every path. The paths themselves are decoded on first access.
-        let paths: Vec<SequenceString> = serde_json::from_str(raw.get()).map_err(D::Error::custom)?;
-        let plain_absolute_local = paths.iter().all(|path| path.0);
-        Ok(SequenceFiles { raw: Some(Arc::new(raw)), parsed: OnceLock::new(), plain_absolute_local: OnceLock::from(plain_absolute_local) })
+        const RAW_VALUE_TOKEN: &str = "$serde_json::private::RawValue";
+
+        struct FilesVisitor;
+
+        impl<'de> Visitor<'de> for FilesVisitor {
+            type Value = SequenceFiles;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("an array of sequence paths")
+            }
+
+            fn visit_newtype_struct<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+            where
+                D: Deserializer<'de>,
+            {
+                Vec::<String>::deserialize(deserializer).map(SequenceFiles::from)
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                let mut paths = Vec::with_capacity(seq.size_hint().unwrap_or(0));
+                while let Some(path) = seq.next_element()? {
+                    paths.push(path);
+                }
+                Ok(SequenceFiles::from(paths))
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                let key = map.next_key::<String>()?;
+                if key.as_deref() != Some(RAW_VALUE_TOKEN) {
+                    return Err(A::Error::custom("invalid raw sequence paths"));
+                }
+                let raw: String = map.next_value()?;
+                if map.next_key::<serde::de::IgnoredAny>()?.is_some() {
+                    return Err(A::Error::custom("invalid raw sequence paths"));
+                }
+                // Validate the array and its element types now, retaining only a small fast-path
+                // flag instead of allocating every path. The paths themselves decode on access.
+                let paths: Vec<SequenceString> = serde_json::from_str(&raw).map_err(A::Error::custom)?;
+                let plain_absolute_local = paths.iter().all(|path| path.0);
+                Ok(SequenceFiles { raw: Some(Arc::from(raw)), parsed: OnceLock::new(), plain_absolute_local: OnceLock::from(plain_absolute_local) })
+            }
+        }
+
+        deserializer.deserialize_newtype_struct(RAW_VALUE_TOKEN, FilesVisitor)
     }
 }
 
