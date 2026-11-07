@@ -214,12 +214,13 @@ fn affine_rows(dst: &mut Image, img: &Image, inv: &Mat3, rows: AffineRows, blend
     // glow-padded layer's buffer) without reading them.
     let clear = (sampling == Sampling::Bilinear && !int_tx).then(|| ClearTiles::new(img));
     let empty = [usize::MAX, usize::MAX, 0, 0];
+    let workers = rayon::current_num_threads().clamp(1, 8);
     dst.data
         .par_chunks_mut(w)
         .enumerate()
         .skip(y0)
         .take(y1 - y0)
-        .with_min_len((y1 - y0).div_ceil(4).max(1))
+        .with_min_len((y1 - y0).div_ceil(workers).max(1))
         .map(|(y, row)| {
             let mut changed = RowSpan::NONE;
             let fy = y as f64 + 0.5;
