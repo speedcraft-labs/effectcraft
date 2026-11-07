@@ -307,7 +307,7 @@ mod tests {
         let dir = Fixture::new();
         let (mut s, id, mut old) = setup(&dir, "shot_0002.png");
         old.kind = FootageKind::Sequence;
-        old.sequence = vec![old.path.clone(), dir.0.join("old/shot_0004.png").to_str().unwrap().into()];
+        old.sequence = vec![old.path.clone(), dir.0.join("old/shot_0004.png").to_str().unwrap().into()].into();
         Arc::make_mut(&mut s.project).item_mut(id).unwrap().kind = ItemKind::Footage(old.clone());
         dir.file("new/shot_0002.png", b"valid");
         assert_eq!(search(&mut s, &dir, false)["relinked"], 0);
