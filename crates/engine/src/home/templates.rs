@@ -683,7 +683,7 @@ fn embed_footage(s: &Session, proj: &mut Project, entries: &mut Vec<(String, Vec
         if f.data.is_some() || f.path.is_empty() {
             continue;
         }
-        let files: Vec<String> = if f.sequence.is_empty() { vec![f.path.clone()] } else { f.sequence.clone() };
+        let files: Vec<String> = if f.sequence.is_empty() { vec![f.path.clone()] } else { f.sequence.to_vec() };
         let mut data = vec![];
         let mut missing = None;
         for file in &files {
@@ -712,7 +712,7 @@ fn embed_footage(s: &Session, proj: &mut Project, entries: &mut Vec<(String, Vec
         }
         f.path = stored[0].clone();
         if !f.sequence.is_empty() {
-            f.sequence = stored.clone();
+            f.sequence = stored.clone().into();
         }
         out.bytes += size;
         out.media.push(json!({"item": id.0, "files": stored, "bytes": size}));
@@ -1135,7 +1135,7 @@ mod tests {
     }
 
     fn add_footage(s: &mut Session, name: &str, path: &str, sequence: Vec<String>) -> ItemId {
-        let f = effectcraft_project::Footage { path: path.into(), width: 4, height: 4, has_video: true, sequence, ..Default::default() };
+        let f = effectcraft_project::Footage { path: path.into(), width: 4, height: 4, has_video: true, sequence: sequence.into(), ..Default::default() };
         Arc::make_mut(&mut s.project).add_item(name, effectcraft_color::Label::Aqua, None, effectcraft_project::ItemKind::Footage(f))
     }
 
@@ -1145,7 +1145,7 @@ mod tests {
             .items
             .values()
             .filter_map(|i| match &i.kind {
-                effectcraft_project::ItemKind::Footage(f) => Some((i.name.clone(), f.path.clone(), f.sequence.clone())),
+                effectcraft_project::ItemKind::Footage(f) => Some((i.name.clone(), f.path.clone(), f.sequence.to_vec())),
                 _ => None,
             })
             .collect();

@@ -49,7 +49,7 @@ fn audio_footage() -> Footage {
         loop_count: 1,
         codec: String::new(),
         missing: false,
-        sequence: vec![],
+        sequence: vec![].into(),
         color_profile: None,
         ..Default::default()
     }

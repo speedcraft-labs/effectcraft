@@ -203,4 +203,37 @@ mod tests {
         assert!((f.duration.seconds() - 0.5).abs() < 1e-9);
         assert_eq!(Footage::default().sequence_frames(), 0);
     }
+
+    #[test]
+    fn sequence_paths_stay_deferred_until_used() -> Result<(), Box<dyn std::error::Error>> {
+        let mut value = serde_json::to_value(Footage::default())?;
+        value["sequence"] = serde_json::json!(["shot_0001.exr", "shot_0002.exr"]);
+        let json = serde_json::to_string(&value)?;
+
+        let footage: Footage = serde_json::from_str(&json)?;
+        assert!(!footage.sequence.is_materialized());
+
+        let saved = serde_json::to_value(&footage)?;
+        assert_eq!(saved["sequence"], value["sequence"]);
+        assert!(!footage.sequence.is_materialized());
+
+        assert_eq!(&*footage.sequence, &["shot_0001.exr", "shot_0002.exr"]);
+        assert!(footage.sequence.is_materialized());
+        Ok(())
+    }
+
+    #[test]
+    fn deferred_empty_sequence_is_omitted_and_non_strings_are_rejected() -> Result<(), Box<dyn std::error::Error>> {
+        let mut value = serde_json::to_value(Footage::default())?;
+        value["sequence"] = serde_json::json!(["placeholder"]);
+        let json = serde_json::to_string(&value)?.replace("[\"placeholder\"]", "[ \n ]");
+        let footage: Footage = serde_json::from_str(&json)?;
+        assert!(footage.sequence.is_empty());
+        assert!(serde_json::to_value(&footage)?.get("sequence").is_none());
+
+        value["sequence"] = serde_json::json!([null]);
+        let invalid = serde_json::to_string(&value)?;
+        assert!(serde_json::from_str::<Footage>(&invalid).is_err());
+        Ok(())
+    }
 }

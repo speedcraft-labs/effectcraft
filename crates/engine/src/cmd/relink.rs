@@ -138,7 +138,7 @@ fn run(s: &mut Session, p: &Value) -> Result<Value> {
                 let mut new = old.clone();
                 new.path = path.clone();
                 if old.kind == FootageKind::Sequence {
-                    new.sequence = sequence_at(old, path).ok_or_else(|| "sequence changed during search; run the search again".to_string())?;
+                    new.sequence = sequence_at(old, path).ok_or_else(|| "sequence changed during search; run the search again".to_string())?.into();
                 }
                 new.missing = false;
                 updates.push((*id, old.clone(), new));

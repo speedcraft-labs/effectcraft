@@ -151,7 +151,7 @@ pub(crate) fn resolve_footage_of(p: &mut Project, pick: impl Fn(ItemId) -> bool,
         match footage_paths(f, project) {
             Ok((path, sequence)) => {
                 f.path = path;
-                f.sequence = sequence;
+                f.sequence = sequence.into();
             }
             Err((path, why)) => {
                 f.missing = true;

@@ -724,7 +724,7 @@ fn sequence_gaps_show_placeholders() {
         grey(n).save(&p).expect("write png");
         files.push(p.to_string_lossy().to_string());
     }
-    let mut f = Footage { kind: FootageKind::Sequence, sequence: files, ..probe(dir.join("gap_001.png")).expect("probe") };
+    let mut f = Footage { kind: FootageKind::Sequence, sequence: files.into(), ..probe(dir.join("gap_001.png")).expect("probe") };
     f.sync_sequence_duration();
     assert_eq!(f.duration, f.frame_rate.tick_of(4), "frames 1-4");
     let pool = MediaPool::new();
