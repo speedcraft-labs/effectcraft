@@ -493,7 +493,7 @@ impl<'a> Renderer<'a> {
     fn draw_comp(&self, ctx: &EvalCtx<'a>, canvas: &mut Image, mut blank: bool) {
         // Bottom-to-top, with runs of consecutive 3D layers depth-sorted (farthest first).
         let visible = self.visible_layers(ctx);
-        let occluded = self.occluded_solid_layers(ctx, &visible, canvas.width, canvas.height);
+        let occluded = self.occluded_bounded_layers(ctx, &visible, canvas.width, canvas.height);
         let mut i = 0;
         while i < visible.len() {
             if visible[i].is_3d() {
