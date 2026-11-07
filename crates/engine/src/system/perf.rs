@@ -84,8 +84,8 @@ fn footage_item(spec: &LargeSpec, i: usize) -> Footage {
         height,
         pixel_aspect: 1.0,
         has_video: true,
-        // The realistic fixture's generated still is an RGB PNG, so it has no alpha channel.
-        alpha: if spec.realistic && i == 2 { AlphaMode::Ignore } else { AlphaMode::Straight },
+        // Realistic fixture stills are RGB PNGs, so they have no alpha channel.
+        alpha: if spec.realistic && i % 3 == 2 { AlphaMode::Ignore } else { AlphaMode::Straight },
         ..Default::default()
     };
     match i % 3 {
@@ -152,7 +152,16 @@ fn realistic_opacity(layer: &mut Layer, n: usize) {
 /// One layer of a varied mix: solids, footage, text, shapes, nulls, some with an effect, some
 /// with expressions, parented to the layer above every 7th.
 fn make_layer(p: &mut Project, comp: &Comp, spec: &LargeSpec, n: usize, solid: ItemId, footage: &[ItemId], prev: Option<&Layer>) -> Layer {
-    let image = footage.get(2).copied().unwrap_or_else(|| footage.first().copied().unwrap_or(solid));
+    let image = if spec.realistic {
+        // Spread visible footage layers across several source images instead of repeatedly
+        // drawing the same still. Footage items are grouped as sequences, videos, then stills.
+        let still_index = 2 + ((n / 5) % 8) * 3;
+        footage.get(still_index).copied().or_else(|| footage.get(2).copied())
+    } else {
+        footage.get(2).copied()
+    }
+    .or_else(|| footage.first().copied())
+    .unwrap_or(solid);
     let (src, size) = if spec.realistic {
         match n % 5 {
             0 | 4 => (LayerSource::Solid { item: solid }, (640, 360)),
@@ -473,13 +482,20 @@ pub fn operation_bench(spec: &LargeSpec, dir: &std::path::Path, fresh: &dyn Fn()
         let media_dir = dir.join("media");
         generated_spec.media_dir = media_dir.to_string_lossy().into_owned();
         if std::fs::create_dir_all(&media_dir).is_ok() {
-            let image_path = media_dir.join("still002.png");
-            if !image_path.exists() {
-                let mut image = image::RgbImage::new(640, 360);
-                for (x, y, px) in image.enumerate_pixels_mut() {
-                    *px = image::Rgb([((x * 13 + y * 3) % 256) as u8, ((x * 5 + y * 11) % 256) as u8, ((x * 7 + y * 17) % 256) as u8]);
+            for still_index in (2..spec.footage).step_by(3).take(8) {
+                let image_path = media_dir.join(format!("still{still_index:03}.png"));
+                if !image_path.exists() {
+                    let mut image = image::RgbImage::new(640, 360);
+                    for (x, y, px) in image.enumerate_pixels_mut() {
+                        let variant = (still_index / 3) as u32;
+                        *px = image::Rgb([
+                            ((x * 13 + y * 3 + variant * 29) % 256) as u8,
+                            ((x * 5 + y * 11 + variant * 47) % 256) as u8,
+                            ((x * 7 + y * 17 + variant * 61) % 256) as u8,
+                        ]);
+                    }
+                    let _ = image.save(&image_path);
                 }
-                let _ = image.save(&image_path);
             }
         }
     }
@@ -599,6 +615,15 @@ mod tests {
             .unwrap();
         assert_eq!(main.layers.len(), spec.main_layers);
         assert!(main.layers.iter().all(|layer| layer.is_active_at(Tick::ZERO)));
+        let visible_footage: std::collections::HashSet<_> = main
+            .layers
+            .iter()
+            .filter_map(|layer| match layer.source {
+                LayerSource::Footage { item } => Some(item),
+                _ => None,
+            })
+            .collect();
+        assert!(visible_footage.len() >= 4, "realistic comp should draw several distinct stills");
         assert!(main.layers.iter().any(|layer| matches!(layer.source, LayerSource::Footage { .. })));
         assert!(main.layers.iter().any(|layer| matches!(layer.source, LayerSource::Text) && layer.props.prop("text/sourceText").is_some()));
         assert!(
