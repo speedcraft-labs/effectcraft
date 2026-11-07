@@ -102,6 +102,7 @@ fn collapsed_instance(ctx: &EvalCtx, layer: &Layer, item: ItemId) -> Option<(Vec
 
 impl<'a> Renderer<'a> {
     pub fn new(project: &'a Project, footage: &'a dyn FootageSource, opts: RenderOpts) -> Renderer<'a> {
+        super::configure_parallelism();
         Renderer {
             project,
             footage,
