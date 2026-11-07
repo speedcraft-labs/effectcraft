@@ -2,7 +2,9 @@
 
 use effectcraft_keyframe::{Keyframe, Value};
 use effectcraft_time::Tick;
-use serde::{Deserialize, Serialize};
+use serde::de::{self, MapAccess, Visitor, value::MapAccessDeserializer};
+use serde::{Deserialize, Deserializer, Serialize};
+use std::fmt;
 
 pub type Uid = u64;
 
@@ -268,11 +270,62 @@ fn yes() -> bool {
     true
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(tag = "node")]
 pub enum Node {
     Prop(Property),
     Group(PropGroup),
+}
+
+/// The derive for an internally tagged enum buffers every node into `Content` before it can
+/// choose a variant. Project files written by EffectCraft put `node` first, so deserialize the
+/// selected struct directly from the remaining map. Keep a buffered fallback for valid files
+/// whose object keys are ordered differently.
+#[derive(Deserialize)]
+#[serde(tag = "node")]
+enum BufferedNode {
+    Prop(Property),
+    Group(PropGroup),
+}
+
+struct NodeVisitor;
+
+impl<'de> Visitor<'de> for NodeVisitor {
+    type Value = Node;
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("a tagged property or group node")
+    }
+
+    fn visit_map<M: MapAccess<'de>>(self, mut map: M) -> Result<Node, M::Error> {
+        let Some(first) = map.next_key::<String>()? else {
+            return Err(de::Error::custom("empty project node"));
+        };
+        if first == "node" {
+            let tag = map.next_value::<String>()?;
+            return match tag.as_str() {
+                "Prop" => Property::deserialize(MapAccessDeserializer::new(map)).map(Node::Prop),
+                "Group" => PropGroup::deserialize(MapAccessDeserializer::new(map)).map(Node::Group),
+                _ => Err(de::Error::unknown_variant(&tag, &["Prop", "Group"])),
+            };
+        }
+
+        let mut fields = serde_json::Map::new();
+        fields.insert(first, map.next_value()?);
+        while let Some(key) = map.next_key::<String>()? {
+            fields.insert(key, map.next_value()?);
+        }
+        match BufferedNode::deserialize(serde_json::Value::Object(fields)).map_err(de::Error::custom)? {
+            BufferedNode::Prop(p) => Ok(Node::Prop(p)),
+            BufferedNode::Group(g) => Ok(Node::Group(g)),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for Node {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Node, D::Error> {
+        deserializer.deserialize_map(NodeVisitor)
+    }
 }
 
 impl Node {
@@ -613,5 +666,19 @@ impl From<Property> for Node {
 impl From<PropGroup> for Node {
     fn from(g: PropGroup) -> Node {
         Node::Group(g)
+    }
+}
+
+#[cfg(test)]
+mod node_deserialization_tests {
+    use super::Node;
+
+    #[test]
+    fn tagged_nodes_accept_tag_first_and_reordered_fields() {
+        let tag_first = r#"{"node":"Group","uid":2,"match":"root","name":"Root","children":[{"node":"Prop","uid":1,"match":"value","name":"Value","value":{"t":"Scalar","v":2.0}}]}"#;
+        let reordered = r#"{"uid":2,"match":"root","name":"Root","children":[{"uid":1,"match":"value","name":"Value","value":{"t":"Scalar","v":2.0},"node":"Prop"}],"node":"Group"}"#;
+        let direct: Node = serde_json::from_str(tag_first).unwrap();
+        let fallback: Node = serde_json::from_str(reordered).unwrap();
+        assert_eq!(direct, fallback);
     }
 }
