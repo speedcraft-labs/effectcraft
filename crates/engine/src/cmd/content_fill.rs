@@ -391,7 +391,7 @@ fn add_fill_layer(
         ..Default::default()
     });
     footage.kind = FootageKind::Sequence;
-    footage.sequence = paths.clone();
+    footage.sequence = paths.clone().into();
     footage.frame_rate = fr;
     footage.duration = dur;
     let (lname, item, layer) = s.edit("Content-Aware Fill", None, |proj, st| {

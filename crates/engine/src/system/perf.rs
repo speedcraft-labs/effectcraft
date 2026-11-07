@@ -89,7 +89,7 @@ fn footage_item(spec: &LargeSpec, i: usize) -> Footage {
                 frame_rate: FrameRate::FPS_30,
                 duration: Tick::from_seconds_f64(spec.sequence_frames as f64 / 30.0),
                 codec: "PNG".into(),
-                sequence: frames,
+                sequence: frames.into(),
                 ..base
             }
         }

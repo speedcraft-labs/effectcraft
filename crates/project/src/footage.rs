@@ -1,5 +1,167 @@
 use super::settings::{Marker, yes};
 use super::{ColorSpace, Deserialize, FrameRate, Serialize, Tick};
+use serde::de::{Error as _, Visitor};
+use serde::{Deserializer, Serializer};
+use std::ops::{Deref, DerefMut};
+use std::sync::{Arc, OnceLock};
+
+/// An image sequence's file paths, kept as raw JSON until something needs the paths.
+///
+/// Large projects can contain tens of thousands of sequence paths that the first rendered frame
+/// never reads. Keeping the valid JSON array here defers per-path string allocation until a
+/// sequence is inspected or used. Serialization writes the original array directly while it is
+/// still deferred.
+#[derive(Clone, Debug)]
+pub struct SequenceFiles {
+    raw: Option<Arc<Box<serde_json::value::RawValue>>>,
+    parsed: OnceLock<Vec<String>>,
+}
+
+impl SequenceFiles {
+    pub fn is_empty(&self) -> bool {
+        if let Some(paths) = self.parsed.get() {
+            return paths.is_empty();
+        }
+        self.raw
+            .as_ref()
+            .is_none_or(|raw| raw.get().trim().strip_prefix('[').and_then(|value| value.strip_suffix(']')).is_some_and(|value| value.trim().is_empty()))
+    }
+
+    /// Whether this list has been expanded into path strings yet.
+    pub fn is_materialized(&self) -> bool {
+        self.parsed.get().is_some()
+    }
+
+    fn paths(&self) -> &[String] {
+        self.parsed.get_or_init(|| self.raw.as_ref().and_then(|raw| serde_json::from_str::<Vec<String>>(raw.get()).ok()).unwrap_or_default())
+    }
+}
+
+impl Default for SequenceFiles {
+    fn default() -> Self {
+        SequenceFiles { raw: None, parsed: OnceLock::new() }
+    }
+}
+
+impl From<Vec<String>> for SequenceFiles {
+    fn from(paths: Vec<String>) -> Self {
+        SequenceFiles { raw: None, parsed: OnceLock::from(paths) }
+    }
+}
+
+impl FromIterator<String> for SequenceFiles {
+    fn from_iter<T: IntoIterator<Item = String>>(iter: T) -> Self {
+        SequenceFiles::from(iter.into_iter().collect::<Vec<String>>())
+    }
+}
+
+impl Deref for SequenceFiles {
+    type Target = [String];
+
+    fn deref(&self) -> &Self::Target {
+        self.paths()
+    }
+}
+
+impl DerefMut for SequenceFiles {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        if self.parsed.get().is_none() {
+            let paths = self.raw.as_ref().and_then(|raw| serde_json::from_str::<Vec<String>>(raw.get()).ok()).unwrap_or_default();
+            self.parsed = OnceLock::from(paths);
+        }
+        self.raw = None;
+        match self.parsed.get_mut() {
+            Some(paths) => paths,
+            None => &mut [],
+        }
+    }
+}
+
+impl<'a> IntoIterator for &'a SequenceFiles {
+    type Item = &'a String;
+    type IntoIter = std::slice::Iter<'a, String>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.paths().iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a mut SequenceFiles {
+    type Item = &'a mut String;
+    type IntoIter = std::slice::IterMut<'a, String>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.deref_mut().iter_mut()
+    }
+}
+
+impl PartialEq for SequenceFiles {
+    fn eq(&self, other: &Self) -> bool {
+        self.paths() == other.paths()
+    }
+}
+
+impl Eq for SequenceFiles {}
+
+impl Serialize for SequenceFiles {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        if self.parsed.get().is_none()
+            && let Some(raw) = &self.raw
+        {
+            return raw.as_ref().serialize(serializer);
+        }
+        self.paths().serialize(serializer)
+    }
+}
+
+struct SequenceString;
+
+impl<'de> Deserialize<'de> for SequenceString {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct StringVisitor;
+
+        impl<'de> Visitor<'de> for StringVisitor {
+            type Value = SequenceString;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a sequence path string")
+            }
+
+            fn visit_str<E>(self, _: &str) -> Result<Self::Value, E> {
+                Ok(SequenceString)
+            }
+
+            fn visit_borrowed_str<E>(self, _: &'de str) -> Result<Self::Value, E> {
+                Ok(SequenceString)
+            }
+
+            fn visit_string<E>(self, _: String) -> Result<Self::Value, E> {
+                Ok(SequenceString)
+            }
+        }
+
+        deserializer.deserialize_str(StringVisitor)
+    }
+}
+
+impl<'de> Deserialize<'de> for SequenceFiles {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = Box::<serde_json::value::RawValue>::deserialize(deserializer)?;
+        // Validate the array and its element types now, using zero-sized placeholders instead of
+        // allocating every path. The paths themselves are decoded only on first access.
+        let _: Vec<SequenceString> = serde_json::from_str(raw.get()).map_err(D::Error::custom)?;
+        Ok(SequenceFiles { raw: Some(Arc::new(raw)), parsed: OnceLock::new() })
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FootageKind {
@@ -217,8 +379,8 @@ pub struct Footage {
     #[serde(default)]
     pub missing: bool,
     /// Image sequence files (when kind = Sequence).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub sequence: Vec<String>,
+    #[serde(default, skip_serializing_if = "SequenceFiles::is_empty")]
+    pub sequence: SequenceFiles,
     /// Colour profile (from the file's metadata, or Interpret Footage). `None` = sRGB.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub color_profile: Option<ColorSpace>,
@@ -293,7 +455,7 @@ impl Default for Footage {
             loop_count: 1,
             codec: String::new(),
             missing: false,
-            sequence: vec![],
+            sequence: SequenceFiles::default(),
             color_profile: None,
             fields: FieldOrder::Off,
             invert_alpha: false,
