@@ -1,6 +1,6 @@
 use std::sync::{Arc, Mutex};
 
-use effectcraft_project::{Footage, ItemId, ItemKind};
+use effectcraft_project::{Footage, ItemId, ItemKind, Project};
 use serde_json::json;
 
 use crate::{Event, Services, Session};
@@ -168,4 +168,45 @@ fn stored_paths_resolve_against_the_project() {
     assert_eq!(super::resolve(r"C:\art\clip.mov", Some(doc)), Err(super::NotFollowed::Refused(super::Refused::Invalid)));
     #[cfg(windows)]
     assert!(super::resolve(r"\\server\share\x.mov", Some(r"\\SERVER\share\job\intro.ecproj")).is_ok());
+}
+
+#[cfg(unix)]
+#[test]
+fn absolute_sequence_paths_stay_deferred_through_project_open() {
+    let mut value = serde_json::to_value(Footage::default()).unwrap();
+    value["path"] = json!("/tmp/media/shot_0001.exr");
+    value["kind"] = json!("Sequence");
+    value["sequence"] = json!(["/tmp/media/shot_0001.exr", "/tmp/media/shot_0002.exr"]);
+    let footage: Footage = serde_json::from_value(value).unwrap();
+    assert!(!footage.sequence.is_materialized());
+
+    let mut project = Project::default();
+    let id = project.add_item("Sequence", effectcraft_color::Label::None, None, ItemKind::Footage(footage));
+    assert!(super::resolve_footage(&mut project, Some("/tmp/Project.ecproj")).is_empty());
+    let ItemKind::Footage(footage) = &project.item(id).unwrap().kind else { panic!("footage") };
+    assert_eq!(footage.path, "/tmp/media/shot_0001.exr");
+    assert!(!footage.sequence.is_materialized());
+
+    let mut paths = super::StoredPaths::default();
+    paths.add(&project, Some("/tmp/Project.ecproj"));
+    assert!(!footage.sequence.is_materialized());
+    assert_eq!(paths.follow("/tmp/media/shot_0002.exr"), Ok(std::path::PathBuf::from("/tmp/media/shot_0002.exr")));
+}
+
+#[cfg(unix)]
+#[test]
+fn relative_sequence_paths_still_resolve_and_validate_on_open() {
+    let mut value = serde_json::to_value(Footage::default()).unwrap();
+    value["path"] = json!("media/shot_0001.exr");
+    value["kind"] = json!("Sequence");
+    value["sequence"] = json!(["media/shot_0001.exr", "media/shot_0002.exr"]);
+    let footage: Footage = serde_json::from_value(value).unwrap();
+    assert!(!footage.sequence.is_materialized());
+
+    let mut project = Project::default();
+    let id = project.add_item("Sequence", effectcraft_color::Label::None, None, ItemKind::Footage(footage));
+    assert!(super::resolve_footage(&mut project, Some("/tmp/Project.ecproj")).is_empty());
+    let ItemKind::Footage(footage) = &project.item(id).unwrap().kind else { panic!("footage") };
+    assert_eq!(footage.path, "/tmp/media/shot_0001.exr");
+    assert_eq!(&*footage.sequence, &["/tmp/media/shot_0001.exr", "/tmp/media/shot_0002.exr"]);
 }
