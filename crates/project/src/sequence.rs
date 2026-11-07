@@ -235,7 +235,7 @@ mod tests {
         assert_eq!(serde_json::to_value(&footage)?["sequence"], value["sequence"]);
         assert!(!footage.sequence.is_materialized());
 
-        footage.sequence.push("relative/frame.exr".into());
+        footage.sequence[0] = "relative/frame.exr".into();
         assert!(!footage.sequence.has_plain_absolute_local_paths());
         assert!(footage.sequence.is_materialized());
         Ok(())
