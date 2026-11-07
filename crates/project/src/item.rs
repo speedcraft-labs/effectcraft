@@ -20,6 +20,28 @@ struct ProjectItemParts<'a> {
 }
 
 #[derive(Deserialize)]
+struct ProjectItemPartsFast {
+    id: ItemId,
+    name: String,
+    label: Label,
+    #[serde(default)]
+    comment: String,
+    #[serde(default)]
+    parent: Option<ItemId>,
+    #[serde(deserialize_with = "deserialize_project_kind")]
+    kind: ItemKind,
+    #[serde(default)]
+    proxy: Option<Box<Proxy>>,
+}
+
+fn deserialize_project_kind<'de, D>(deserializer: D) -> Result<ItemKind, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserializer.deserialize_map(ProjectItemKindVisitor)
+}
+
+#[derive(Deserialize)]
 struct ProjectCompParts<'a> {
     width: u32,
     height: u32,
@@ -156,6 +178,10 @@ fn parse_project_kind(raw: &serde_json::value::RawValue) -> Result<ItemKind, ser
 }
 
 fn parse_project_item(raw: &serde_json::value::RawValue) -> Result<Item, serde_json::Error> {
+    if let Ok(item) = serde_json::from_str::<ProjectItemPartsFast>(raw.get()) {
+        return Ok(Item { id: item.id, name: item.name, label: item.label, comment: item.comment, parent: item.parent, kind: item.kind, proxy: item.proxy });
+    }
+    // Preserve compatibility with older files that don't put the kind discriminator first.
     let item: ProjectItemParts<'_> = serde_json::from_str(raw.get())?;
     Ok(Item {
         id: item.id,
