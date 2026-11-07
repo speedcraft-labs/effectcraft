@@ -523,6 +523,10 @@ pub fn operation_bench(spec: &LargeSpec, dir: &std::path::Path, fresh: &dyn Fn()
             let profiled = renderer.comp_frame(cid, Tick::ZERO);
             let main_draws = profile.lock().map(|rows| rows.iter().filter(|row| row.depth == 0).count()).unwrap_or(0);
             let profiled_hash = stable_hash(profiled.data.iter().flatten().flat_map(|channel| channel.to_bits().to_le_bytes()));
+            if spec.realistic {
+                assert_eq!(main_draws, spec.main_layers, "every realistic main-comp layer must draw");
+                assert_eq!(profiled_hash, output_hash, "the profiled render must match the timed render");
+            }
             vec![Measure {
                 name: "firstFrame",
                 ms,
