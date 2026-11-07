@@ -207,12 +207,30 @@ fn parse_project_layers<'a>(layers: Vec<&'a serde_json::value::RawValue>) -> Res
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+fn project_parse_pool() -> Option<&'static rayon::ThreadPool> {
+    static POOL: std::sync::OnceLock<Option<rayon::ThreadPool>> = std::sync::OnceLock::new();
+    POOL.get_or_init(|| {
+        let threads = std::env::var("RAYON_NUM_THREADS")
+            .ok()
+            .and_then(|n| n.parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()));
+        rayon::ThreadPoolBuilder::new().num_threads(threads).build().ok()
+    })
+    .as_ref()
+}
+
 fn parse_project_items<'a>(items: BTreeMap<ItemId, &'a serde_json::value::RawValue>) -> Result<BTreeMap<ItemId, Item>, serde_json::Error> {
     #[cfg(not(target_arch = "wasm32"))]
     {
         use rayon::prelude::*;
 
-        items.into_par_iter().map(|(id, raw)| parse_project_item(raw).map(|item| (id, item))).collect()
+        let parse = move || items.into_par_iter().map(|(id, raw)| parse_project_item(raw).map(|item| (id, item))).collect();
+        match project_parse_pool() {
+            Some(pool) => pool.install(parse),
+            None => parse(),
+        }
     }
     #[cfg(target_arch = "wasm32")]
     {
