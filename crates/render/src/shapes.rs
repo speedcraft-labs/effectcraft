@@ -724,7 +724,11 @@ pub fn render(ctx: &EvalCtx, layer: &Layer, contents: &PropGroup, s: f64) -> Buf
             px += jobs[j].2.w as usize * jobs[j].2.h as usize;
             j += 1;
         }
-        let covs: Vec<Mask> = jobs[i..j].par_iter().map(|(d, paths, r)| draw_coverage(d, paths, &m, *r)).collect();
+        let covs: Vec<Mask> = if j - i >= 4 {
+            jobs[i..j].par_iter().map(|(d, paths, r)| draw_coverage(d, paths, &m, *r)).collect()
+        } else {
+            jobs[i..j].iter().map(|(d, paths, r)| draw_coverage(d, paths, &m, *r)).collect()
+        };
         for ((d, _, r), cov) in jobs[i..j].iter().zip(&covs) {
             match &d.paint {
                 Paint::Fill { color, .. } | Paint::Stroke { color, .. } => paint(&mut img, *r, cov, d.opacity, d.blend, |_, _| *color),

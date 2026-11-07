@@ -215,7 +215,19 @@ impl Session {
     }
 
     /// Replace the whole project (open/new), resetting history and state.
-    pub fn replace_project(&mut self, mut p: Project, path: Option<String>) {
+    pub fn replace_project(&mut self, p: Project, path: Option<String>) {
+        self.replace_project_inner(p, path, true);
+    }
+
+    /// Replace a project already repaired by `Project::from_file_json_repaired`.
+    ///
+    /// The file reader has already raised `next_id` above every item, layer and property UID.
+    /// Avoid walking those 5,000-layer property trees a second time during file open.
+    pub(crate) fn replace_repaired_project(&mut self, p: Project, path: Option<String>) {
+        self.replace_project_inner(p, path, false);
+    }
+
+    fn replace_project_inner(&mut self, mut p: Project, path: Option<String>, fix_ids: bool) {
         if self.stop_render()
             && let Some(mut job) = self.render_job.take()
         {
@@ -239,7 +251,9 @@ impl Session {
         self.roto_pending.clear();
         self.drop_tasks();
         self.script_ui.project_epoch = self.script_ui.project_epoch.wrapping_add(1);
-        p.fix_next_id();
+        if fix_ids {
+            p.fix_next_id();
+        }
         upgrade_effects(&mut p);
         // The media layer keys decoded frames by path: files of the new project may have changed
         // since an earlier project decoded them (#1070).

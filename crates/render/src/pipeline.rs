@@ -5,10 +5,280 @@ use super::fx_host::{FxHost, essential_overrides};
 use super::opts::{Collapse3d, LayerTiming, MAX_THROUGH, RenderOpts, Through};
 use super::{
     Arc, AutoKey, AutoPick, BlendMode, Buf, Comp, EffectCtx, EffectEnv, EvalCtx, Footage, FootageKind, FrameBlend, FrameRate, GroupKind, Image, ItemId,
-    ItemKind, Layer, LayerCache, LayerSource, Params, Project, Quality, Region, Renderer, Tick, cache, color, masks, shapes, styles, text, three_d, vec2,
+    ItemKind, Layer, LayerCache, LayerSource, Params, Project, Quality, Region, Renderer, Tick, WarpOpts, cache, color, masks, shapes, styles, text, three_d,
+    vec2,
 };
 use effectcraft_keyframe::Value;
-use effectcraft_project::LayerId;
+use effectcraft_project::{LayerId, Node, PropGroup};
+use rayon::prelude::*;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Mutex, OnceLock};
+
+const COMP_FRAME_CACHE_BYTES: usize = 128 * 1024 * 1024;
+const COMP_FRAME_CACHE_SINGLE: usize = 8 * 1024 * 1024;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct CompFrameKey {
+    project: usize,
+    comp: ItemId,
+    time: i64,
+    scale: u64,
+    options: u8,
+}
+
+#[derive(Default)]
+struct CompFrameCacheInner {
+    entries: HashMap<CompFrameKey, Arc<Image>>,
+    in_flight: HashMap<CompFrameKey, Arc<OnceLock<Arc<Image>>>>,
+    static_comps: HashMap<(usize, ItemId, i64), bool>,
+    bytes: usize,
+    #[cfg(test)]
+    hits: usize,
+}
+
+/// A bounded, one-frame memo for small static precomps reused by many layers.
+#[derive(Default)]
+pub(crate) struct CompFrameCache(Mutex<CompFrameCacheInner>);
+
+impl CompFrameCache {
+    fn clear(&self) {
+        if let Ok(mut inner) = self.0.lock() {
+            inner.entries.clear();
+            inner.in_flight.clear();
+            inner.static_comps.clear();
+            inner.bytes = 0;
+            #[cfg(test)]
+            {
+                inner.hits = 0;
+            }
+        }
+    }
+
+    fn render(&self, key: CompFrameKey, render: impl FnOnce() -> Image) -> Image {
+        let (flight, _owner) = {
+            let Ok(mut inner) = self.0.lock() else { return render() };
+            if let Some(image) = inner.entries.get(&key).cloned() {
+                #[cfg(test)]
+                {
+                    inner.hits += 1;
+                }
+                return (*image).clone();
+            }
+            match inner.in_flight.get(&key) {
+                Some(flight) => (flight.clone(), false),
+                None => {
+                    let flight = Arc::new(OnceLock::new());
+                    inner.in_flight.insert(key, flight.clone());
+                    (flight, true)
+                }
+            }
+        };
+        #[cfg(test)]
+        if !_owner {
+            if let Ok(mut inner) = self.0.lock() {
+                inner.hits += 1;
+            }
+        }
+        let image = flight.get_or_init(|| Arc::new(render())).clone();
+        self.insert(key, &image);
+        if let Ok(mut inner) = self.0.lock()
+            && inner.in_flight.get(&key).is_some_and(|current| Arc::ptr_eq(current, &flight))
+        {
+            inner.in_flight.remove(&key);
+        }
+        (*image).clone()
+    }
+
+    fn insert(&self, key: CompFrameKey, image: &Image) {
+        let bytes = image.data.len().saturating_mul(std::mem::size_of::<effectcraft_raster::Px>());
+        if bytes == 0 || bytes > COMP_FRAME_CACHE_SINGLE {
+            return;
+        }
+        let Ok(mut inner) = self.0.lock() else { return };
+        if inner.entries.contains_key(&key) {
+            return;
+        }
+        if inner.bytes.saturating_add(bytes) > COMP_FRAME_CACHE_BYTES {
+            inner.entries.clear();
+            inner.bytes = 0;
+        }
+        inner.entries.insert(key, Arc::new(image.clone()));
+        inner.bytes += bytes;
+    }
+
+    fn is_static(&self, project: &Project, id: ItemId, time: Tick) -> bool {
+        let key = (project as *const Project as usize, id, time.0);
+        if let Ok(inner) = self.0.lock()
+            && let Some(&is_static) = inner.static_comps.get(&key)
+        {
+            return is_static;
+        }
+        let mut path = HashSet::new();
+        let is_static = comp_is_static(project, id, time, &mut path, 0);
+        if let Ok(mut inner) = self.0.lock() {
+            inner.static_comps.insert(key, is_static);
+        }
+        is_static
+    }
+
+    #[cfg(test)]
+    pub(crate) fn hits(&self) -> usize {
+        self.0.lock().map(|inner| inner.hits).unwrap_or(0)
+    }
+}
+
+#[cfg(test)]
+mod comp_frame_cache_tests {
+    use crate::{ItemKind, LayerSource, NoFootage, Project, RenderOpts, Renderer};
+    use effectcraft_color::Label;
+    use effectcraft_keyframe::Value;
+    use effectcraft_project::{Comp, Solid};
+    use effectcraft_time::{FrameRate, Tick};
+    use std::sync::Arc;
+
+    #[test]
+    fn static_precomp_cache_preserves_pixels_and_reuses_frames() {
+        let mut project = Project::default();
+        let main = Comp::new(200, 100, FrameRate::FPS_30, Tick::from_seconds_f64(1.0));
+        let main_id = project.add_item("Main", Label::None, None, ItemKind::Comp(Arc::new(main.clone())));
+
+        let mut plate = Comp::new(40, 20, FrameRate::FPS_30, Tick::from_seconds_f64(1.0));
+        let solid_id =
+            project.add_item("Plate solid", Label::Red, None, ItemKind::Solid(Solid { color: [0.3, 0.6, 0.9], width: 40, height: 20, pixel_aspect: 1.0 }));
+        plate.layers = vec![effectcraft_project::build::layer(&mut project, &plate, "Plate", LayerSource::Solid { item: solid_id }, (40, 20), None)].into();
+        let plate_id = project.add_item("Static plate", Label::Sandstone, None, ItemKind::Comp(Arc::new(plate)));
+
+        let mut layers = Vec::new();
+        for index in 0..4 {
+            let mut layer =
+                effectcraft_project::build::layer(&mut project, &main, &format!("Plate {index}"), LayerSource::Comp { item: plate_id }, (40, 20), None);
+            assert!(layer.props.prop_mut("transform/opacity").is_some_and(|prop| {
+                prop.value = Value::Scalar(40.0 + index as f64 * 10.0);
+                true
+            }));
+            layers.push(layer);
+        }
+        assert!(project.comp_mut(main_id).is_some_and(|comp| {
+            comp.layers = layers.into();
+            true
+        }));
+
+        let footage = NoFootage;
+        let mut uncached = Renderer::new(&project, &footage, RenderOpts::default());
+        uncached.cache_static_comps = false;
+        let expected = uncached.comp_frame(main_id, Tick::ZERO);
+
+        let cached = Renderer::new(&project, &footage, RenderOpts::default());
+        let actual = cached.comp_frame(main_id, Tick::ZERO);
+        assert_eq!(actual, expected);
+        assert_eq!(cached.comp_frames.hits(), 3);
+    }
+
+    #[test]
+    fn parallel_prepared_layers_match_serial_stack_order() {
+        let mut project = Project::default();
+        let main = Comp::new(200, 100, FrameRate::FPS_30, Tick::from_seconds_f64(1.0));
+        let main_id = project.add_item("Main", Label::None, None, ItemKind::Comp(Arc::new(main.clone())));
+
+        let mut plate = Comp::new(40, 20, FrameRate::FPS_30, Tick::from_seconds_f64(1.0));
+        let solid_id =
+            project.add_item("Plate solid", Label::Red, None, ItemKind::Solid(Solid { color: [0.3, 0.6, 0.9], width: 40, height: 20, pixel_aspect: 1.0 }));
+        plate.layers = vec![effectcraft_project::build::layer(&mut project, &plate, "Plate", LayerSource::Solid { item: solid_id }, (40, 20), None)].into();
+        let plate_id = project.add_item("Static plate", Label::Sandstone, None, ItemKind::Comp(Arc::new(plate)));
+
+        let modes = [crate::BlendMode::Normal, crate::BlendMode::Multiply, crate::BlendMode::Screen, crate::BlendMode::Add];
+        let mut layers = Vec::new();
+        for index in 0..32 {
+            let mut layer =
+                effectcraft_project::build::layer(&mut project, &main, &format!("Plate {index}"), LayerSource::Comp { item: plate_id }, (40, 20), None);
+            layer.blend_mode = modes[index % modes.len()];
+            assert!(layer.props.prop_mut("transform/opacity").is_some_and(|prop| {
+                prop.value = Value::Scalar([43.0, 61.0, 79.0, 94.0][index % 4]);
+                true
+            }));
+            assert!(layer.props.prop_mut("transform/position").is_some_and(|prop| {
+                let x = if index % 7 == 0 { -100.0 } else { 20.0 + (index * 7 % 160) as f64 };
+                let y = if index % 11 == 0 { -80.0 } else { 20.0 + (index * 11 % 60) as f64 };
+                prop.value = Value::Vec3([x, y, 0.0]);
+                true
+            }));
+            layers.push(layer);
+        }
+        assert!(project.comp_mut(main_id).is_some_and(|comp| {
+            comp.layers = layers.into();
+            true
+        }));
+
+        let footage = NoFootage;
+        let opts = RenderOpts { motion_blur: false, ..RenderOpts::default() };
+        let mut serial = Renderer::new(&project, &footage, opts);
+        let profile = std::sync::Mutex::new(Vec::new());
+        serial.profile = Some(&profile); // Forces the ordinary full-frame layer path.
+        let expected = serial.comp_frame(main_id, Tick::ZERO);
+
+        let parallel = Renderer::new(&project, &footage, opts);
+        let actual = parallel.comp_frame(main_id, Tick::ZERO);
+        assert_eq!(actual, expected);
+    }
+}
+
+fn props_are_static(group: &PropGroup, depth: usize) -> bool {
+    depth < crate::MAX_FX_DEPTH
+        && group.children.iter().all(|node| match node {
+            Node::Prop(prop) => prop.keys.is_empty() && !prop.has_expression(),
+            Node::Group(sub) => props_are_static(sub, depth + 1),
+        })
+}
+
+fn props_have_expression(group: &PropGroup, depth: usize) -> bool {
+    depth >= crate::MAX_FX_DEPTH
+        || group.children.iter().any(|node| match node {
+            Node::Prop(prop) => prop.has_expression(),
+            Node::Group(sub) => props_have_expression(sub, depth + 1),
+        })
+}
+
+fn comp_is_static(project: &Project, id: ItemId, time: Tick, path: &mut HashSet<ItemId>, depth: usize) -> bool {
+    if depth >= crate::MAX_FX_DEPTH || !path.insert(id) {
+        return false;
+    }
+    let Some(comp) = project.comp(id) else {
+        path.remove(&id);
+        return false;
+    };
+    let ctx = EvalCtx::new(project, id, comp, time);
+    let static_layers = !comp.layers.is_empty()
+        && comp.layers.iter().all(|layer| {
+            if !layer.switches.video
+                || layer.is_3d()
+                || layer.parent.is_some()
+                || layer.switches.adjustment
+                || layer.switches.collapse
+                || layer.preserve_transparency
+                || layer.track_matte.is_some()
+                || layer.masks().is_some_and(|m| !m.children.is_empty())
+                || layer.switches.effects && layer.effects().is_some_and(|fx| fx.groups().any(|group| group.enabled))
+                || !props_are_static(&layer.props, 0)
+                || styles::active(&ctx, layer)
+            {
+                return false;
+            }
+            match layer.source {
+                LayerSource::Solid { item } => project.item(item).is_some_and(|it| it.proxy.is_none() && matches!(&it.kind, ItemKind::Solid(_))),
+                LayerSource::Text | LayerSource::Shape => true,
+                LayerSource::Footage { item } => project
+                    .item(ctx.media_item(layer, item))
+                    .is_some_and(|it| it.proxy.is_none() && matches!(&it.kind, ItemKind::Footage(f) if f.kind == FootageKind::Still)),
+                LayerSource::Comp { item } => {
+                    let nested_time = ctx.nested_time(layer);
+                    project.item(item).is_some_and(|it| it.proxy.is_none()) && comp_is_static(project, item, nested_time, path, depth + 1)
+                }
+                _ => false,
+            }
+        });
+    path.remove(&id);
+    static_layers
+}
 
 /// Coordinate space and stack range shared by CPU and accelerated effect evaluation.
 #[derive(Clone, Copy)]
@@ -110,6 +380,8 @@ impl<'a> Renderer<'a> {
             opts,
             cache: None,
             profile: None,
+            comp_frames: Arc::new(CompFrameCache::default()),
+            cache_static_comps: true,
             accel: None,
             depth: 0,
             pipe: color::Pipe::of(&project.settings),
@@ -177,7 +449,7 @@ impl<'a> Renderer<'a> {
             top: false,
             through: [None; MAX_THROUGH],
             through_lost: false,
-            ..*self
+            ..self.clone()
         }
     }
 
@@ -275,7 +547,16 @@ impl<'a> Renderer<'a> {
             *slot = Some(link);
         }
         Some((
-            Renderer { opts: self.nested_opts(), depth: self.depth + 1, outer, opacity_mul: opacity, collapse3d: Some(c3), through, through_lost, ..*self },
+            Renderer {
+                opts: self.nested_opts(),
+                depth: self.depth + 1,
+                outer,
+                opacity_mul: opacity,
+                collapse3d: Some(c3),
+                through,
+                through_lost,
+                ..self.clone()
+            },
             nctx,
         ))
     }
@@ -374,7 +655,7 @@ impl<'a> Renderer<'a> {
     /// This renderer with another accelerator (or none): the passes of
     /// [`passes::in_passes`] render with the accelerator, its CPU fallback without.
     pub fn with_accel(&self, accel: Option<&'a dyn Accelerator>) -> Renderer<'a> {
-        Renderer { accel, ..*self }
+        Renderer { accel, ..self.clone() }
     }
 
     /// The accelerator to use for this render, if any (see [`Backend`]).
@@ -390,6 +671,57 @@ impl<'a> Renderer<'a> {
     /// Render a composition at comp time `t` (transparent background, comp size × scale).
     /// Top-level frames go to the GPU when [`Self::active_accel`] is set and handles them.
     pub fn comp_frame(&self, comp_id: ItemId, t: Tick) -> Image {
+        if self.depth == 0 {
+            self.comp_frames.clear();
+        }
+        if self.cache_static_comps
+            && let Some(key) = self.comp_frame_cache_key(comp_id, t)
+        {
+            return self.comp_frames.render(key, || self.comp_frame_uncached(comp_id, t));
+        }
+        self.comp_frame_uncached(comp_id, t)
+    }
+
+    fn comp_frame_cache_key(&self, comp_id: ItemId, t: Tick) -> Option<CompFrameKey> {
+        if self.depth == 0
+            || self.profile.is_some()
+            || self.active_accel().is_some()
+            || self.opts.roi.is_some()
+            || self.opts.view.is_some()
+            || self.footage.called_off()
+            || self.outer.is_some()
+            || self.collapse3d.is_some()
+            || self.through_lost
+            || self.through.iter().any(Option::is_some)
+        {
+            return None;
+        }
+        let (inherited_quality, inherited_motion_blur) = self.inherited.map_or((0, false), |(quality, motion_blur)| {
+            (
+                match quality {
+                    Quality::Best => 0,
+                    Quality::Draft => 1,
+                    Quality::Wireframe => 2,
+                },
+                motion_blur,
+            )
+        });
+        self.comp_frames.is_static(self.project, comp_id, t).then_some(CompFrameKey {
+            project: self.project as *const Project as usize,
+            comp: comp_id,
+            time: t.0,
+            scale: self.opts.scale.to_bits(),
+            options: u8::from(self.opts.motion_blur)
+                | (u8::from(self.opts.draft) << 1)
+                | (u8::from(self.opts.nested_switches) << 2)
+                | (u8::from(self.opts.guides) << 3)
+                | (u8::from(self.opts.draft_shadows) << 4)
+                | (inherited_quality << 5)
+                | (u8::from(inherited_motion_blur) << 7),
+        })
+    }
+
+    fn comp_frame_uncached(&self, comp_id: ItemId, t: Tick) -> Image {
         // Classic 3D runs composite on the GPU too (M12.7), so Auto sends 3D comps there as well;
         // Auto renders each comp on whichever compositor measured faster ([`AutoPick`]).
         if self.depth == 0
@@ -440,7 +772,7 @@ impl<'a> Renderer<'a> {
             && comp.has_3d()
             && (roi_inside(r, comp.width, comp.height) || comp.renderer == effectcraft_project::Renderer::Advanced3D)
         {
-            let full = Renderer { opts: RenderOpts { roi: None, ..self.opts }, ..*self }.comp_frame(comp_id, t);
+            let full = Renderer { opts: RenderOpts { roi: None, ..self.opts }, ..self.clone() }.comp_frame(comp_id, t);
             let (x0, y0) = ((r[0] * s).round() as i64, (r[1] * s).round() as i64);
             let (rw, rh) = (((r[2] * s).round() as u32).max(1), ((r[3] * s).round() as u32).max(1));
             let mut out = Image::new(rw, rh);
@@ -495,8 +827,20 @@ impl<'a> Renderer<'a> {
         // Bottom-to-top, with runs of consecutive 3D layers depth-sorted (farthest first).
         let visible = self.visible_layers(ctx);
         let occluded = self.occluded_bounded_layers(ctx, &visible, canvas.width, canvas.height);
+        let parallel_prepare = self.can_prepare_layers_parallel();
         let mut i = 0;
         while i < visible.len() {
+            if parallel_prepare && self.can_prepare_layer(visible[i]) {
+                let mut end = i + 1;
+                while end < visible.len() && self.can_prepare_layer(visible[end]) {
+                    end += 1;
+                }
+                if end - i >= 16 {
+                    self.draw_comp_parallel_prepared(ctx, &visible[i..end], &occluded[i..end], canvas, &mut blank);
+                    i = end;
+                    continue;
+                }
+            }
             if visible[i].is_3d() {
                 let mut j = i;
                 while j < visible.len() && visible[j].is_3d() {
@@ -521,6 +865,120 @@ impl<'a> Renderer<'a> {
                 self.pipe.quantize_region(canvas, changed);
                 blank = false;
             }
+        }
+    }
+
+    /// Parallel source processing is safe when every layer can be prepared without reading the
+    /// current comp canvas. The row batch below keeps each output pixel's layer order intact.
+    fn can_prepare_layers_parallel(&self) -> bool {
+        self.depth == 0
+            && self.profile.is_none()
+            && self.active_accel().is_none()
+            && self.opts.roi.is_none()
+            && self.opts.view.is_none()
+            && self.outer.is_none()
+            && self.collapse3d.is_none()
+            && self.inherited.is_none()
+            && !self.through_lost
+            && self.through.iter().all(Option::is_none)
+    }
+
+    fn can_prepare_layer(&self, layer: &Layer) -> bool {
+        !layer.is_3d()
+            && !layer.switches.adjustment
+            && !layer.switches.collapse
+            && !layer.preserve_transparency
+            && layer.track_matte.is_none()
+            && layer.parent.is_none()
+            && !layer.blend_mode.is_stencil()
+            && self.quality(layer) != Quality::Wireframe
+            && !props_have_expression(&layer.props, 0)
+    }
+
+    /// Prepare bounded batches so a 5,000-layer frame never retains thousands of full layer
+    /// buffers at once. The source pass is parallel; affine rows then visit the prepared layers
+    /// in stack order, so every pixel sees the same blend and quantisation sequence.
+    fn draw_comp_parallel_prepared(&self, ctx: &EvalCtx<'a>, layers: &[&Layer], occluded: &[bool], canvas: &mut Image, blank: &mut bool) {
+        const BATCH: usize = 32;
+        for start in (0..layers.len()).step_by(BATCH) {
+            let end = (start + BATCH).min(layers.len());
+            let prepared: Vec<_> = layers[start..end]
+                .par_iter()
+                .enumerate()
+                .map(|(offset, layer)| {
+                    if occluded[start + offset] || self.layer_outside_canvas(ctx, layer, canvas.width, canvas.height) {
+                        return None;
+                    }
+                    let opacity = ctx.opacity(layer) as f32 * self.opacity_mul;
+                    if opacity <= 0.0 || self.empty_precomp(ctx, layer) {
+                        return None;
+                    }
+                    self.styled_for_draw(ctx, layer, None).map(|st| (self.styled_to_blend(st), opacity))
+                })
+                .collect();
+
+            let row_plans: Option<Vec<_>> = if canvas.width > 0 {
+                prepared
+                    .par_iter()
+                    .zip(layers[start..end].par_iter())
+                    .enumerate()
+                    .map(|(offset, (prepared, layer))| -> Option<Option<_>> {
+                        let Some((st, opacity)) = prepared else { return Some(None) };
+                        if !st.plain {
+                            return None;
+                        }
+                        let placement = self.placement(ctx, layer, &st.body);
+                        let [matrix] = placement.matrices.as_slice() else { return None };
+                        let layer_blank = *blank && offset == 0;
+                        let footprint = self.footprint(ctx, layer, &st.body, *opacity, layer_blank);
+                        let quantize = if footprint == Region::Empty { None } else { self.pipe.levels };
+                        let opts = WarpOpts { sampling: placement.sampling, opacity: *opacity, mode: layer.blend_mode, seed: layer.id.0 as u32, clip: None };
+                        let plan = effectcraft_raster::prepare_warp_rows(
+                            &st.body.img,
+                            matrix,
+                            &opts,
+                            canvas.width,
+                            canvas.height,
+                            quantize,
+                            self.source_is_known_opaque(ctx, layer),
+                        )?;
+                        Some(Some(plan))
+                    })
+                    .collect::<Option<Vec<_>>>()
+            } else {
+                None
+            };
+
+            if let Some(row_plans) = row_plans {
+                let width = canvas.width as usize;
+                const TILE_ROWS: usize = 8;
+                let rows_per_tile = width * TILE_ROWS;
+                let mut tile_plans = vec![Vec::new(); canvas.height.div_ceil(TILE_ROWS as u32) as usize];
+                for plan in row_plans.iter().flatten() {
+                    let (y0, y1) = plan.y_bounds();
+                    if y0 < y1 {
+                        for tile_y in y0 / TILE_ROWS..=(y1 - 1) / TILE_ROWS {
+                            tile_plans[tile_y].push(plan);
+                        }
+                    }
+                }
+                canvas.data.par_chunks_mut(rows_per_tile).enumerate().for_each(|(tile_y, tile)| {
+                    for (dy, row) in tile.chunks_mut(width).enumerate() {
+                        let y = tile_y * TILE_ROWS + dy;
+                        for plan in &tile_plans[tile_y] {
+                            plan.blend_row(y, row);
+                        }
+                    }
+                });
+            } else {
+                let mut draw_blank = *blank;
+                for (layer, prepared) in layers[start..end].iter().zip(prepared) {
+                    let changed = prepared.map_or(Region::Empty, |(st, opacity)| self.draw_prepared_layer(ctx, layer, st, canvas, opacity, draw_blank));
+                    self.pipe.quantize_region(canvas, changed);
+                    draw_blank = false;
+                }
+            }
+            *blank = false;
         }
     }
 
@@ -737,7 +1195,11 @@ impl<'a> Renderer<'a> {
                 let base = self.nested_through(layer);
                 let base = Renderer { opts: RenderOpts { scale: bs, ..base.opts }, ..base };
                 let sub = match &tmp {
-                    Some(p) => Renderer { project: p, ..base },
+                    // These per-instance project copies can be dropped and their allocation
+                    // reused while another override is rendered in the same top-level frame.
+                    // The static-frame cache keys projects by address, so keep override renders
+                    // out of it rather than risk reusing pixels from a different override.
+                    Some(p) => Renderer { project: p, cache_static_comps: false, ..base },
                     None => base,
                 };
                 // Frame blending between the nested comp's frames (time-stretched/remapped).

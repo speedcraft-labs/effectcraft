@@ -314,6 +314,97 @@ enum ValueDataSeed {
     Str,
 }
 
+#[derive(Clone, Copy, Deserialize)]
+enum ValueTag {
+    Scalar,
+    Vec2,
+    Vec3,
+    Color,
+    Bool,
+    Enum,
+    Path,
+    Text,
+    Layer,
+    Gradient,
+    Str,
+}
+
+impl From<ValueTag> for ValueDataSeed {
+    fn from(tag: ValueTag) -> Self {
+        match tag {
+            ValueTag::Scalar => ValueDataSeed::Scalar,
+            ValueTag::Vec2 => ValueDataSeed::Vec2,
+            ValueTag::Vec3 => ValueDataSeed::Vec3,
+            ValueTag::Color => ValueDataSeed::Color,
+            ValueTag::Bool => ValueDataSeed::Bool,
+            ValueTag::Enum => ValueDataSeed::Enum,
+            ValueTag::Path => ValueDataSeed::Path,
+            ValueTag::Text => ValueDataSeed::Text,
+            ValueTag::Layer => ValueDataSeed::Layer,
+            ValueTag::Gradient => ValueDataSeed::Gradient,
+            ValueTag::Str => ValueDataSeed::Str,
+        }
+    }
+}
+
+enum ValueField {
+    Tag,
+    Payload,
+    Other(String),
+}
+
+impl ValueField {
+    fn into_name(self) -> String {
+        match self {
+            ValueField::Tag => "t".to_string(),
+            ValueField::Payload => "v".to_string(),
+            ValueField::Other(name) => name,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ValueField {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct FieldVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for FieldVisitor {
+            type Value = ValueField;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a property value field")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E> {
+                Ok(match value {
+                    "t" => ValueField::Tag,
+                    "v" => ValueField::Payload,
+                    _ => ValueField::Other(value.to_owned()),
+                })
+            }
+
+            fn visit_borrowed_str<E>(self, value: &'de str) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                self.visit_str(value)
+            }
+
+            fn visit_string<E>(self, value: String) -> Result<Self::Value, E> {
+                Ok(match value.as_str() {
+                    "t" => ValueField::Tag,
+                    "v" => ValueField::Payload,
+                    _ => ValueField::Other(value),
+                })
+            }
+        }
+
+        deserializer.deserialize_identifier(FieldVisitor)
+    }
+}
+
 impl<'de> serde::de::DeserializeSeed<'de> for ValueDataSeed {
     type Value = Value;
 
@@ -337,43 +428,23 @@ impl<'de> serde::de::DeserializeSeed<'de> for ValueDataSeed {
     }
 }
 
-fn value_data_seed(tag: &str) -> Option<ValueDataSeed> {
-    match tag {
-        "Scalar" => Some(ValueDataSeed::Scalar),
-        "Vec2" => Some(ValueDataSeed::Vec2),
-        "Vec3" => Some(ValueDataSeed::Vec3),
-        "Color" => Some(ValueDataSeed::Color),
-        "Bool" => Some(ValueDataSeed::Bool),
-        "Enum" => Some(ValueDataSeed::Enum),
-        "Path" => Some(ValueDataSeed::Path),
-        "Text" => Some(ValueDataSeed::Text),
-        "Layer" => Some(ValueDataSeed::Layer),
-        "Gradient" => Some(ValueDataSeed::Gradient),
-        "Str" => Some(ValueDataSeed::Str),
-        _ => None,
-    }
-}
-
-fn deserialize_tagged_value<'de, A>(mut map: A, tag: String) -> Result<Value, A::Error>
+fn deserialize_tagged_value<'de, A>(mut map: A, seed: ValueDataSeed) -> Result<Value, A::Error>
 where
     A: serde::de::MapAccess<'de>,
 {
     use serde::de::Error as _;
 
-    let Some(seed) = value_data_seed(&tag) else {
-        return Err(A::Error::unknown_variant(&tag, &["Scalar", "Vec2", "Vec3", "Color", "Bool", "Enum", "Path", "Text", "Layer", "Gradient", "Str"]));
-    };
     let mut value = None;
-    while let Some(key) = map.next_key::<String>()? {
-        match key.as_str() {
-            "v" => {
+    while let Some(key) = map.next_key::<ValueField>()? {
+        match key {
+            ValueField::Payload => {
                 if value.is_some() {
                     return Err(A::Error::duplicate_field("v"));
                 }
                 value = Some(map.next_value_seed(seed)?);
             }
-            "t" => return Err(A::Error::duplicate_field("t")),
-            _ => {
+            ValueField::Tag => return Err(A::Error::duplicate_field("t")),
+            ValueField::Other(_) => {
                 let _: serde::de::IgnoredAny = map.next_value()?;
             }
         }
@@ -422,14 +493,15 @@ impl<'de> Deserialize<'de> for Value {
             {
                 use serde::de::Error as _;
 
-                let Some(first_key) = map.next_key::<String>()? else {
+                let Some(first_key) = map.next_key::<ValueField>()? else {
                     return Err(A::Error::custom("missing property value tag"));
                 };
-                if first_key == "t" {
-                    let tag = map.next_value::<String>()?;
-                    deserialize_tagged_value(map, tag)
-                } else {
-                    deserialize_unordered_value(map, first_key)
+                match first_key {
+                    ValueField::Tag => {
+                        let tag = map.next_value::<ValueTag>()?;
+                        deserialize_tagged_value(map, tag.into())
+                    }
+                    other => deserialize_unordered_value(map, other.into_name()),
                 }
             }
         }

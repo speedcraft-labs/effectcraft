@@ -1152,6 +1152,7 @@ fn bench_ops(args: &Args) -> Result<(), Failure> {
         spec.realistic = true;
     }
     let dir = std::env::temp_dir().join(format!("effectcraft-bench-ops-{}", std::process::id()));
+    let keep_bench_file = std::env::var_os("EFFECTCRAFT_KEEP_BENCH_FILE").is_some();
     std::fs::create_dir_all(&dir).map_err(|e| Failure::Error(format!("{}: {e}", dir.display())))?;
     if let Some(measure) = args.opt("--measure") {
         if !matches!(measure, "open" | "firstFrame") {
@@ -1167,7 +1168,11 @@ fn bench_ops(args: &Args) -> Result<(), Failure> {
         } else if let Some(x) = m.first() {
             say!("{}: {:.2} ms ({})", x.name, x.ms, x.note);
         }
-        let _ = std::fs::remove_dir_all(&dir);
+        if keep_bench_file {
+            eprintln!("bench fixture retained at {}", dir.display());
+        } else {
+            let _ = std::fs::remove_dir_all(&dir);
+        }
         return Ok(());
     }
     let t0 = std::time::Instant::now();
@@ -1183,7 +1188,11 @@ fn bench_ops(args: &Args) -> Result<(), Failure> {
         }
         s
     }));
-    let _ = std::fs::remove_dir_all(&dir);
+    if keep_bench_file {
+        eprintln!("bench fixture retained at {}", dir.display());
+    } else {
+        let _ = std::fs::remove_dir_all(&dir);
+    }
     if args.flag("--json") {
         emit(&json!({"spec": format!("{spec:?}"), "measures": m.iter().map(perf::Measure::json).collect::<Vec<_>>()}), true);
     } else {

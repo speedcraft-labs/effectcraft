@@ -1053,9 +1053,7 @@ fn draw_glyphs(geom: &TextGeom, img: &mut Image, to_px: &Mat3, s: f64, only: Opt
 }
 
 /// Render a text layer into a layer-space buffer at scale `s`.
-pub fn render(ctx: &EvalCtx, layer: &Layer, s: f64) -> Buf {
-    let empty = || Buf { img: Image::new(1, 1), offset: [0.0; 2], scale: s };
-    let Some(geom) = text_geom(ctx, layer) else { return empty() };
+fn glyph_render_bounds(geom: &TextGeom) -> Option<kurbo::Rect> {
     let mut bounds: Option<kurbo::Rect> = None;
     for g in &geom.glyphs {
         if let Some(b) = effectcraft_path::bounds(&[g.path()]) {
@@ -1065,8 +1063,13 @@ pub fn render(ctx: &EvalCtx, layer: &Layer, s: f64) -> Buf {
             bounds = Some(bounds.map_or(b, |a| a.union(b)));
         }
     }
-    let Some(b) = bounds else { return empty() };
-    let b = b.intersect(kurbo::Rect::new(-20000.0, -20000.0, 20000.0, 20000.0));
+    bounds.map(|b| b.intersect(kurbo::Rect::new(-20000.0, -20000.0, 20000.0, 20000.0)))
+}
+
+pub fn render(ctx: &EvalCtx, layer: &Layer, s: f64) -> Buf {
+    let empty = || Buf { img: Image::new(1, 1), offset: [0.0; 2], scale: s };
+    let Some(geom) = text_geom(ctx, layer) else { return empty() };
+    let Some(b) = glyph_render_bounds(&geom) else { return empty() };
     let w = ((b.width() * s).ceil() as u32 + 4).clamp(1, 16384);
     let h = ((b.height() * s).ceil() as u32 + 4).clamp(1, 16384);
     let offset = [-b.x0 * s + 2.0, -b.y0 * s + 2.0];
