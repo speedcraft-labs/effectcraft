@@ -15,6 +15,7 @@ use std::sync::{Arc, OnceLock};
 pub struct SequenceFiles {
     raw: Option<Arc<Box<serde_json::value::RawValue>>>,
     parsed: OnceLock<Vec<String>>,
+    plain_absolute_local: OnceLock<bool>,
 }
 
 impl SequenceFiles {
@@ -32,6 +33,13 @@ impl SequenceFiles {
         self.parsed.get().is_some()
     }
 
+    /// Whether every path is a plain absolute local path that needs no document-relative
+    /// resolution. This is recorded while validating deferred JSON, so checking it does not
+    /// allocate the sequence's path strings.
+    pub fn has_plain_absolute_local_paths(&self) -> bool {
+        *self.plain_absolute_local.get_or_init(|| self.paths().iter().all(|path| plain_absolute_local(path)))
+    }
+
     fn paths(&self) -> &[String] {
         self.parsed.get_or_init(|| self.raw.as_ref().and_then(|raw| serde_json::from_str::<Vec<String>>(raw.get()).ok()).unwrap_or_default())
     }
@@ -39,13 +47,14 @@ impl SequenceFiles {
 
 impl Default for SequenceFiles {
     fn default() -> Self {
-        SequenceFiles { raw: None, parsed: OnceLock::new() }
+        SequenceFiles { raw: None, parsed: OnceLock::new(), plain_absolute_local: OnceLock::from(true) }
     }
 }
 
 impl From<Vec<String>> for SequenceFiles {
     fn from(paths: Vec<String>) -> Self {
-        SequenceFiles { raw: None, parsed: OnceLock::from(paths) }
+        let plain_absolute_local = paths.iter().all(|path| plain_absolute_local(path));
+        SequenceFiles { raw: None, parsed: OnceLock::from(paths), plain_absolute_local: OnceLock::from(plain_absolute_local) }
     }
 }
 
@@ -65,6 +74,7 @@ impl Deref for SequenceFiles {
 
 impl DerefMut for SequenceFiles {
     fn deref_mut(&mut self) -> &mut Self::Target {
+        self.plain_absolute_local.take();
         if self.parsed.get().is_none() {
             let paths = self.raw.as_ref().and_then(|raw| serde_json::from_str::<Vec<String>>(raw.get()).ok()).unwrap_or_default();
             self.parsed = OnceLock::from(paths);
@@ -117,7 +127,7 @@ impl Serialize for SequenceFiles {
     }
 }
 
-struct SequenceString;
+struct SequenceString(bool);
 
 impl<'de> Deserialize<'de> for SequenceString {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
@@ -133,16 +143,16 @@ impl<'de> Deserialize<'de> for SequenceString {
                 formatter.write_str("a sequence path string")
             }
 
-            fn visit_str<E>(self, _: &str) -> Result<Self::Value, E> {
-                Ok(SequenceString)
+            fn visit_str<E>(self, path: &str) -> Result<Self::Value, E> {
+                Ok(SequenceString(plain_absolute_local(path)))
             }
 
-            fn visit_borrowed_str<E>(self, _: &'de str) -> Result<Self::Value, E> {
-                Ok(SequenceString)
+            fn visit_borrowed_str<E>(self, path: &'de str) -> Result<Self::Value, E> {
+                Ok(SequenceString(plain_absolute_local(path)))
             }
 
-            fn visit_string<E>(self, _: String) -> Result<Self::Value, E> {
-                Ok(SequenceString)
+            fn visit_string<E>(self, path: String) -> Result<Self::Value, E> {
+                Ok(SequenceString(plain_absolute_local(&path)))
             }
         }
 
@@ -156,11 +166,37 @@ impl<'de> Deserialize<'de> for SequenceFiles {
         D: Deserializer<'de>,
     {
         let raw = Box::<serde_json::value::RawValue>::deserialize(deserializer)?;
-        // Validate the array and its element types now, using zero-sized placeholders instead of
-        // allocating every path. The paths themselves are decoded only on first access.
-        let _: Vec<SequenceString> = serde_json::from_str(raw.get()).map_err(D::Error::custom)?;
-        Ok(SequenceFiles { raw: Some(Arc::new(raw)), parsed: OnceLock::new() })
+        // Validate the array and its element types now, retaining only a small fast-path flag per
+        // frame instead of allocating every path. The paths themselves are decoded on first access.
+        let paths: Vec<SequenceString> = serde_json::from_str(raw.get()).map_err(D::Error::custom)?;
+        let plain_absolute_local = paths.iter().all(|path| path.0);
+        Ok(SequenceFiles { raw: Some(Arc::new(raw)), parsed: OnceLock::new(), plain_absolute_local: OnceLock::from(plain_absolute_local) })
     }
+}
+
+/// The resolver can leave an absolute Unix path as-is only when it cannot contain URL, network,
+/// device, or traversal syntax. Windows paths use the ordinary resolver on every platform.
+fn plain_absolute_local(path: &str) -> bool {
+    if !cfg!(unix) || !path.starts_with('/') || path.starts_with("//") || path.contains(['\\', ':', '\0']) {
+        return false;
+    }
+    let Some(components) = path.strip_prefix('/') else { return false };
+    if components.starts_with("??/") {
+        return false;
+    }
+    components.split('/').all(|component| {
+        !component.is_empty() && component != "." && component != ".." && !component.chars().all(|ch| ch == '.' || ch == ' ') && !dos_device(component)
+    })
+}
+
+fn dos_device(component: &str) -> bool {
+    let stem = component.split(['.', ':']).next().unwrap_or_default().trim_end_matches(' ');
+    if ["CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"].iter().any(|name| stem.eq_ignore_ascii_case(name)) {
+        return true;
+    }
+    let Some(head) = stem.get(..3) else { return false };
+    let mut tail = stem.get(3..).unwrap_or_default().chars();
+    (head.eq_ignore_ascii_case("COM") || head.eq_ignore_ascii_case("LPT")) && matches!((tail.next(), tail.next()), (Some('0'..='9' | '¹' | '²' | '³'), None))
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]

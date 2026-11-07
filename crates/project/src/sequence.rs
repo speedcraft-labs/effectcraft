@@ -222,6 +222,38 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn plain_absolute_sequence_paths_are_classified_without_materializing() -> Result<(), Box<dyn std::error::Error>> {
+        let mut value = serde_json::to_value(Footage::default())?;
+        value["sequence"] = serde_json::json!(["/media/shot_0001.exr", "/media/shot_0002.exr"]);
+        let json = serde_json::to_string(&value)?;
+        let mut footage: Footage = serde_json::from_str(&json)?;
+
+        assert!(footage.sequence.has_plain_absolute_local_paths());
+        assert!(!footage.sequence.is_materialized());
+        assert_eq!(serde_json::to_value(&footage)?["sequence"], value["sequence"]);
+        assert!(!footage.sequence.is_materialized());
+
+        footage.sequence.push("relative/frame.exr".into());
+        assert!(!footage.sequence.has_plain_absolute_local_paths());
+        assert!(footage.sequence.is_materialized());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn paths_needing_resolution_are_not_plain_absolute_local() -> Result<(), Box<dyn std::error::Error>> {
+        for path in ["relative/frame.exr", "//host/share/frame.exr", "/media/../frame.exr", "/media/NUL.exr", "/media/??/frame.exr"] {
+            let mut value = serde_json::to_value(Footage::default())?;
+            value["sequence"] = serde_json::json!([path]);
+            let footage: Footage = serde_json::from_value(value)?;
+            assert!(!footage.sequence.has_plain_absolute_local_paths(), "{path}");
+            assert!(!footage.sequence.is_materialized(), "{path}");
+        }
+        Ok(())
+    }
+
     #[test]
     fn deferred_empty_sequence_is_omitted_and_non_strings_are_rejected() -> Result<(), Box<dyn std::error::Error>> {
         let mut value = serde_json::to_value(Footage::default())?;
