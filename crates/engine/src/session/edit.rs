@@ -277,13 +277,26 @@ pub fn upgrade_effects(p: &mut Project) {
     let mut bounds = std::collections::HashMap::new();
     for (cid, c) in p.comps() {
         for l in &c.layers {
-            bounds.insert((*cid, l.id), effectcraft_render::effect_bounds(p, c, l));
+            // Current-schema files only need bounds for layers whose effects are migrated. A
+            // previous schema also needs source bounds for Clone/effect-space coordinate shifts.
+            if to_effect_space || l.effects().is_some_and(|fx| !fx.children.is_empty()) {
+                bounds.insert((*cid, l.id), effectcraft_render::effect_bounds(p, c, l));
+            }
         }
     }
     let mut next = p.next_id;
     for (cid, it) in p.items.iter_mut() {
         let effectcraft_project::ItemKind::Comp(c) = &mut it.kind else { continue };
         for l in &mut std::sync::Arc::make_mut(c).layers {
+            if matches!(&l.source, effectcraft_project::LayerSource::Shape)
+                && let Some(contents) = l.props.sub_mut("contents")
+            {
+                effectcraft_project::build::upgrade_shape_contents(&mut effectcraft_project::build::Ids(&mut next), contents);
+            }
+            let Some(fx) = l.props.sub_mut("effects") else { continue };
+            if fx.children.is_empty() {
+                continue;
+            }
             let (size, origin) = bounds.get(&(*cid, l.id)).copied().unwrap_or(([100.0, 100.0], [0.0; 2]));
             // Effect space starts at the bounds' top-left: positions move by minus that corner.
             // Adjustment layers run their effects on the comp below as it is: nothing moves.
@@ -293,10 +306,6 @@ pub fn upgrade_effects(p: &mut Project) {
                 Some(id) => bounds.get(&(*cid, effectcraft_project::LayerId(id))).map_or([0.0; 2], |b| shift(b.1)),
                 None => d,
             };
-            if let Some(contents) = l.props.sub_mut("contents") {
-                effectcraft_project::build::upgrade_shape_contents(&mut effectcraft_project::build::Ids(&mut next), contents);
-            }
-            let Some(fx) = l.props.sub_mut("effects") else { continue };
             for n in &mut fx.children {
                 let effectcraft_project::Node::Group(g) = n else { continue };
                 let effectcraft_project::GroupKind::Effect { effect } = &g.kind else { continue };
