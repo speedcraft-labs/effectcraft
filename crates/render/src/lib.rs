@@ -62,6 +62,17 @@ pub use opts::{LayerTiming, RenderOpts};
 use opts::{MAX_THROUGH, Through};
 pub use pipeline::{Collapsed, MediaOverride, PropertyOverride};
 
+/// Configure Rayon once for an EffectCraft process. The compositor uses the global pool across
+/// layer rendering, pixel operations and project parsing, so avoid oversubscribing machines with
+/// many logical CPUs. `RAYON_NUM_THREADS` remains the explicit user override.
+pub fn configure_parallelism() {
+    if std::env::var_os("RAYON_NUM_THREADS").is_some() {
+        return;
+    }
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get().min(8));
+    let _ = rayon::ThreadPoolBuilder::new().num_threads(threads).build_global();
+}
+
 pub struct Renderer<'a> {
     pub project: &'a Project,
     pub footage: &'a dyn FootageSource,

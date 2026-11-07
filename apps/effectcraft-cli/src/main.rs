@@ -300,6 +300,7 @@ fn utf8_args(raw: impl IntoIterator<Item = std::ffi::OsString>) -> Result<Vec<St
 }
 
 fn main() {
+    effectcraft_render::configure_parallelism();
     // Warnings and errors to standard error (`RUST_LOG` overrides), so a GPU that declines
     // frames or runs out of memory says so instead of silently rendering on the CPU.
     effectcraft_engine::logging::install_with("warn");
