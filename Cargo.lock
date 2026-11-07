@@ -1092,7 +1092,7 @@ dependencies = [
 [[package]]
 name = "craft-blur"
 version = "0.1.0"
-source = "git+https://github.com/speedcraft-labs/craft-libs?rev=fc15099447756b34714f46e86712fb91913c8405#fc15099447756b34714f46e86712fb91913c8405"
+source = "git+https://github.com/storytold/craft-libs?rev=fc15099447756b34714f46e86712fb91913c8405#fc15099447756b34714f46e86712fb91913c8405"
 
 [[package]]
 name = "craft-docpath"
@@ -1160,7 +1160,7 @@ dependencies = [
 [[package]]
 name = "craft-resample"
 version = "0.1.0"
-source = "git+https://github.com/speedcraft-labs/craft-libs?rev=e6d994496a6d11cfb4b42a46847933f837c46afd#e6d994496a6d11cfb4b42a46847933f837c46afd"
+source = "git+https://github.com/storytold/craft-libs?rev=e6d994496a6d11cfb4b42a46847933f837c46afd#e6d994496a6d11cfb4b42a46847933f837c46afd"
 dependencies = [
  "rayon",
 ]
