@@ -215,7 +215,7 @@ fn project_parse_pool() -> Option<&'static rayon::ThreadPool> {
             .ok()
             .and_then(|n| n.parse::<usize>().ok())
             .filter(|&n| n > 0)
-            .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()));
+            .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get().min(8)));
         rayon::ThreadPoolBuilder::new().num_threads(threads).build().ok()
     })
     .as_ref()
