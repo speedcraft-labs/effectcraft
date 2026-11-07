@@ -205,7 +205,7 @@ mod tests {
     }
 
     #[test]
-    fn sequence_paths_stay_deferred_until_used() -> Result<(), Box<dyn std::error::Error>> {
+    fn sequence_paths_stay_deferred_until_used_or_serialized() -> Result<(), Box<dyn std::error::Error>> {
         let mut value = serde_json::to_value(Footage::default())?;
         value["sequence"] = serde_json::json!(["shot_0001.exr", "shot_0002.exr"]);
         let json = serde_json::to_string(&value)?;
@@ -215,7 +215,7 @@ mod tests {
 
         let saved = serde_json::to_value(&footage)?;
         assert_eq!(saved["sequence"], value["sequence"]);
-        assert!(!footage.sequence.is_materialized());
+        assert!(footage.sequence.is_materialized());
 
         assert_eq!(&*footage.sequence, &["shot_0001.exr", "shot_0002.exr"]);
         assert!(footage.sequence.is_materialized());
