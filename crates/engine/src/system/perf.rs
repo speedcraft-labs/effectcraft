@@ -79,7 +79,15 @@ fn base_comp(name: &str) -> Comp {
 fn footage_item(spec: &LargeSpec, i: usize) -> Footage {
     let dir = &spec.media_dir;
     let (width, height) = if spec.realistic { (640, 360) } else { (1920, 1080) };
-    let base = Footage { width, height, pixel_aspect: 1.0, has_video: true, alpha: AlphaMode::Straight, ..Default::default() };
+    let base = Footage {
+        width,
+        height,
+        pixel_aspect: 1.0,
+        has_video: true,
+        // The realistic fixture's generated still is an RGB PNG, so it has no alpha channel.
+        alpha: if spec.realistic && i == 2 { AlphaMode::Ignore } else { AlphaMode::Straight },
+        ..Default::default()
+    };
     match i % 3 {
         0 => {
             let frames: Vec<String> = (0..spec.sequence_frames).map(|f| format!("{dir}/seq{i:03}/shot{i:03}_{f:05}.png")).collect();
