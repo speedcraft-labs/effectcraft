@@ -11,7 +11,7 @@ rust-version = "1.95"
 repository = "https://github.com/storytold/effectcraft"
 
 [workspace.dependencies]
-craft-blur = { package = "craft-blur", git = "https://github.com/speedcraft-labs/craft-libs", rev = "fc15099447756b34714f46e86712fb91913c8405" }
+craft-blur = { package = "craft-blur", git = "https://github.com/speedcraft-labs/craft-libs", rev = "f0507f3d4512dfc880388a4b9687e411a27e0b35" }
 craft-resample = { git = "https://github.com/storytold/craft-libs", rev = "fd21a0a80a8e4f4c183a8e0da0953e1b033b817d", features = ["rayon"] }
 craft-pdf = { git = "https://github.com/storytold/craft-libs", rev = "e11f9d9aebea5f6b8e74643c1ea1ed172ba5f545", version = "=0.1.0", default-features = false, features = ["read"] }
 craft-docpath = { version = "0.1.0", git = "https://github.com/storytold/craft-libs", rev = "e11f9d9aebea5f6b8e74643c1ea1ed172ba5f545" }
