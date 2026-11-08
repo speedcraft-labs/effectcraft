@@ -122,6 +122,10 @@ fn draw_comp<'a>(e: &mut Enc, r: &Renderer<'a>, ctx: &EvalCtx<'a>, canvas: &mut 
     let visible = r.visible_layers(ctx);
     let occluded = r.occluded_bounded_layers(ctx, &visible, canvas.width, canvas.height);
     let levels = r.pipe().levels;
+    // Quantizing uploaded texels is equivalent to quantizing CPU-rendered sources only when
+    // the renderer is already in the blending space. A color-space conversion must keep its
+    // full-precision input until after conversion.
+    let compact_8bit_sources = levels == Some(255.0) && r.pipe().to_blend().is_none();
     let mut i = 0;
     while i < visible.len() {
         // A device that ran out of memory (or was lost) on an earlier layer fails every later
@@ -147,11 +151,11 @@ fn draw_comp<'a>(e: &mut Enc, r: &Renderer<'a>, ctx: &EvalCtx<'a>, canvas: &mut 
                         let Some(st) = st else { continue };
                         let layer = visible[start + offset];
                         let opacity = r.layer_opacity(ctx, layer);
-                        let quantize_source = st.quantize_source() || levels == Some(255.0);
+                        let quantize_source = st.quantize_source() || compact_8bit_sources;
                         let prepared_by_ping_pong = if st.plain && opacity > 0.0 {
                             let placement = r.placement(ctx, layer, &st.body);
                             if let [matrix] = placement.matrices.as_slice() {
-                                let src = if levels == Some(255.0) { e.g.upload_buf_8bit(&st.body, st.quantize_source())? } else { e.g.upload_buf(&st.body)? };
+                                let src = if compact_8bit_sources { e.g.upload_buf_8bit(&st.body, st.quantize_source())? } else { e.g.upload_buf(&st.body)? };
                                 let ping_pong = ping_pong.get_or_insert_with(|| PingPongCanvas::new(e, canvas));
                                 ping_pong.draw(
                                     e,
@@ -545,7 +549,7 @@ fn composite_layer(
     let matte = r.track_matte(ctx, layer).is_some();
     if !matte && !layer.preserve_transparency {
         // The comp is quantised after the layer (8/16 bpc) in the same pass.
-        let source_is_8bit = r.pipe().levels == Some(255.0);
+        let source_is_8bit = r.pipe().levels == Some(255.0) && r.pipe().to_blend().is_none();
         let src = if source_is_8bit { e.g.upload_buf_8bit(buf, quantize_source)? } else { e.g.upload_buf(buf)? };
         *canvas = place_src(e, r, ctx, layer, buf, src, canvas, layer.blend_mode, opacity, r.pipe().levels, quantize_source || source_is_8bit)?;
         return Some(());
