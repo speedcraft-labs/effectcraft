@@ -127,7 +127,11 @@ fn fxs_point(@builtin(global_invocation_id) gid: vec3<u32>) {
         case 1u: {
             let lv = P.f[0].x;
             let c = vec3<f32>(unit_div(px.x, a), unit_div(px.y, a), unit_div(px.z, a));
-            let o = vec3<f32>(fxs_posterize_bin(c.x, u32(lv)), fxs_posterize_bin(c.y, u32(lv)), fxs_posterize_bin(c.z, u32(lv))) / lv;
+            let bins = vec3<f32>(fxs_posterize_bin(c.x, u32(lv)), fxs_posterize_bin(c.y, u32(lv)), fxs_posterize_bin(c.z, u32(lv)));
+            // Match the CPU's correctly rounded f32 bin / level division. Some GPU backends
+            // approximate this otherwise simple division by an ulp, which changes exact pixel
+            // hashes in 8 bpc compositions.
+            let o = vec3<f32>(unit_div(bins.x, lv), unit_div(bins.y, lv), unit_div(bins.z, lv));
             textureStore(out, p, vec4<f32>(o * a, a));
         }
         case 2u: {
