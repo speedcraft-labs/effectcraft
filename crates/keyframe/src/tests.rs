@@ -118,7 +118,7 @@ fn tagged_values_deserialize_without_losing_variant_compatibility() {
         Value::Bool(true),
         Value::Enum(7),
         Value::Path(ShapePath::polygon(&[[0.0, 0.0], [1.0, 1.0]], true)),
-        Value::Text(Box::new(TextDoc::default())),
+        Value::Text(Box::default()),
         Value::Layer(Some(42)),
         Value::Layer(None),
         Value::Gradient(Gradient::default()),

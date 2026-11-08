@@ -55,9 +55,8 @@ impl CompFrameCache {
     }
 
     fn render(&self, key: CompFrameKey, render: impl FnOnce() -> Image) -> Image {
-        let mut render = Some(render);
-        let (flight, _owner, render_without_wait) = {
-            let Ok(mut inner) = self.0.lock() else { return render.take().expect("render closure")() };
+        let (flight, _owner) = {
+            let Ok(mut inner) = self.0.lock() else { return render() };
             if let Some(image) = inner.entries.get(&key).cloned() {
                 #[cfg(test)]
                 {
@@ -70,28 +69,25 @@ impl CompFrameCache {
                 // become waiters before the owner runs, the owner can never make progress. A
                 // duplicate render in that case is bounded to the current batch and is safe;
                 // later layers reuse the cached image.
-                Some(_) if rayon::current_thread_index().is_some() => (None, false, true),
-                Some(flight) => (Some(flight.clone()), false, false),
+                Some(_) if rayon::current_thread_index().is_some() => (None, false),
+                Some(flight) => (Some(flight.clone()), false),
                 None => {
                     let flight = Arc::new(OnceLock::new());
                     inner.in_flight.insert(key, flight.clone());
-                    (Some(flight), true, false)
+                    (Some(flight), true)
                 }
             }
         };
-        if render_without_wait {
-            let image = Arc::new(render.take().expect("render closure")());
+        let Some(flight) = flight else {
+            let image = Arc::new(render());
             self.insert(key, &image);
             return (*image).clone();
-        }
-        let flight = flight.expect("cache owner or waiter has an in-flight frame");
+        };
         #[cfg(test)]
-        if !_owner {
-            if let Ok(mut inner) = self.0.lock() {
-                inner.hits += 1;
-            }
+        if !_owner && let Ok(mut inner) = self.0.lock() {
+            inner.hits += 1;
         }
-        let image = flight.get_or_init(|| Arc::new(render.take().expect("render closure")())).clone();
+        let image = flight.get_or_init(|| Arc::new(render())).clone();
         self.insert(key, &image);
         if let Ok(mut inner) = self.0.lock()
             && inner.in_flight.get(&key).is_some_and(|current| Arc::ptr_eq(current, &flight))

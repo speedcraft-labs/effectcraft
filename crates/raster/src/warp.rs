@@ -26,6 +26,14 @@ pub struct WarpOpts {
     pub clip: Option<Rect>,
 }
 
+#[derive(Clone, Copy)]
+struct WarpOperation {
+    allow_fast: bool,
+    accumulate: Option<f32>,
+    quantize: Option<f32>,
+    source_opaque: bool,
+}
+
 impl Default for WarpOpts {
     fn default() -> Self {
         WarpOpts { sampling: Sampling::Bilinear, opacity: 1.0, mode: BlendMode::Normal, seed: 0, clip: None }
@@ -46,7 +54,7 @@ fn half(src: &Image) -> Image {
 /// bilinear without bounds checks, integer-translation copies, inlined Normal blending); it
 /// matches [`composite_warp_reference`] to float rounding.
 pub fn composite_warp(dst: &mut Image, src: &Image, m: &Mat3, opts: &WarpOpts) {
-    composite_warp_impl::<false>(dst, src, m, opts, true, None, None, false);
+    composite_warp_impl::<false>(dst, src, m, opts, WarpOperation { allow_fast: true, accumulate: None, quantize: None, source_opaque: false });
 }
 
 /// [`composite_warp`], also returning the destination pixels it changed when it knows them:
@@ -54,13 +62,13 @@ pub fn composite_warp(dst: &mut Image, src: &Image, m: &Mat3, opts: &WarpOpts) {
 /// `None` otherwise. With `quantize` (an 8/16 bpc destination's levels), the fast path also
 /// quantises each pixel it blends ([`crate::quantize_px`]): exactly when this returns `Some`.
 pub fn composite_warp_changed(dst: &mut Image, src: &Image, m: &Mat3, opts: &WarpOpts, quantize: Option<f32>) -> Option<[u32; 4]> {
-    composite_warp_impl::<true>(dst, src, m, opts, true, None, quantize, false)
+    composite_warp_impl::<true>(dst, src, m, opts, WarpOperation { allow_fast: true, accumulate: None, quantize, source_opaque: false })
 }
 
 /// [`composite_warp_changed`] for a source whose pixels are known to be fully opaque. This skips
 /// building a transparency-tile map while retaining the same bilinear edge handling.
 pub fn composite_warp_changed_opaque(dst: &mut Image, src: &Image, m: &Mat3, opts: &WarpOpts, quantize: Option<f32>) -> Option<[u32; 4]> {
-    composite_warp_impl::<true>(dst, src, m, opts, true, None, quantize, true)
+    composite_warp_impl::<true>(dst, src, m, opts, WarpOperation { allow_fast: true, accumulate: None, quantize, source_opaque: true })
 }
 
 /// [`composite_warp`] with inline quantisation on the affine fast path. The caller can skip a
@@ -68,12 +76,13 @@ pub fn composite_warp_changed_opaque(dst: &mut Image, src: &Image, m: &Mat3, opt
 /// that reduction is unnecessary for this use. A no-op also returns `true`, since no later
 /// quantisation is needed.
 pub fn composite_warp_quantized(dst: &mut Image, src: &Image, m: &Mat3, opts: &WarpOpts, levels: f32) -> bool {
-    composite_warp_impl::<false>(dst, src, m, opts, true, None, Some(levels), false).is_some()
+    composite_warp_impl::<false>(dst, src, m, opts, WarpOperation { allow_fast: true, accumulate: None, quantize: Some(levels), source_opaque: false })
+        .is_some()
 }
 
 /// [`composite_warp_quantized`] for a source whose pixels are known to be fully opaque.
 pub fn composite_warp_quantized_opaque(dst: &mut Image, src: &Image, m: &Mat3, opts: &WarpOpts, levels: f32) -> bool {
-    composite_warp_impl::<false>(dst, src, m, opts, true, None, Some(levels), true).is_some()
+    composite_warp_impl::<false>(dst, src, m, opts, WarpOperation { allow_fast: true, accumulate: None, quantize: Some(levels), source_opaque: true }).is_some()
 }
 
 /// `dst += warp(src) · weight` (plain sum, no blending): motion-blur sub-samples accumulate
@@ -81,7 +90,7 @@ pub fn composite_warp_quantized_opaque(dst: &mut Image, src: &Image, m: &Mat3, o
 pub fn accumulate_warp(dst: &mut Image, src: &Image, m: &Mat3, sampling: Sampling, weight: f32) {
     let opts = WarpOpts { sampling, ..Default::default() };
     if m.is_affine() && m.inverse().is_some_and(|i| i.is_affine()) {
-        composite_warp_impl::<false>(dst, src, m, &opts, true, Some(weight), None, false);
+        composite_warp_impl::<false>(dst, src, m, &opts, WarpOperation { allow_fast: true, accumulate: Some(weight), quantize: None, source_opaque: false });
         return;
     }
     let mut tmp = Image::new(dst.width, dst.height);
@@ -95,7 +104,7 @@ pub fn accumulate_warp(dst: &mut Image, src: &Image, m: &Mat3, sampling: Samplin
 
 /// The straightforward per-pixel implementation (reference for the fast path's tests).
 pub fn composite_warp_reference(dst: &mut Image, src: &Image, m: &Mat3, opts: &WarpOpts) {
-    composite_warp_impl::<false>(dst, src, m, opts, false, None, None, false);
+    composite_warp_impl::<false>(dst, src, m, opts, WarpOperation { allow_fast: false, accumulate: None, quantize: None, source_opaque: false });
 }
 
 /// Bilinear blend of four taps (same operation order as [`Image::sample_bilinear`]).
@@ -562,16 +571,8 @@ fn composite_affine<const TRACK_CHANGES: bool>(
     }
 }
 
-fn composite_warp_impl<const TRACK_CHANGES: bool>(
-    dst: &mut Image,
-    src: &Image,
-    m: &Mat3,
-    opts: &WarpOpts,
-    allow_fast: bool,
-    accumulate: Option<f32>,
-    quantize: Option<f32>,
-    source_opaque: bool,
-) -> Option<[u32; 4]> {
+fn composite_warp_impl<const TRACK_CHANGES: bool>(dst: &mut Image, src: &Image, m: &Mat3, opts: &WarpOpts, operation: WarpOperation) -> Option<[u32; 4]> {
+    let WarpOperation { allow_fast, accumulate, quantize, source_opaque } = operation;
     const NOTHING: Option<[u32; 4]> = Some([0; 4]);
     if src.is_empty() || dst.is_empty() || opts.opacity <= 0.0 {
         return NOTHING;

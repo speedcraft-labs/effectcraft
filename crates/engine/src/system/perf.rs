@@ -193,7 +193,7 @@ fn make_layer(p: &mut Project, comp: &Comp, spec: &LargeSpec, n: usize, solid: I
             effectcraft_color::BlendMode::Add,
             effectcraft_color::BlendMode::Darken,
         ];
-        if n % 10 == 0 {
+        if n.is_multiple_of(10) {
             l.blend_mode = MODES[(n / 10) % MODES.len()];
         }
         if matches!(l.source, LayerSource::Text)
@@ -209,7 +209,7 @@ fn make_layer(p: &mut Project, comp: &Comp, spec: &LargeSpec, n: usize, solid: I
                 contents.children.push(build::shape_group(&mut ids, "Survey Shape", vec![shape, fill]).into());
             }
         }
-        if n % 40 == 0
+        if n.is_multiple_of(40)
             && let Some(masks) = l.props.sub_mut("masks")
         {
             let mut ids = Ids(&mut p.next_id);
