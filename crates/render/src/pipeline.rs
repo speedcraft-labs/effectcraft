@@ -55,8 +55,9 @@ impl CompFrameCache {
     }
 
     fn render(&self, key: CompFrameKey, render: impl FnOnce() -> Image) -> Image {
-        let (flight, _owner) = {
-            let Ok(mut inner) = self.0.lock() else { return render() };
+        let mut render = Some(render);
+        let (flight, _owner, render_without_wait) = {
+            let Ok(mut inner) = self.0.lock() else { return render.take().expect("render closure")() };
             if let Some(image) = inner.entries.get(&key).cloned() {
                 #[cfg(test)]
                 {
@@ -65,21 +66,32 @@ impl CompFrameCache {
                 return (*image).clone();
             }
             match inner.in_flight.get(&key) {
-                Some(flight) => (flight.clone(), false),
+                // Waiting on a OnceLock blocks a Rayon worker. If all workers in a layer batch
+                // become waiters before the owner runs, the owner can never make progress. A
+                // duplicate render in that case is bounded to the current batch and is safe;
+                // later layers reuse the cached image.
+                Some(_) if rayon::current_thread_index().is_some() => (None, false, true),
+                Some(flight) => (Some(flight.clone()), false, false),
                 None => {
                     let flight = Arc::new(OnceLock::new());
                     inner.in_flight.insert(key, flight.clone());
-                    (flight, true)
+                    (Some(flight), true, false)
                 }
             }
         };
+        if render_without_wait {
+            let image = Arc::new(render.take().expect("render closure")());
+            self.insert(key, &image);
+            return (*image).clone();
+        }
+        let flight = flight.expect("cache owner or waiter has an in-flight frame");
         #[cfg(test)]
         if !_owner {
             if let Ok(mut inner) = self.0.lock() {
                 inner.hits += 1;
             }
         }
-        let image = flight.get_or_init(|| Arc::new(render())).clone();
+        let image = flight.get_or_init(|| Arc::new(render.take().expect("render closure")())).clone();
         self.insert(key, &image);
         if let Ok(mut inner) = self.0.lock()
             && inner.in_flight.get(&key).is_some_and(|current| Arc::ptr_eq(current, &flight))
@@ -129,15 +141,49 @@ impl CompFrameCache {
 
 #[cfg(test)]
 mod comp_frame_cache_tests {
+    use super::{CompFrameCache, CompFrameKey};
     use crate::{ItemKind, LayerSource, NoFootage, Project, RenderOpts, Renderer};
     use effectcraft_color::Label;
     use effectcraft_keyframe::Value;
     use effectcraft_project::{Comp, Solid};
     use effectcraft_time::{FrameRate, Tick};
-    use std::sync::Arc;
+    use std::sync::{
+        Arc, Barrier,
+        atomic::{AtomicUsize, Ordering},
+    };
 
     #[test]
-    fn static_precomp_cache_preserves_pixels_and_reuses_frames() {
+    fn concurrent_static_precomp_misses_do_not_block_rayon_workers() {
+        use rayon::prelude::*;
+
+        let cache = Arc::new(CompFrameCache::default());
+        let barrier = Arc::new(Barrier::new(2));
+        let render_calls = Arc::new(AtomicUsize::new(0));
+        let key = CompFrameKey { project: 1, comp: effectcraft_project::ItemId(1), time: 0, scale: 1.0f64.to_bits(), options: 0 };
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(2).build().expect("two-worker pool");
+        let images = pool.install(|| {
+            (0..2)
+                .into_par_iter()
+                .map(|_| {
+                    let barrier = barrier.clone();
+                    let render_calls = render_calls.clone();
+                    cache.render(key, move || {
+                        render_calls.fetch_add(1, Ordering::SeqCst);
+                        barrier.wait();
+                        crate::Image::filled(1, 1, [0.2, 0.4, 0.6, 1.0])
+                    })
+                })
+                .collect::<Vec<_>>()
+        });
+
+        assert_eq!(render_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(images[0], images[1]);
+        assert_eq!(cache.render(key, || panic!("cached frame should be reused")), images[0]);
+        assert_eq!(cache.hits(), 1);
+    }
+
+    #[test]
+    fn static_precomp_cache_preserves_pixels_for_repeated_layers() {
         let mut project = Project::default();
         let main = Comp::new(200, 100, FrameRate::FPS_30, Tick::from_seconds_f64(1.0));
         let main_id = project.add_item("Main", Label::None, None, ItemKind::Comp(Arc::new(main.clone())));
@@ -171,7 +217,6 @@ mod comp_frame_cache_tests {
         let cached = Renderer::new(&project, &footage, RenderOpts::default());
         let actual = cached.comp_frame(main_id, Tick::ZERO);
         assert_eq!(actual, expected);
-        assert_eq!(cached.comp_frames.hits(), 3);
     }
 
     #[test]
