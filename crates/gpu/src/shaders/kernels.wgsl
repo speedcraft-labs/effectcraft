@@ -11,8 +11,8 @@ fn out_dims() -> vec2<i32> {
 
 // Warp `src` by the inverse matrix (output pixel → source pixel) and blend over `aux`
 // (raster::composite_warp / accumulate_warp).
-// u[0] = (mode, sampling, seed, flags: 1 accumulate, 2 clear outside bounds)
-// f[0..3] = inverse rows; f[3] = (opacity, weight); f[4] = bounds (x0, y0, x1, y1)
+// u[0] = (mode, sampling, seed, flags: 1 accumulate, 2 clear outside, 4 uniform solid)
+// f[0..3] = inverse rows; f[3] = (opacity, weight); f[4] = bounds; f[6] = solid color; f[7] = source size
 @compute @workgroup_size(16, 16)
 fn warp_blend(@builtin(global_invocation_id) gid: vec3<u32>) {
     let dims = out_dims();
@@ -46,7 +46,10 @@ fn warp_blend(@builtin(global_invocation_id) gid: vec3<u32>) {
         px = px / w;
         py = py / w;
     }
-    let sz = vec2<f32>(textureDimensions(src));
+    var sz = vec2<f32>(textureDimensions(src));
+    if ((flags & 4u) != 0u) {
+        sz = P.f[7].xy;
+    }
     let stencil = is_stencil(mode);
     if (px < -1.0 || py < -1.0 || px > sz.x + 1.0 || py > sz.y + 1.0) {
         if (stencil && (flags & 1u) == 0u) {
@@ -57,7 +60,13 @@ fn warp_blend(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     let source_levels = P.f[5].x;
     var s: vec4<f32>;
-    if (source_levels > 0.0) {
+    if ((flags & 4u) != 0u) {
+        var color = P.f[6];
+        if (source_levels > 0.0) {
+            color = quantize_px(color, source_levels, P.f[5].y);
+        }
+        s = sample_solid(color, sampling, px, py, vec2<i32>(sz));
+    } else if (source_levels > 0.0) {
         s = sample_quantized(src, sampling, px, py, source_levels, P.f[5].y);
     } else {
         s = sample(src, sampling, px, py);

@@ -1541,6 +1541,11 @@ impl GpuContext {
         w > 0 && h > 0 && w <= self.max_dim && h <= self.max_dim
     }
 
+    /// A sampled binding for kernels whose source pixels are supplied as uniforms instead.
+    pub(crate) fn dummy_image(&self) -> GpuImage {
+        GpuImage::new(self.dummy.clone(), 1, 1)
+    }
+
     /// A new (zeroed) texture of its own (not pooled).
     pub(crate) fn image(&self, w: u32, h: u32) -> GpuImage {
         GpuImage::new(self.texture(w, h), w, h)

@@ -58,6 +58,29 @@ impl PingPongCanvas {
         }
     }
 
+    fn draw_solid(
+        &mut self,
+        e: &mut Enc,
+        color: [f32; 4],
+        size: (u32, u32),
+        matrix: &effectcraft_geom::Mat3,
+        opts: ops::WarpOptions,
+        levels: Option<f32>,
+        quantize_source: bool,
+    ) -> bool {
+        let next = 1 - self.front;
+        let current = self.images[self.front].clone();
+        match ops::warp_q_solid_pingpong(e, &current, &mut self.images[next], color, size, matrix, opts, levels, self.dirty, quantize_source) {
+            ops::PingPongWarp::Unsupported => false,
+            ops::PingPongWarp::Unchanged => true,
+            ops::PingPongWarp::Drawn(region) => {
+                self.front = next;
+                self.dirty = Some(region);
+                true
+            }
+        }
+    }
+
     fn finish(self, canvas: &mut GpuImage) {
         *canvas = self.images[self.front].clone();
     }
@@ -155,16 +178,15 @@ fn draw_comp<'a>(e: &mut Enc, r: &Renderer<'a>, ctx: &EvalCtx<'a>, canvas: &mut 
                         let prepared_by_ping_pong = if st.plain && opacity > 0.0 {
                             let placement = r.placement(ctx, layer, &st.body);
                             if let [matrix] = placement.matrices.as_slice() {
-                                let src = if compact_8bit_sources { e.g.upload_buf_8bit(&st.body, st.quantize_source())? } else { e.g.upload_buf(&st.body)? };
                                 let ping_pong = ping_pong.get_or_insert_with(|| PingPongCanvas::new(e, canvas));
-                                ping_pong.draw(
-                                    e,
-                                    &src,
-                                    matrix,
-                                    ops::WarpOptions { sampling: placement.sampling, mode: layer.blend_mode, opacity, seed: placement.seed },
-                                    levels,
-                                    quantize_source,
-                                )
+                                let opts = ops::WarpOptions { sampling: placement.sampling, mode: layer.blend_mode, opacity, seed: placement.seed };
+                                if let (Some(color), Some(size)) = (st.solid_color, st.solid_size) {
+                                    ping_pong.draw_solid(e, color, size, matrix, opts, levels, quantize_source)
+                                } else {
+                                    let src =
+                                        if compact_8bit_sources { e.g.upload_buf_8bit(&st.body, st.quantize_source())? } else { e.g.upload_buf(&st.body)? };
+                                    ping_pong.draw(e, &src, matrix, opts, levels, quantize_source)
+                                }
                             } else {
                                 false
                             }

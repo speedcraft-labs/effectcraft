@@ -51,7 +51,17 @@ impl<'a> Renderer<'a> {
     pub(crate) fn styled(&self, ctx: &EvalCtx, layer: &Layer, mut timing: Option<&mut LayerTiming>) -> Option<StyledLayer> {
         let (content, ckey) = self.content_buf_timed(ctx, layer, timing.as_deref_mut())?;
         if !styles::active(ctx, layer) {
-            return Some(StyledLayer { passes: vec![], body: content.clone(), content, key: ckey, ckey, plain: true, quantize_source: false });
+            return Some(StyledLayer {
+                passes: vec![],
+                body: content.clone(),
+                content,
+                key: ckey,
+                ckey,
+                plain: true,
+                quantize_source: false,
+                solid_color: None,
+                solid_size: None,
+            });
         }
         let modes = styles::pass_modes(ctx, layer);
         let key = ckey.map(|k| cache::styles_key(ctx, layer, k));
@@ -60,7 +70,7 @@ impl<'a> Renderer<'a> {
         {
             let passes: Option<Vec<_>> = modes.iter().enumerate().map(|(i, m)| c.get(cache::derive(k, i as u64 + 1)).map(|b| (b, *m))).collect();
             if let Some(passes) = passes {
-                return Some(StyledLayer { passes, body, content, key, ckey, plain: false, quantize_source: false });
+                return Some(StyledLayer { passes, body, content, key, ckey, plain: false, quantize_source: false, solid_color: None, solid_size: None });
             }
         }
         let t0 = web_time::Instant::now();
@@ -80,7 +90,7 @@ impl<'a> Renderer<'a> {
                 *b = c.insert(cache::derive(k, i as u64 + 1), b.clone());
             }
         }
-        Some(StyledLayer { passes, body, content, key, ckey, plain: false, quantize_source: false })
+        Some(StyledLayer { passes, body, content, key, ckey, plain: false, quantize_source: false, solid_color: None, solid_size: None })
     }
 
     /// The styled layer's buffers in the blending space.
@@ -139,9 +149,10 @@ impl<'a> Renderer<'a> {
 
     /// The raster mip dimensions a plain solid would use for its current transform. Solid pixels
     /// are uniform, so a caller can construct the final mip directly instead of filling and then
-    /// halving the full-resolution source image.
+    /// halving the full-resolution source image. The transform depends on the source scale and
+    /// offset, not its pixels or dimensions, so use a 1×1 placeholder here.
     pub(crate) fn solid_mip(&self, ctx: &EvalCtx, layer: &Layer, width: u32, height: u32, source_scale: f64) -> Option<(f64, u32, u32)> {
-        let buf = Buf { img: Image::new(width, height), offset: [0.0; 2], scale: source_scale };
+        let buf = Buf { img: Image::new(1, 1), offset: [0.0; 2], scale: source_scale };
         let m = self.buf_matrix(ctx, layer, &buf);
         let mut scale = m.mean_scale();
         if !m.is_affine() || scale >= 0.5 {
@@ -466,9 +477,41 @@ impl<'a> Renderer<'a> {
     pub(crate) fn styled_for_draw(&self, ctx: &EvalCtx, layer: &Layer, timing: Option<&mut LayerTiming>) -> Option<StyledLayer> {
         if let Some(buf) = self.plain_solid_mip(ctx, layer) {
             let body = Arc::new(buf);
-            return Some(StyledLayer { passes: vec![], body: body.clone(), content: body, key: None, ckey: None, plain: true, quantize_source: false });
+            return Some(StyledLayer {
+                passes: vec![],
+                body: body.clone(),
+                content: body,
+                key: None,
+                ckey: None,
+                plain: true,
+                quantize_source: false,
+                solid_color: None,
+                solid_size: None,
+            });
         }
         self.styled(ctx, layer, timing)
+    }
+
+    /// Prepare a plain solid for the GPU without allocating its full uniform raster. The shader
+    /// evaluates the solid's rectangular sample directly, including the normal filter edge.
+    pub(crate) fn styled_for_gpu_draw(&self, ctx: &EvalCtx, layer: &Layer) -> Option<StyledLayer> {
+        if self.pipe.to_blend().is_none()
+            && let Some((buf, color, size)) = self.plain_solid_gpu_mip(ctx, layer)
+        {
+            let body = Arc::new(buf);
+            return Some(StyledLayer {
+                passes: vec![],
+                body: body.clone(),
+                content: body,
+                key: None,
+                ckey: None,
+                plain: true,
+                quantize_source: false,
+                solid_color: Some(color),
+                solid_size: Some(size),
+            });
+        }
+        self.styled_for_draw(ctx, layer, None)
     }
 
     /// Composite precomputed buffers for a plain 2D layer in the original stack order.
@@ -817,6 +860,10 @@ pub struct StyledLayer {
     pub plain: bool,
     /// The GPU will quantize these unquantized source pixels before sampling.
     pub(crate) quantize_source: bool,
+    /// A uniform opaque source that the GPU samples without a full source texture.
+    pub solid_color: Option<[f32; 4]>,
+    /// The logical dimensions of `solid_color` in its final mip.
+    pub solid_size: Option<(u32, u32)>,
 }
 
 impl StyledLayer {

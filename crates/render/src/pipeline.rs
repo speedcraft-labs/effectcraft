@@ -992,7 +992,7 @@ impl<'a> Renderer<'a> {
                         && !cpu.mb_on(ctx, layer)
                         && !styles::active(ctx, layer);
                     let renderer = if defer_quantize { &unquantized } else { &cpu };
-                    renderer.styled_for_draw(ctx, layer, None).map(|mut st| {
+                    renderer.styled_for_gpu_draw(ctx, layer).map(|mut st| {
                         st.quantize_source = defer_quantize;
                         renderer.styled_to_blend(st)
                     })
@@ -1475,6 +1475,20 @@ impl<'a> Renderer<'a> {
     /// the full-resolution solid, then box-filters it for minification; every level of that box
     /// filter is the same uniform pixel, so these allocations and copies are redundant.
     pub(crate) fn plain_solid_mip(&self, ctx: &EvalCtx, layer: &Layer) -> Option<Buf> {
+        let (width, height, scale, color) = self.plain_solid_mip_data(ctx, layer)?;
+        Some(Buf { img: Image::filled(width, height, color), offset: [0.0; 2], scale })
+    }
+
+    /// The compact upload-free representation used by the GPU batch path.
+    pub(crate) fn plain_solid_gpu_mip(&self, ctx: &EvalCtx, layer: &Layer) -> Option<(Buf, [f32; 4], (u32, u32))> {
+        let (width, height, scale, color) = self.plain_solid_mip_data(ctx, layer)?;
+        // Placement only needs the buffer's scale and offset. Keep a valid 1×1 image here;
+        // the GPU shader uses `solid_color` and the separately retained logical dimensions.
+        let buf = Buf { img: Image::filled(1, 1, color), offset: [0.0; 2], scale };
+        Some((buf, color, (width, height)))
+    }
+
+    fn plain_solid_mip_data(&self, ctx: &EvalCtx, layer: &Layer) -> Option<(u32, u32, f64, [f32; 4])> {
         if self.accel.is_some()
             || layer.is_3d()
             || layer.switches.adjustment
@@ -1498,7 +1512,7 @@ impl<'a> Renderer<'a> {
             color = conv.apply(color);
         }
         let px = self.pipe.quantize_px([color[0], color[1], color[2], 1.0]);
-        Some(Buf { img: Image::filled(width, height, px), offset: [0.0; 2], scale: scale * factor })
+        Some((width, height, scale * factor, px))
     }
 
     /// Fully processed layer buffer (source → masks → effects → layer styles, flattened).

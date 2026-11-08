@@ -84,7 +84,7 @@ fn warp_q_with_source_quantization(
     levels: Option<f32>,
     source_levels: Option<f32>,
 ) -> GpuImage {
-    let Some((img, p, region, clear)) = warp_params(e, dst, src, m, opts, accumulate, levels, source_levels) else { return dst.clone() };
+    let Some((img, p, region, clear)) = warp_params(e, dst, src, m, opts, accumulate, levels, source_levels, None) else { return dst.clone() };
     let mut out = e.scratch(dst.width, dst.height);
     if clear {
         // Stencil modes clear pixels outside the source footprint too.
@@ -113,11 +113,43 @@ pub fn warp_q_pingpong(
     previous: Option<(u32, u32, u32, u32)>,
     quantize_source: bool,
 ) -> PingPongWarp {
+    warp_q_pingpong_inner(e, current, next, src, m, opts, levels, previous, quantize_source, None)
+}
+
+/// [`warp_q_pingpong`] for an opaque rectangle whose uniform pixels are passed as parameters.
+pub fn warp_q_solid_pingpong(
+    e: &mut Enc,
+    current: &GpuImage,
+    next: &mut GpuImage,
+    color: [f32; 4],
+    size: (u32, u32),
+    m: &Mat3,
+    opts: WarpOptions,
+    levels: Option<f32>,
+    previous: Option<(u32, u32, u32, u32)>,
+    quantize_source: bool,
+) -> PingPongWarp {
+    let src = e.g.dummy_image();
+    warp_q_pingpong_inner(e, current, next, &src, m, opts, levels, previous, quantize_source, Some((color, size)))
+}
+
+fn warp_q_pingpong_inner(
+    e: &mut Enc,
+    current: &GpuImage,
+    next: &mut GpuImage,
+    src: &GpuImage,
+    m: &Mat3,
+    opts: WarpOptions,
+    levels: Option<f32>,
+    previous: Option<(u32, u32, u32, u32)>,
+    quantize_source: bool,
+    solid: Option<([f32; 4], (u32, u32))>,
+) -> PingPongWarp {
     if current.width != next.width || current.height != next.height {
         return PingPongWarp::Unsupported;
     }
     let source_levels = quantize_source.then_some(levels).flatten();
-    let Some((img, p, region, clear)) = warp_params(e, current, src, m, opts, None, levels, source_levels) else { return PingPongWarp::Unchanged };
+    let Some((img, p, region, clear)) = warp_params(e, current, src, m, opts, None, levels, source_levels, solid) else { return PingPongWarp::Unchanged };
     if clear {
         return PingPongWarp::Unsupported;
     }
@@ -138,6 +170,7 @@ fn warp_params(
     accumulate: Option<f32>,
     levels: Option<f32>,
     source_levels: Option<f32>,
+    solid: Option<([f32; 4], (u32, u32))>,
 ) -> Option<(GpuImage, Params, (u32, u32, u32, u32), bool)> {
     let WarpOptions { sampling, mode, opacity, seed } = opts;
     if src.width == 0 || src.height == 0 || opacity <= 0.0 {
@@ -148,18 +181,31 @@ fn warp_params(
     let scale = m.mean_scale();
     let mut img = src.clone();
     let mut inv = inv0;
+    let (mut source_width, mut source_height) = solid.map_or((src.width, src.height), |(_, size)| size);
+    let (bounds_width, bounds_height) = (source_width, source_height);
     if scale < 0.5 && m.is_affine() {
         let mut s = scale * 2.0;
         let mut f = 0.5;
-        img = if let Some(source_levels) = source_levels { half_quantized(e, src, source_levels) } else { half(e, src) };
-        while s < 0.5 && img.width > 1 && img.height > 1 {
-            img = half(e, &img);
-            f *= 0.5;
-            s *= 2.0;
+        if solid.is_some() {
+            (source_width, source_height) = (source_width.div_ceil(2).max(1), source_height.div_ceil(2).max(1));
+            while s < 0.5 && source_width > 1 && source_height > 1 {
+                (source_width, source_height) = (source_width.div_ceil(2).max(1), source_height.div_ceil(2).max(1));
+                f *= 0.5;
+                s *= 2.0;
+            }
+        } else {
+            img = if let Some(source_levels) = source_levels { half_quantized(e, src, source_levels) } else { half(e, src) };
+            while s < 0.5 && img.width > 1 && img.height > 1 {
+                img = half(e, &img);
+                f *= 0.5;
+                s *= 2.0;
+            }
+            source_width = img.width;
+            source_height = img.height;
         }
         inv = Mat3::scale(vec2(f, f)) * inv;
     }
-    let bounds = m.map_rect(&Rect::from_size(src.width as f64, src.height as f64)).inflate(1.0).round_out();
+    let bounds = m.map_rect(&Rect::from_size(bounds_width as f64, bounds_height as f64)).inflate(1.0).round_out();
     let area = bounds.intersect(&Rect::from_size(dst.width as f64, dst.height as f64));
     if area.is_empty() {
         return None;
@@ -168,7 +214,7 @@ fn warp_params(
     let (y0, y1) = (area.y0.max(0.0) as u32, area.y1.min(dst.height as f64) as u32);
     let mut p = Params::default();
     let clear = matches!(mode, BlendMode::StencilAlpha | BlendMode::StencilLuma);
-    let flags = u32::from(accumulate.is_some()) | if clear && accumulate.is_none() { 2 } else { 0 };
+    let flags = u32::from(accumulate.is_some()) | if clear && accumulate.is_none() { 2 } else { 0 } | if solid.is_some() { 4 } else { 0 };
     p.u[0] = [mode_id(mode), sampling_id(sampling), seed, flags];
     let r = rows(&inv);
     p.f[0] = r[0];
@@ -177,6 +223,10 @@ fn warp_params(
     p.f[3] = [opacity, accumulate.unwrap_or(1.0), levels.unwrap_or(0.0), levels.map_or(0.0, |v| 1.0 / v)];
     p.f[4] = [x0 as f32, y0 as f32, x1 as f32, y1 as f32];
     p.f[5] = [source_levels.unwrap_or(0.0), source_levels.map_or(0.0, |v| 1.0 / v), 0.0, 0.0];
+    if let Some((color, _)) = solid {
+        p.f[6] = color;
+        p.f[7] = [source_width as f32, source_height as f32, 0.0, 0.0];
+    }
     Some((img, p, (x0, y0, x1, y1), clear))
 }
 
