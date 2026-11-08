@@ -62,6 +62,20 @@ pub use opts::{LayerTiming, RenderOpts};
 use opts::{MAX_THROUGH, Through};
 pub use pipeline::{Collapsed, MediaOverride, PropertyOverride};
 
+/// Configure Rayon once for an EffectCraft process. The compositor uses the global pool across
+/// layer rendering, pixel operations and project parsing, so cap it at a moderate size on
+/// machines with many logical CPUs. `RAYON_NUM_THREADS` remains the explicit user override.
+pub fn configure_parallelism() {
+    static CONFIGURED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    CONFIGURED.get_or_init(|| {
+        if std::env::var_os("RAYON_NUM_THREADS").is_none() {
+            let threads = std::thread::available_parallelism().map_or(1, |n| n.get().min(8));
+            let _ = rayon::ThreadPoolBuilder::new().num_threads(threads).build_global();
+        }
+    });
+}
+
+#[derive(Clone)]
 pub struct Renderer<'a> {
     pub project: &'a Project,
     pub footage: &'a dyn FootageSource,
@@ -71,6 +85,10 @@ pub struct Renderer<'a> {
     pub cache: Option<&'a LayerCache>,
     /// Optional per-layer timing sink (`frame --bench` / perf readouts).
     pub profile: Option<&'a std::sync::Mutex<Vec<LayerTiming>>>,
+    /// Per-top-level-frame cache for repeated static precomps.
+    pub(crate) comp_frames: Arc<crate::pipeline::CompFrameCache>,
+    /// Disabled by profile renders so every nested layer remains visible in layer timings.
+    pub(crate) cache_static_comps: bool,
     /// GPU backend used when [`RenderOpts::backend`] asks for it.
     pub accel: Option<&'a dyn Accelerator>,
     /// Current nesting depth (precomp recursion guard).

@@ -5,7 +5,7 @@ use super::settings::{APP_VERSION, ProjectError, ProjectSettings, SCHEMA_VERSION
 use super::{Arc, BTreeMap, Deserialize, FrameRate, Label, Project, Serialize, Tick, file_check, limits};
 
 #[derive(Deserialize)]
-struct ProjectItemParts<'a> {
+struct ProjectItemPartsFast {
     id: ItemId,
     name: String,
     label: Label,
@@ -13,14 +13,65 @@ struct ProjectItemParts<'a> {
     comment: String,
     #[serde(default)]
     parent: Option<ItemId>,
-    #[serde(borrow)]
-    kind: &'a serde_json::value::RawValue,
+    #[serde(deserialize_with = "deserialize_project_kind")]
+    kind: ItemKind,
     #[serde(default)]
     proxy: Option<Box<Proxy>>,
 }
 
+struct ProjectItemsFast(BTreeMap<ItemId, super::Item>);
+
+impl<'de> Deserialize<'de> for ProjectItemsFast {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct ItemsVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for ItemsVisitor {
+            type Value = ProjectItemsFast;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a map of project item ids to project items")
+            }
+
+            fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
+            where
+                M: serde::de::MapAccess<'de>,
+            {
+                let mut items = BTreeMap::new();
+                while let Some(id) = map.next_key::<ItemId>()? {
+                    let item = map.next_value::<ProjectItemPartsFast>()?;
+                    items.insert(
+                        id,
+                        super::Item {
+                            id: item.id,
+                            name: item.name,
+                            label: item.label,
+                            comment: item.comment,
+                            parent: item.parent,
+                            kind: item.kind,
+                            proxy: item.proxy,
+                        },
+                    );
+                }
+                Ok(ProjectItemsFast(items))
+            }
+        }
+
+        deserializer.deserialize_map(ItemsVisitor)
+    }
+}
+
+fn deserialize_project_kind<'de, D>(deserializer: D) -> Result<ItemKind, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserializer.deserialize_map(ProjectItemKindVisitor)
+}
+
 #[derive(Deserialize)]
-struct ProjectCompParts<'a> {
+struct ProjectCompParts {
     width: u32,
     height: u32,
     pixel_aspect: f64,
@@ -29,8 +80,7 @@ struct ProjectCompParts<'a> {
     display_start: Tick,
     background: [f32; 3],
     work_area: (Tick, Tick),
-    #[serde(borrow)]
-    layers: Vec<&'a serde_json::value::RawValue>,
+    layers: Vec<Layer>,
     #[serde(default)]
     markers: Vec<super::settings::Marker>,
     shutter_angle: f64,
@@ -64,10 +114,9 @@ struct ProjectCompParts<'a> {
     resolution: super::comp::Resolution,
 }
 
-impl ProjectCompParts<'_> {
-    fn into_comp(self) -> Result<Comp, serde_json::Error> {
-        let layers = parse_project_layers(self.layers)?;
-        Ok(Comp {
+impl ProjectCompParts {
+    fn into_comp(self) -> Comp {
+        Comp {
             width: self.width,
             height: self.height,
             pixel_aspect: self.pixel_aspect,
@@ -76,7 +125,7 @@ impl ProjectCompParts<'_> {
             display_start: self.display_start,
             background: self.background,
             work_area: self.work_area,
-            layers,
+            layers: self.layers.into(),
             markers: self.markers,
             shutter_angle: self.shutter_angle,
             shutter_phase: self.shutter_phase,
@@ -94,7 +143,7 @@ impl ProjectCompParts<'_> {
             guides: self.guides,
             essential: self.essential,
             resolution: self.resolution,
-        })
+        }
     }
 }
 
@@ -125,7 +174,14 @@ impl<'de> serde::de::Visitor<'de> for ProjectItemKindVisitor {
             return Err(M::Error::custom("missing item kind discriminator"));
         };
         if first_key != "type" {
-            return Err(M::Error::custom("item kind discriminator is not first"));
+            // Older projects may put other fields before the discriminator. Keep the common
+            // tag-first form on the streaming path; use a DOM only for this compatibility case.
+            let mut fields = serde_json::Map::new();
+            fields.insert(first_key, map.next_value()?);
+            while let Some(key) = map.next_key::<String>()? {
+                fields.insert(key, map.next_value()?);
+            }
+            return serde_json::from_value(serde_json::Value::Object(fields)).map_err(M::Error::custom);
         }
         let tag = map.next_value::<String>()?;
         match tag.as_str() {
@@ -137,60 +193,12 @@ impl<'de> serde::de::Visitor<'de> for ProjectItemKindVisitor {
             }
             "Comp" => {
                 let comp = ProjectCompParts::deserialize(serde::de::value::MapAccessDeserializer::new(map))?;
-                comp.into_comp().map(Arc::new).map(ItemKind::Comp).map_err(M::Error::custom)
+                Ok(ItemKind::Comp(Arc::new(comp.into_comp())))
             }
             "Footage" => Footage::deserialize(serde::de::value::MapAccessDeserializer::new(map)).map(ItemKind::Footage),
             "Solid" => Solid::deserialize(serde::de::value::MapAccessDeserializer::new(map)).map(ItemKind::Solid),
             _ => Err(M::Error::unknown_variant(&tag, &["Folder", "Comp", "Footage", "Solid"])),
         }
-    }
-}
-
-fn parse_project_kind(raw: &serde_json::value::RawValue) -> Result<ItemKind, serde_json::Error> {
-    let fast = (|| {
-        let mut deserializer = serde_json::Deserializer::from_str(raw.get());
-        let kind = serde::Deserializer::deserialize_map(&mut deserializer, ProjectItemKindVisitor)?;
-        deserializer.end().map(|()| kind)
-    })();
-    fast.or_else(|_| serde_json::from_str(raw.get()))
-}
-
-fn parse_project_item(raw: &serde_json::value::RawValue) -> Result<Item, serde_json::Error> {
-    let item: ProjectItemParts<'_> = serde_json::from_str(raw.get())?;
-    Ok(Item {
-        id: item.id,
-        name: item.name,
-        label: item.label,
-        comment: item.comment,
-        parent: item.parent,
-        kind: parse_project_kind(item.kind)?,
-        proxy: item.proxy,
-    })
-}
-
-fn parse_project_layers(layers: Vec<&serde_json::value::RawValue>) -> Result<super::Layers, serde_json::Error> {
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        use rayon::prelude::*;
-
-        layers.into_par_iter().map(|raw| serde_json::from_str::<Layer>(raw.get())).collect::<Result<Vec<_>, _>>().map(super::Layers::from)
-    }
-    #[cfg(target_arch = "wasm32")]
-    {
-        layers.into_iter().map(|raw| serde_json::from_str::<Layer>(raw.get())).collect::<Result<Vec<_>, _>>().map(super::Layers::from)
-    }
-}
-
-fn parse_project_items(items: BTreeMap<ItemId, &serde_json::value::RawValue>) -> Result<BTreeMap<ItemId, Item>, serde_json::Error> {
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        use rayon::prelude::*;
-
-        items.into_par_iter().map(|(id, raw)| parse_project_item(raw).map(|item| (id, item))).collect()
-    }
-    #[cfg(target_arch = "wasm32")]
-    {
-        items.into_iter().map(|(id, raw)| parse_project_item(raw).map(|item| (id, item))).collect()
     }
 }
 
@@ -512,12 +520,17 @@ impl Project {
     /// `savedBy` and the saved view next to the project fields, so parsing them separately would
     /// rescan a large file for each small metadata object.
     pub fn from_file_json_repaired(bytes: &[u8]) -> Result<(Project, Vec<String>, SavedView, Option<String>), ProjectError> {
+        #[cfg(not(target_arch = "wasm32"))]
+        let profile_open = std::env::var_os("EFFECTCRAFT_PROFILE_OPEN").is_some();
+        #[cfg(target_arch = "wasm32")]
+        let profile_open = false;
+        #[cfg(not(target_arch = "wasm32"))]
+        let serde_started = std::time::Instant::now();
         #[derive(Deserialize)]
-        struct ProjectFile<'a> {
+        struct ProjectFile {
             schema: u32,
             settings: ProjectSettings,
-            #[serde(borrow)]
-            items: BTreeMap<ItemId, &'a serde_json::value::RawValue>,
+            items: ProjectItemsFast,
             next_id: u64,
             #[serde(default)]
             render_queue: Vec<super::render_queue::RenderQueueItem>,
@@ -535,7 +548,12 @@ impl Project {
             comp_times: Option<serde_json::Value>,
         }
 
-        let file: ProjectFile = serde_json::from_slice(bytes).map_err(|e| ProjectError::Invalid(e.to_string()))?;
+        let parsed = serde_json::from_slice::<ProjectFile>(bytes);
+        let file = parsed.map_err(|e| ProjectError::Invalid(e.to_string()))?;
+        #[cfg(not(target_arch = "wasm32"))]
+        let serde_ms = serde_started.elapsed().as_secs_f64() * 1e3;
+        #[cfg(target_arch = "wasm32")]
+        let serde_ms = 0.0;
         let saved_by = file.saved_by.as_ref().and_then(serde_json::Value::as_str).map(str::to_string);
         let view = SavedView {
             active_comp: file.active_comp.as_ref().and_then(serde_json::Value::as_u64).map(ItemId),
@@ -550,17 +568,25 @@ impl Project {
                 .and_then(serde_json::Value::as_object)
                 .map_or_else(BTreeMap::new, |o| o.iter().filter_map(|(k, v)| Some((ItemId(k.parse().ok()?), Tick(v.as_i64()?)))).collect()),
         };
-        let items = parse_project_items(file.items).map_err(|e| ProjectError::Invalid(e.to_string()))?;
         let p = Project {
             schema: file.schema,
             settings: file.settings,
-            items,
+            items: file.items.0,
             next_id: file.next_id,
             render_queue: file.render_queue,
             render_templates: file.render_templates,
             render_prefs: file.render_prefs,
         };
+        #[cfg(not(target_arch = "wasm32"))]
+        let repair_started = std::time::Instant::now();
         let (project, repaired) = Self::repair(p)?;
+        #[cfg(not(target_arch = "wasm32"))]
+        let repair_ms = repair_started.elapsed().as_secs_f64() * 1e3;
+        #[cfg(target_arch = "wasm32")]
+        let repair_ms = 0.0;
+        if profile_open {
+            eprintln!("open-profile-project bytes={} serde={serde_ms:.3}ms repair={repair_ms:.3}ms", bytes.len());
+        }
         Ok((project, repaired, view, saved_by))
     }
 

@@ -25,7 +25,7 @@
 //! effectcraft-cli render F.ecproj --queue                    render the project's Render Queue
 //! effectcraft-cli bench [--comp C] [--time S] [--scale K] [--n N] [--play N] [--gpu [--adv3d]]   render timings
 //!     (--gpu: CPU vs GPU ms/frame for every comp at Full and Half)
-//! effectcraft-cli bench --ops [--small] [--layers N] [--comps N] [--footage N]   everyday-operation timings
+//! effectcraft-cli bench --ops [--small] [--layers N] [--comps N] [--footage N] [--realistic]   everyday-operation timings
 //!     on a large generated project (open, save, auto-save, undo/redo, timeline, Project panel)
 //! effectcraft-cli bench --roto [--frames N] [--sam2 model.safetensors] [--mobilesam mobile_sam.pt] [--fixes] [--clip FRAMES --truth MASKS] [--json]   Roto Brush trackers on synthetic clips with known mattes
 //!     (classical engine, MobileSAM and SAM 2.1 (any installed size) when installed; IoU, flicker, re-appearance, seconds per frame)
@@ -124,7 +124,7 @@ const USAGE: &str = "usage: effectcraft-cli <info|commands|exec|run|props|get|se
   bench [--comp C] [--time S] [--scale K] [--n N] [--play N] [--gpu [--adv3d]]   per-layer/effect render timings;
                                            --play N renders N consecutive frames with/without the layer cache;
                                            --gpu compares CPU and GPU ms/frame for every comp at Full and Half
-  bench --ops [--small] [--layers N] [--comps N] [--footage N]
+  bench --ops [--small] [--layers N] [--comps N] [--footage N] [--realistic]
                                            everyday operations on a large generated project: startup, open,
                                            save, auto-save, edits + undo/redo, timeline, Project panel
   bench --roto [--frames N] [--sam2 FILE] [--mobilesam FILE] [--fixes] [--clip FRAMES_DIR --truth MASKS_DIR] [--json]
@@ -212,6 +212,7 @@ const FLAGS: &[&str] = &[
     "--work-area",
     "--queue",
     "--ops",
+    "--realistic",
     "--roto",
     "--small",
     "--adv3d",
@@ -299,6 +300,7 @@ fn utf8_args(raw: impl IntoIterator<Item = std::ffi::OsString>) -> Result<Vec<St
 }
 
 fn main() {
+    effectcraft_render::configure_parallelism();
     // Warnings and errors to standard error (`RUST_LOG` overrides), so a GPU that declines
     // frames or runs out of memory says so instead of silently rendering on the CPU.
     effectcraft_engine::logging::install_with("warn");
@@ -1146,7 +1148,11 @@ fn bench_ops(args: &Args) -> Result<(), Failure> {
     if let Some(n) = args.num("--footage")? {
         spec.footage = n.max(0.0) as usize;
     }
+    if args.flag("--realistic") {
+        spec.realistic = true;
+    }
     let dir = std::env::temp_dir().join(format!("effectcraft-bench-ops-{}", std::process::id()));
+    let keep_bench_file = std::env::var_os("EFFECTCRAFT_KEEP_BENCH_FILE").is_some();
     std::fs::create_dir_all(&dir).map_err(|e| Failure::Error(format!("{}: {e}", dir.display())))?;
     if let Some(measure) = args.opt("--measure") {
         if !matches!(measure, "open" | "firstFrame") {
@@ -1162,7 +1168,11 @@ fn bench_ops(args: &Args) -> Result<(), Failure> {
         } else if let Some(x) = m.first() {
             say!("{}: {:.2} ms ({})", x.name, x.ms, x.note);
         }
-        let _ = std::fs::remove_dir_all(&dir);
+        if keep_bench_file {
+            eprintln!("bench fixture retained at {}", dir.display());
+        } else {
+            let _ = std::fs::remove_dir_all(&dir);
+        }
         return Ok(());
     }
     let t0 = std::time::Instant::now();
@@ -1178,7 +1188,11 @@ fn bench_ops(args: &Args) -> Result<(), Failure> {
         }
         s
     }));
-    let _ = std::fs::remove_dir_all(&dir);
+    if keep_bench_file {
+        eprintln!("bench fixture retained at {}", dir.display());
+    } else {
+        let _ = std::fs::remove_dir_all(&dir);
+    }
     if args.flag("--json") {
         emit(&json!({"spec": format!("{spec:?}"), "measures": m.iter().map(perf::Measure::json).collect::<Vec<_>>()}), true);
     } else {

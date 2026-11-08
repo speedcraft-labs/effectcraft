@@ -108,6 +108,35 @@ fn gradients_coerce_from_plain_json() {
     assert_eq!(g.coerce_json(&serde_json::json!(5)), None);
 }
 
+#[test]
+fn tagged_values_deserialize_without_losing_variant_compatibility() {
+    let values = [
+        Value::Scalar(1.25),
+        Value::Vec2([1.0, 2.0]),
+        Value::Vec3([1.0, 2.0, 3.0]),
+        Value::Color([0.1, 0.2, 0.3, 0.4]),
+        Value::Bool(true),
+        Value::Enum(7),
+        Value::Path(ShapePath::polygon(&[[0.0, 0.0], [1.0, 1.0]], true)),
+        Value::Text(Box::default()),
+        Value::Layer(Some(42)),
+        Value::Layer(None),
+        Value::Gradient(Gradient::default()),
+        Value::Str("value".into()),
+    ];
+    for value in values {
+        let encoded = serde_json::to_string(&value).unwrap();
+        let decoded: Value = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, value, "{encoded}");
+    }
+
+    // Older and hand-authored files can put the value payload before the tag.
+    assert_eq!(serde_json::from_str::<Value>(r#"{"v":[2.0,3.0],"t":"Vec2"}"#).unwrap(), Value::Vec2([2.0, 3.0]));
+    // Unknown metadata remains ignored on the common tag-first representation.
+    assert_eq!(serde_json::from_str::<Value>(r#"{"t":"Scalar","note":"extra","v":4.5}"#).unwrap(), Value::Scalar(4.5));
+    assert!(serde_json::from_str::<Value>(r#"{"t":"Scalar","v":1,"v":2}"#).is_err());
+}
+
 /// #612: the gradient editor samples a new stop from its own track only. `sample` multiplies
 /// in the opacity stops, so feeding its alpha into a colour stop would apply 50% twice (25%).
 #[test]

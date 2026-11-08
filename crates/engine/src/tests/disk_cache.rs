@@ -99,7 +99,7 @@ fn footage_changes_change_the_salt() {
             loop_count: 1,
             codec: "PNG".into(),
             missing: false,
-            sequence: vec![],
+            sequence: vec![].into(),
             color_profile: None,
             layer: None,
             ..Default::default()
