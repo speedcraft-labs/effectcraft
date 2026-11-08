@@ -1,5 +1,6 @@
 //! Noise & Grain effects: film grain, median-family filters, denoising and procedural noise.
 
+use craft_blur::MedianHistogram;
 use effectcraft_color::{hsl_to_rgb, luminance, rgb_to_hsl};
 use effectcraft_keyframe::Value;
 use effectcraft_project::ParamUi;
@@ -378,14 +379,10 @@ pub(crate) fn median_image(img: &Image, r: usize) -> Image {
         return img.clone();
     }
     let q: Vec<[u16; 4]> = img.data.par_iter().map(|p| [quant(p[0]), quant(p[1]), quant(p[2]), quant(p[3])]).collect();
-    let n = (2 * r + 1) * (2 * r + 1);
-    let half = n / 2;
     let ri = r as i64;
     let mut out = Image::new(img.width, img.height);
     out.rows_mut().for_each(|(y, row)| {
-        let mut hist = vec![0u32; NB * 4];
-        let mut med = [0usize; 4];
-        let mut lt = [0usize; 4];
+        let mut hist = std::array::from_fn::<_, 4, _>(|_| MedianHistogram::new(NB));
         let at = |x: i64, y: i64| q[y.clamp(0, h as i64 - 1) as usize * w + x.clamp(0, w as i64 - 1) as usize];
         let col = |x: i64, f: &mut dyn FnMut([u16; 4])| {
             for dy in -ri..=ri {
@@ -395,46 +392,25 @@ pub(crate) fn median_image(img: &Image, r: usize) -> Image {
         for dx in -ri..=ri {
             col(dx, &mut |v| {
                 for c in 0..4 {
-                    hist[c * NB + v[c] as usize] += 1;
+                    hist[c].add(v[c] as usize);
                 }
             });
         }
-        let rebalance = |hist: &[u32], med: &mut [usize; 4], lt: &mut [usize; 4]| {
-            for c in 0..4 {
-                let hc = &hist[c * NB..(c + 1) * NB];
-                while lt[c] > half {
-                    med[c] -= 1;
-                    lt[c] -= hc[med[c]] as usize;
-                }
-                while lt[c] + hc[med[c]] as usize <= half {
-                    lt[c] += hc[med[c]] as usize;
-                    med[c] += 1;
-                }
-            }
-        };
-        rebalance(&hist, &mut med, &mut lt);
         for x in 0..w {
-            row[x] = med.map(|m| m as f32 / (NB - 1) as f32);
+            row[x] = std::array::from_fn(|c| hist[c].median().unwrap_or_default() as f32 / (NB - 1) as f32);
             if x + 1 == w {
                 break;
             }
             col(x as i64 - ri, &mut |v| {
                 for c in 0..4 {
-                    hist[c * NB + v[c] as usize] -= 1;
-                    if (v[c] as usize) < med[c] {
-                        lt[c] -= 1;
-                    }
+                    hist[c].remove(v[c] as usize);
                 }
             });
             col(x as i64 + ri + 1, &mut |v| {
                 for c in 0..4 {
-                    hist[c * NB + v[c] as usize] += 1;
-                    if (v[c] as usize) < med[c] {
-                        lt[c] += 1;
-                    }
+                    hist[c].add(v[c] as usize);
                 }
             });
-            rebalance(&hist, &mut med, &mut lt);
         }
     });
     out
@@ -877,7 +853,13 @@ mod tests {
         let mut img = Image::new(w, h);
         for y in 0..h {
             for x in 0..w {
-                let v = |k: u32| ((x * 37 + y * 101 + k * 13) % 511) as f32 / 511.0;
+                let v = |k: u32| {
+                    let mut s = x.wrapping_mul(0x8da6_b343) ^ y.wrapping_mul(0xd816_3841) ^ k.wrapping_mul(0xcb1a_b31f);
+                    s ^= s >> 16;
+                    s = s.wrapping_mul(0x7feb_352d);
+                    s ^= s >> 15;
+                    (s % 512) as f32 / 511.0
+                };
                 img.set(x, y, [v(0), v(1), v(2), v(3)]);
             }
         }
@@ -896,6 +878,43 @@ mod tests {
                         let want = vals[vals.len() / 2];
                         let got = m.data[y as usize * w as usize + x as usize][c];
                         assert!((want - got).abs() < 1e-4, "r={r} ({x},{y}) c={c}: {want} vs {got}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn median_matches_brute_force_on_pinned_8_and_16_bit_images_when_available() {
+        let Some(root) = std::env::var_os("ARTCRAFT_CORPUS") else { return };
+        for fixture in ["basn6a08.png", "basn6a16.png"] {
+            let path = std::path::PathBuf::from(&root).join("pngsuite").join(fixture);
+            assert!(path.exists(), "missing corpus fixture {path:?}");
+            let decoded = image::open(&path);
+            assert!(decoded.is_ok(), "could not decode corpus fixture {path:?}");
+            let Ok(decoded) = decoded else { return };
+            let rgba = decoded.to_rgba32f();
+            let (w, h) = (rgba.width(), rgba.height());
+            let mut img = Image::new(w, h);
+            for (i, pixel) in rgba.pixels().enumerate() {
+                img.data[i] = pixel.0;
+            }
+            for r in [1usize, 3] {
+                let actual = median_image(&img, r);
+                for y in 0..h as i64 {
+                    for x in 0..w as i64 {
+                        for c in 0..4 {
+                            let mut values = Vec::new();
+                            for dy in -(r as i64)..=r as i64 {
+                                for dx in -(r as i64)..=r as i64 {
+                                    values.push(quant(img.get_clamped(x + dx, y + dy)[c]));
+                                }
+                            }
+                            values.sort_unstable();
+                            let want = values[values.len() / 2] as f32 / 511.0;
+                            let got = actual.data[y as usize * w as usize + x as usize][c];
+                            assert_eq!(got.to_bits(), want.to_bits(), "{fixture} r={r} ({x},{y}) c={c}");
+                        }
                     }
                 }
             }
