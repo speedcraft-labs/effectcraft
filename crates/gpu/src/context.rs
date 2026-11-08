@@ -2,6 +2,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, Mutex, Weak};
+use std::time::Instant;
 
 use effectcraft_effects::Buf;
 use effectcraft_raster::Image;
@@ -143,9 +144,12 @@ const STALE_FRAMES: u64 = 2;
 /// Readback staging buffers kept for reuse across sizes (bytes).
 const STAGING_BUDGET: u64 = 256 << 20;
 
-/// A GPU image: premultiplied RGBA f32 in a texture (cheap to clone; immutable once written).
-/// Working images come from the context's texture pool and go back to it when the last clone
-/// is dropped.
+/// Per-frame cache for rasters of repeated static precomps.
+const STATIC_PRECOMP_CACHE_BYTES: usize = 256 << 20;
+const STATIC_PRECOMP_CACHE_SINGLE: usize = 32 << 20;
+
+/// A GPU image (cheap to clone; immutable once written). Working images use premultiplied RGBA
+/// f32; an exact 8-bit layer upload may use RGBA8Unorm.
 #[derive(Clone, Debug)]
 pub struct GpuImage {
     pub texture: wgpu::Texture,
@@ -291,6 +295,34 @@ pub struct TransferStats {
     pub upload_bytes: u64,
     pub readbacks: u64,
     pub readback_bytes: u64,
+}
+
+/// Lazy shader and pipeline work since a GPU context was created.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PipelineBuildStats {
+    pub requests: u64,
+    pub cache_hits: u64,
+    pub shader_modules: u64,
+    pub shader_module_ns: u64,
+    pub pipelines: u64,
+    pub pipeline_ns: u64,
+}
+
+/// Repeated static precomp rasters reused within GPU frames.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StaticPrecompStats {
+    pub hits: u64,
+    pub misses: u64,
+}
+
+#[derive(Default)]
+struct PipelineBuildCounters {
+    requests: std::sync::atomic::AtomicU64,
+    cache_hits: std::sync::atomic::AtomicU64,
+    shader_modules: std::sync::atomic::AtomicU64,
+    shader_module_ns: std::sync::atomic::AtomicU64,
+    pipelines: std::sync::atomic::AtomicU64,
+    pipeline_ns: std::sync::atomic::AtomicU64,
 }
 
 /// `WGPU_ADAPTER_NAME` trimmed; empty or whitespace-only counts as unset (an empty
@@ -710,6 +742,9 @@ pub struct GpuContext {
     pool: Arc<Mutex<Pool>>,
     /// CPU ↔ GPU traffic (diagnostics: `bench --gpu`).
     pub(crate) transfers: Transfers,
+    pipeline_builds: PipelineBuildCounters,
+    static_precomp_hits: std::sync::atomic::AtomicU64,
+    static_precomp_misses: std::sync::atomic::AtomicU64,
     /// Readback staging buffers by size.
     staging: Mutex<HashMap<u64, Vec<wgpu::Buffer>>>,
     /// Transparent read-only images by size (see [`Enc::zeros`]).
@@ -1034,6 +1069,9 @@ impl GpuContext {
             pool,
             staging: Default::default(),
             transfers: Default::default(),
+            pipeline_builds: Default::default(),
+            static_precomp_hits: Default::default(),
+            static_precomp_misses: Default::default(),
             zeros: Default::default(),
             adv3d: std::sync::OnceLock::new(),
             yuv: std::sync::OnceLock::new(),
@@ -1357,7 +1395,10 @@ impl GpuContext {
     /// Kernel `entry`'s pipeline: one built up front, or an effect kernel, built the first time
     /// it is asked for. `None` when the device doesn't have it.
     fn pipeline(&self, entry: &str) -> Option<&wgpu::ComputePipeline> {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.pipeline_builds.requests.fetch_add(1, Relaxed);
         if let Some(p) = self.pipelines.get(entry) {
+            self.pipeline_builds.cache_hits.fetch_add(1, Relaxed);
             return Some(p);
         }
         let Some((e, (family, cell))) = self.effect_pipelines.get_key_value(entry) else {
@@ -1366,8 +1407,17 @@ impl GpuContext {
             }
             return None;
         };
+        if cell.get().is_some() {
+            self.pipeline_builds.cache_hits.fetch_add(1, Relaxed);
+        }
         let built = cell.get_or_init(|| {
-            let built = self.family_module(*family).and_then(|module| build_pipeline(&self.device, module, &self.layout, e));
+            let built = self.family_module(*family).and_then(|module| {
+                let start = Instant::now();
+                let built = build_pipeline(&self.device, module, &self.layout, e);
+                self.pipeline_builds.pipelines.fetch_add(1, Relaxed);
+                self.pipeline_builds.pipeline_ns.fetch_add(start.elapsed().as_nanos() as u64, Relaxed);
+                built
+            });
             if let Err(why) = &built {
                 log::warn!("gpu {}: kernel {e} unavailable, its effects render on the CPU: {why}", self.name);
             }
@@ -1385,7 +1435,11 @@ impl GpuContext {
             let median = [self.median_kernel.source()];
             let extra: &[&str] = if *label == MEDIAN_FAMILY { &median } else { &[] };
             let files: Vec<&str> = files.iter().chain(extra).copied().collect();
-            kernel_module(&self.device, label, &files)
+            let start = Instant::now();
+            let result = kernel_module(&self.device, label, &files);
+            self.pipeline_builds.shader_modules.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.pipeline_builds.shader_module_ns.fetch_add(start.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+            result
         })
         .as_ref()
         .map_err(Clone::clone)
@@ -1463,6 +1517,9 @@ impl GpuContext {
             pool: self.pool.clone(),
             staging: Default::default(),
             transfers: Default::default(),
+            pipeline_builds: Default::default(),
+            static_precomp_hits: Default::default(),
+            static_precomp_misses: Default::default(),
             zeros: Default::default(),
             adv3d: std::sync::OnceLock::new(),
             adv3d_raster: self.adv3d_raster,
@@ -1557,6 +1614,26 @@ impl GpuContext {
             readbacks: t.downs.load(Relaxed),
             readback_bytes: t.down_bytes.load(Relaxed),
         }
+    }
+
+    /// Lazy shader compilation, pipeline compilation, and pipeline-cache lookups.
+    pub fn pipeline_build_stats(&self) -> PipelineBuildStats {
+        use std::sync::atomic::Ordering::Relaxed;
+        let p = &self.pipeline_builds;
+        PipelineBuildStats {
+            requests: p.requests.load(Relaxed),
+            cache_hits: p.cache_hits.load(Relaxed),
+            shader_modules: p.shader_modules.load(Relaxed),
+            shader_module_ns: p.shader_module_ns.load(Relaxed),
+            pipelines: p.pipelines.load(Relaxed),
+            pipeline_ns: p.pipeline_ns.load(Relaxed),
+        }
+    }
+
+    /// Hit and miss counts for the static precomp cache.
+    pub fn static_precomp_stats(&self) -> StaticPrecompStats {
+        use std::sync::atomic::Ordering::Relaxed;
+        StaticPrecompStats { hits: self.static_precomp_hits.load(Relaxed), misses: self.static_precomp_misses.load(Relaxed) }
     }
 
     /// Bytes of working textures the pool keeps for reuse (see [`GpuContext::trim_pool`]).
@@ -1745,6 +1822,9 @@ pub(crate) struct Enc<'g> {
     owner: u64,
     /// `owner` is lent ([`Enc::lent`]) and outlives this `Enc`.
     lent: bool,
+    /// Bounded memo for repeated, contentful static precomps in this frame.
+    static_comps: HashMap<effectcraft_render::CompFrameKey, GpuImage>,
+    static_comp_bytes: usize,
 }
 
 /// Images bound to a compute kernel's source, optional auxiliary and output slots.
@@ -1773,7 +1853,7 @@ impl Drop for Enc<'_> {
 impl<'g> Enc<'g> {
     pub fn new(g: &'g GpuContext) -> Enc<'g> {
         let owner = g.pool.lock().map(|mut p| p.register()).unwrap_or(0);
-        Enc { g, enc: None, last_submit: None, pending: 0, missing: false, owner, lent: false }
+        Enc { g, enc: None, last_submit: None, pending: 0, missing: false, owner, lent: false, static_comps: HashMap::new(), static_comp_bytes: 0 }
     }
 
     /// An `Enc` for self-contained work (an effect chain): once it is dropped, its working
@@ -1785,7 +1865,27 @@ impl<'g> Enc<'g> {
     /// effect's intermediates stayed allocated until the frame ended.
     pub(crate) fn lent(g: &'g GpuContext) -> Enc<'g> {
         let owner = g.pool.lock().map(|mut p| p.lend()).unwrap_or(0);
-        Enc { g, enc: None, last_submit: None, pending: 0, missing: false, owner, lent: true }
+        Enc { g, enc: None, last_submit: None, pending: 0, missing: false, owner, lent: true, static_comps: HashMap::new(), static_comp_bytes: 0 }
+    }
+
+    pub fn static_comp(&mut self, key: &effectcraft_render::CompFrameKey) -> Option<GpuImage> {
+        let image = self.static_comps.get(key).cloned();
+        let counter = if image.is_some() { &self.g.static_precomp_hits } else { &self.g.static_precomp_misses };
+        counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        image
+    }
+
+    pub fn cache_static_comp(&mut self, key: effectcraft_render::CompFrameKey, image: &GpuImage) {
+        let bytes = image.width as usize * image.height as usize * 16;
+        if bytes == 0 || bytes > STATIC_PRECOMP_CACHE_SINGLE || self.static_comps.contains_key(&key) {
+            return;
+        }
+        if self.static_comp_bytes.saturating_add(bytes) > STATIC_PRECOMP_CACHE_BYTES {
+            self.static_comps.clear();
+            self.static_comp_bytes = 0;
+        }
+        self.static_comps.insert(key, image.clone());
+        self.static_comp_bytes += bytes;
     }
 
     /// `img` is used by this `Enc`: if another `Enc` made it, that one must not reuse it at once
@@ -1934,6 +2034,39 @@ impl<'g> Enc<'g> {
     pub fn pixels(&mut self, entry: &str, p: &Params, src: &GpuImage, aux: Option<&GpuImage>, out: &GpuImage, data: Option<&wgpu::Buffer>) {
         let groups = (out.width.div_ceil(16), out.height.div_ceil(16));
         self.dispatch(entry, p, KernelImages { src, aux, out }, data, groups);
+    }
+
+    /// Copy a full-size canvas before a kernel updates one region.
+    pub fn copy_image(&mut self, src: &GpuImage, dst: &GpuImage) {
+        if src.width != dst.width || src.height != dst.height {
+            return;
+        }
+        self.record(&[src, dst]).copy_texture_to_texture(
+            wgpu::TexelCopyTextureInfo { texture: &src.texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            wgpu::TexelCopyTextureInfo { texture: &dst.texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            wgpu::Extent3d { width: src.width, height: src.height, depth_or_array_layers: 1 },
+        );
+    }
+
+    /// Dispatch a warp over its bounds, aligned to the 16×16 workgroup grid.
+    pub fn pixels_region(
+        &mut self,
+        entry: &str,
+        p: &Params,
+        src: &GpuImage,
+        aux: Option<&GpuImage>,
+        out: &GpuImage,
+        region: (u32, u32, u32, u32),
+        data: Option<&wgpu::Buffer>,
+    ) {
+        let (x0, y0, x1, y1) = region;
+        let gx0 = x0 / 16;
+        let gy0 = y0 / 16;
+        let gx1 = x1.div_ceil(16);
+        let gy1 = y1.div_ceil(16);
+        let mut params = *p;
+        params.u[3] = [gx0 * 16, gy0 * 16, 0, 0];
+        self.dispatch(entry, &params, KernelImages { src, aux, out }, data, (gx1.saturating_sub(gx0), gy1.saturating_sub(gy0)));
     }
 
     /// Copy `src` into a larger zeroed image at (`x`, `y`) (Buf::pad).

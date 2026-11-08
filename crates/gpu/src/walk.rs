@@ -80,22 +80,27 @@ fn draw_comp<'a>(e: &mut Enc, r: &Renderer<'a>, ctx: &EvalCtx<'a>, canvas: &mut 
         // A device that ran out of memory (or was lost) on an earlier layer fails every later
         // one: give the frame back to the CPU now instead of drawing the rest of the comp.
         e.g.check_health().ok()?;
-        if visible[i].is_3d() {
+        let full_quantize = if visible[i].is_3d() {
             let mut j = i;
             while j < visible.len() && visible[j].is_3d() {
                 j += 1;
             }
             draw_3d(e, r, ctx, &visible[i..j], canvas)?;
             i = j;
+            true
         } else {
-            match r.collapsed(ctx, visible[i]) {
-                Some(collapsed) => draw_collapsed(e, r, ctx, visible[i], &collapsed, canvas)?,
-                None => draw_layer(e, r, ctx, visible[i], canvas)?,
-            }
+            let full_quantize = match r.collapsed(ctx, visible[i]) {
+                Some(collapsed) => {
+                    draw_collapsed(e, r, ctx, visible[i], &collapsed, canvas)?;
+                    true
+                }
+                None => !draw_layer(e, r, ctx, visible[i], canvas)?,
+            };
             i += 1;
-        }
-        // 8/16 bpc: the comp is an integer buffer after every layer.
-        if let Some(l) = levels {
+            // 8/16 bpc: the comp is an integer buffer after every layer.
+            full_quantize
+        };
+        if full_quantize && let Some(l) = levels {
             *canvas = ops::quantize(e, canvas, l);
         }
     }
@@ -212,37 +217,39 @@ fn draw_collapsed<'a>(
     composite_iso(e, r, ctx, layer, iso, canvas, opacity)
 }
 
-fn draw_layer(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, canvas: &mut GpuImage) -> Option<()> {
+fn draw_layer(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, canvas: &mut GpuImage) -> Option<bool> {
     let out = draw_layer_on(e, r, ctx, layer, canvas);
     e.mem_gate();
     out
 }
 
-fn draw_layer_on(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, canvas: &mut GpuImage) -> Option<()> {
+/// `true` means placement or a no-op has already left the canvas quantised; more complex paths
+/// need the compositor's full-frame quantisation after this layer.
+fn draw_layer_on(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, canvas: &mut GpuImage) -> Option<bool> {
     if layer.switches.adjustment {
         if draw_adjustment(e, r, ctx, layer, canvas).is_some() {
-            return Some(());
+            return Some(false);
         }
-        return on_cpu(e, canvas, |img| r.draw_layer_cpu(ctx, layer, img));
+        return on_cpu(e, canvas, |img| r.draw_layer_cpu(ctx, layer, img)).map(|()| false);
     }
     if r.quality(layer) == Quality::Wireframe {
         // The layer's bounds as a one-pixel outline (the CPU's pixels).
         *canvas = crate::adv3d::wireframe(e, canvas, &r.wireframe_pixels(ctx, layer, (canvas.width, canvas.height)));
-        return Some(());
+        return Some(false);
     }
     let opacity = r.layer_opacity(ctx, layer);
     if opacity <= 0.0 {
-        return Some(());
+        return Some(true);
     }
     if let Some(done) = draw_precomp(e, r, ctx, layer, canvas, opacity) {
-        return done;
+        return done.map(|()| true);
     }
     if let Some(done) = draw_resident_fx(e, r, ctx, layer, canvas, opacity) {
-        return done;
+        return done.map(|()| true);
     }
-    let Some(st) = r.styled_layer(ctx, layer) else { return Some(()) };
+    let Some(st) = r.styled_layer(ctx, layer) else { return Some(true) };
     if st.plain {
-        return composite_layer(e, r, ctx, layer, &st.body, canvas, opacity);
+        return composite_layer(e, r, ctx, layer, &st.body, canvas, opacity).map(|()| true);
     }
     // Layer styles: exterior passes with their own modes, then the body; the layer's opacity
     // fades the whole stack; knockout and channel switches as on the CPU.
@@ -254,7 +261,7 @@ fn draw_layer_on(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, canvas
             iso = place(e, r, ctx, layer, b, &iso, *m, 1.0, None)?;
         }
         iso = place(e, r, ctx, layer, &st.body, &iso, BlendMode::Normal, 1.0, None)?;
-        return composite_iso(e, r, ctx, layer, iso, canvas, opacity);
+        return composite_iso(e, r, ctx, layer, iso, canvas, opacity).map(|()| false);
     }
     let mut tmp = canvas.clone();
     if bl.knockout > 0 {
@@ -266,7 +273,7 @@ fn draw_layer_on(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, canvas
     }
     tmp = place(e, r, ctx, layer, &st.body, &tmp, layer.blend_mode, 1.0, None)?;
     *canvas = ops::channel_mix(e, canvas, &tmp, bl.channels, opacity);
-    Some(())
+    Some(false)
 }
 
 /// A plain layer with effects, its effect stack run on the GPU: the source (+ masks, from the
@@ -292,7 +299,7 @@ fn draw_resident_fx(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, can
     let Some(src) = e.g.upload_buf(&input) else { return Some(None) };
     let pipe = r.pipe();
     // `layer_input` is in effect space: run the stack there, then back to layer space.
-    let mut fx = crate::effects::GpuFx::new(e, src, input.offset, input.scale, pipe.levels);
+    let mut fx = crate::effects::GpuFx::with_cpu_shadow(e, src, input, pipe.levels);
     let origin = r.run_layer_effects_on(ctx, layer, &mut fx);
     let Some((mut img, mut offset, scale)) = fx.finish() else { return Some(None) };
     offset = [offset[0] - origin[0] * scale, offset[1] - origin[1] * scale];
@@ -322,8 +329,24 @@ fn draw_precomp(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, canvas:
     // A nested comp the GPU can't take (nested too deep, over the texture limit, content it
     // declines) goes back to the CPU path for this layer only; only a device failure fails the
     // frame.
-    let Some(mut src) = render(e, &sub, item, lt) else {
-        return if e.g.check_health().is_ok() { None } else { Some(None) };
+    let key = sub.gpu_static_comp_frame_key(item, lt);
+    let mut src = match key {
+        Some(key) => match e.static_comp(&key) {
+            Some(src) => src,
+            None => {
+                let Some(src) = render(e, &sub, item, lt) else {
+                    return if e.g.check_health().is_ok() { None } else { Some(None) };
+                };
+                e.cache_static_comp(key, &src);
+                src
+            }
+        },
+        None => {
+            let Some(src) = render(e, &sub, item, lt) else {
+                return if e.g.check_health().is_ok() { None } else { Some(None) };
+            };
+            src
+        }
     };
     let pipe = r.pipe();
     // `masked_source` quantises a non-solid source to the project's depth.

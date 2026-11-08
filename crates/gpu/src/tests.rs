@@ -1135,6 +1135,35 @@ fn nested_precomps_render_resident() {
     }
 }
 
+#[test]
+fn repeated_static_precomps_reuse_gpu_rasters() {
+    let mut s = Scene::new(BitDepth::Bpc32);
+    let inner = Comp::new(40, 30, FrameRate::FPS_30, Tick::from_seconds_f64(2.0));
+    let inner_id = s.p.add_item("Static inner", Label::Sandstone, None, ItemKind::Comp(inner.clone().into()));
+    {
+        let mut sub = Scene { p: std::mem::take(&mut s.p), cid: inner_id, comp: inner };
+        let still = sub.footage(32, 24);
+        sub.push(still);
+        let mut solid = sub.solid([0.8, 0.25, 0.4], 20, 18);
+        set(&mut solid, "transform/rotation", Value::Scalar(11.0));
+        sub.push(solid);
+        s.p = sub.p;
+    }
+    for i in 0..12 {
+        let mut layer = build::layer(&mut s.p, &s.comp, "Static instance", LayerSource::Comp { item: inner_id }, (40, 30), None);
+        set(&mut layer, "transform/position", v3(8.0 + f64::from(i * 6), 10.0 + f64::from(i * 3)));
+        set(&mut layer, "transform/scale", Value::Vec3([70.0 + f64::from(i % 3) * 10.0, 70.0, 100.0]));
+        s.push(layer);
+    }
+
+    let Some(g) = gpu() else { return };
+    let before = g.ctx.static_precomp_stats();
+    check("repeated static precomps", compare_at(&s, RenderOpts { motion_blur: false, ..opts() }, Tick::ZERO), 0.0);
+    let after = g.ctx.static_precomp_stats();
+    assert!(after.misses - before.misses >= 1, "the first static raster is rendered once");
+    assert!(after.hits - before.hits >= 11, "later instances should reuse the first raster");
+}
+
 /// #613: an effect kernel the device's shader compiler rejects (FXC on DirectX 12 aborting on
 /// `pointwise`) no longer turns the whole GPU compositor off: the context is built without it,
 /// lists it, and the effects that need it render on the CPU, matching the CPU render.
@@ -1444,6 +1473,26 @@ fn static_effect_layers_draw_from_the_cache() {
     }
     assert!(frames[1] == frames[2]);
     check("static effect layer vs CPU", compare_at(&s, opts(), t(2)), 0.0);
+}
+
+#[test]
+fn first_cpu_effect_uses_the_layer_source_without_gpu_readback() {
+    let Some(g) = gpu() else { return };
+    let mut img = Image::new(8, 8);
+    img.data.fill([0.2, 0.4, 0.6, 1.0]);
+    let source = Arc::new(effectcraft_effects::Buf { img, offset: [0.0; 2], scale: 1.0 });
+    let mut e = crate::context::Enc::new(&g.ctx);
+    let uploaded = e.g.upload_buf(&source).expect("source fits the GPU");
+    let before = g.ctx.transfer_stats();
+    let mut fx = crate::effects::GpuFx::with_cpu_shadow(&mut e, uploaded, source, None);
+    effectcraft_render::FxTarget::cpu(&mut fx, &mut |mut buf| {
+        buf.img.data[0] = [0.1, 0.3, 0.5, 1.0];
+        buf
+    });
+    let after = g.ctx.transfer_stats();
+    assert_eq!(after.readbacks, before.readbacks, "the clean GPU upload was read back");
+    let (result, _, _) = fx.finish().expect("CPU result is uploaded");
+    assert_eq!(e.download(&result).expect("read result").data[0], [0.1, 0.3, 0.5, 1.0]);
 }
 
 /// The layer upload cache drops the textures of freed buffers when it inserts, not only once
