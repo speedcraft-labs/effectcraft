@@ -86,7 +86,15 @@ pub fn warp_q(e: &mut Enc, dst: &GpuImage, src: &GpuImage, m: &Mat3, opts: WarpO
     p.f[3] = [opacity, accumulate.unwrap_or(1.0), levels.unwrap_or(0.0), levels.map_or(0.0, |v| 1.0 / v)];
     p.f[4] = [x0 as f32, y0 as f32, x1 as f32, y1 as f32];
     let mut out = e.scratch(dst.width, dst.height);
-    e.pixels("warp_blend", &p, &img, Some(dst), &out, None);
+    if clear {
+        // Stencil modes clear pixels outside the source footprint too.
+        e.pixels("warp_blend", &p, &img, Some(dst), &out, None);
+    } else {
+        // Other blend modes leave the canvas outside this layer's transformed bounds unchanged.
+        // Copy it with the GPU's texture-copy path, then run the shader only over the layer area.
+        e.copy_image(dst, &out);
+        e.pixels_region("warp_blend", &p, &img, Some(dst), &out, (x0, y0, x1, y1), None);
+    }
     out.levels = levels;
     out
 }

@@ -60,7 +60,7 @@ pub use layers::{Placement, StyledLayer};
 pub(crate) use opts::Collapse3d;
 pub use opts::{LayerTiming, RenderOpts};
 use opts::{MAX_THROUGH, Through};
-pub use pipeline::{Collapsed, MediaOverride, PropertyOverride};
+pub use pipeline::{Collapsed, CompFrameKey, MediaOverride, PropertyOverride};
 
 /// Configure Rayon once for an EffectCraft process. The compositor uses the global pool across
 /// layer rendering, pixel operations and project parsing, so cap it at a moderate size on

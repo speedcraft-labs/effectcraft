@@ -18,7 +18,7 @@ const COMP_FRAME_CACHE_BYTES: usize = 128 * 1024 * 1024;
 const COMP_FRAME_CACHE_SINGLE: usize = 8 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-struct CompFrameKey {
+pub struct CompFrameKey {
     project: usize,
     comp: ItemId,
     time: i64,
@@ -724,9 +724,18 @@ impl<'a> Renderer<'a> {
     }
 
     fn comp_frame_cache_key(&self, comp_id: ItemId, t: Tick) -> Option<CompFrameKey> {
+        self.comp_frame_cache_key_for(comp_id, t, false)
+    }
+
+    /// A static nested comp raster can be reused by the GPU within a top-level frame.
+    pub fn gpu_static_comp_frame_key(&self, comp_id: ItemId, t: Tick) -> Option<CompFrameKey> {
+        self.cache_static_comps.then(|| self.comp_frame_cache_key_for(comp_id, t, true)).flatten()
+    }
+
+    fn comp_frame_cache_key_for(&self, comp_id: ItemId, t: Tick, gpu: bool) -> Option<CompFrameKey> {
         if self.depth == 0
             || self.profile.is_some()
-            || self.active_accel().is_some()
+            || (!gpu && self.active_accel().is_some())
             || self.opts.roi.is_some()
             || self.opts.view.is_some()
             || self.footage.called_off()

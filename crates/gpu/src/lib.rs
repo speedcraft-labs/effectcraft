@@ -89,7 +89,7 @@ mod yuv;
 
 use std::sync::Arc;
 
-pub use context::{GpuContext, GpuImage, TransferStats};
+pub use context::{GpuContext, GpuImage, PipelineBuildStats, StaticPrecompStats, TransferStats};
 use effectcraft_effects::Buf;
 use effectcraft_project::ItemId;
 use effectcraft_raster::Image;
