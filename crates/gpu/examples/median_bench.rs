@@ -97,12 +97,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         revs: Revs { old: Some("EffectCraft CPU median renderer".into()), new: Some("EffectCraft wgpu median renderer".into()) },
         ..Config::default()
     };
-    let report = Paired::new("EffectCraft median render: CPU reference vs wgpu")
+    let mut report = Paired::new("EffectCraft median render: CPU reference vs wgpu")
         .old(cpu)
         .new(|input| render_gpu(&device, input))
         .check(close)
         .inputs(inputs)
         .run(&config)?;
+    report.gpu_adapters.push(adapter);
     let path = std::env::args().nth(1).unwrap_or_else(|| "effectcraft-median-gpu.json".into());
     std::fs::write(&path, report.to_json())?;
     println!("{}", report.to_markdown());
