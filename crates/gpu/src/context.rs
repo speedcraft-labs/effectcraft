@@ -673,28 +673,15 @@ impl Pool {
 }
 
 /// Uniform parameter block shared by every kernel (see `shaders/common.wgsl`).
-#[derive(Clone, Copy, Debug, Default)]
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, bytemuck::Pod, bytemuck::Zeroable)]
 pub(crate) struct Params {
     pub u: [[u32; 4]; 4],
     pub f: [[f32; 4]; 12],
 }
 
-impl Params {
-    fn bytes(&self) -> Vec<u8> {
-        let mut v = Vec::with_capacity(256);
-        for r in &self.u {
-            for x in r {
-                v.extend_from_slice(&x.to_le_bytes());
-            }
-        }
-        for r in &self.f {
-            for x in r {
-                v.extend_from_slice(&x.to_le_bytes());
-            }
-        }
-        v
-    }
-}
+const PARAMS_SIZE: usize = std::mem::size_of::<Params>();
+const UNIFORM_DISPATCHES: usize = 256;
 
 struct Upload {
     buf: Weak<Buf>,
@@ -705,7 +692,7 @@ struct Upload {
 
 #[derive(Default)]
 struct Uploads {
-    map: HashMap<usize, Upload>,
+    map: HashMap<(usize, bool), Upload>,
     bytes: usize,
     clock: u64,
 }
@@ -914,7 +901,7 @@ impl GpuContext {
                     wgpu::BindGroupLayoutEntry {
                         binding: 0,
                         visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
+                        ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: true, min_binding_size: None },
                         count: None,
                     },
                     tex_entry(1),
@@ -1724,6 +1711,40 @@ impl GpuContext {
         Some(g)
     }
 
+    /// Upload an 8-bit layer source as normalized bytes instead of four floats per pixel.
+    /// `quantize` is true when the renderer deliberately deferred its project-depth rounding.
+    fn upload_image_8bit(&self, img: &Image, quantize: bool) -> Option<GpuImage> {
+        if !self.fits(img.width, img.height) {
+            return None;
+        }
+        let mut bytes = Vec::with_capacity(img.data.len() * 4);
+        for px in &img.data {
+            let a = if quantize { ((px[3].clamp(0.0, 1.0) * 255.0 + 0.5) as u32).min(255) as f32 / 255.0 } else { px[3] };
+            for value in [px[0], px[1], px[2], a] {
+                let v = if quantize { value.clamp(0.0, a) } else { value.clamp(0.0, 1.0) };
+                bytes.push((v * 255.0 + 0.5).clamp(0.0, 255.0) as u8);
+            }
+        }
+        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("8-bit layer source"),
+            size: wgpu::Extent3d { width: img.width.max(1), height: img.height.max(1), depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        self.transfers.count(true, bytes.len());
+        self.queue.write_texture(
+            wgpu::TexelCopyTextureInfo { texture: &texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            &bytes,
+            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(img.width * 4), rows_per_image: Some(img.height) },
+            wgpu::Extent3d { width: img.width, height: img.height, depth_or_array_layers: 1 },
+        );
+        Some(GpuImage::new(texture, img.width, img.height))
+    }
+
     /// Entries in the layer upload cache.
     #[cfg(test)]
     pub(crate) fn upload_entries(&self) -> usize {
@@ -1733,7 +1754,17 @@ impl GpuContext {
     /// Upload a (layer cache) buffer, reusing the texture while the same `Arc` is alive: static
     /// layers upload once, not every frame.
     pub(crate) fn upload_buf(&self, buf: &Arc<Buf>) -> Option<GpuImage> {
+        self.upload_buf_format(buf, false, false)
+    }
+
+    /// Upload a project-quantized 8-bit layer source with one byte per channel.
+    pub(crate) fn upload_buf_8bit(&self, buf: &Arc<Buf>, quantize: bool) -> Option<GpuImage> {
+        self.upload_buf_format(buf, true, quantize)
+    }
+
+    fn upload_buf_format(&self, buf: &Arc<Buf>, rgba8: bool, quantize: bool) -> Option<GpuImage> {
         let key = Arc::as_ptr(buf) as usize;
+        let key = (key, rgba8);
         if let Ok(mut u) = self.uploads.lock() {
             u.clock += 1;
             let now = u.clock;
@@ -1744,9 +1775,9 @@ impl GpuContext {
                 return Some(e.img.clone());
             }
         }
-        let img = self.upload_image(&buf.img)?;
+        let img = if rgba8 { self.upload_image_8bit(&buf.img, quantize)? } else { self.upload_image(&buf.img)? };
         if let Ok(mut u) = self.uploads.lock() {
-            let bytes = buf.img.data.len() * 16;
+            let bytes = buf.img.data.len() * if rgba8 { 4 } else { 16 };
             let now = u.clock;
             if let Some(old) = u.map.insert(key, Upload { buf: Arc::downgrade(buf), img: img.clone(), bytes, last_use: now }) {
                 u.bytes -= old.bytes;
@@ -1756,7 +1787,7 @@ impl GpuContext {
             // makes a new one each time, and nothing can hit the old one again), then the least
             // recently used over budget.
             let budget = self.upload_budget();
-            let dead: Vec<usize> = u.map.iter().filter(|(_, e)| e.buf.strong_count() == 0).map(|(k, _)| *k).collect();
+            let dead: Vec<(usize, bool)> = u.map.iter().filter(|(_, e)| e.buf.strong_count() == 0).map(|(k, _)| *k).collect();
             for k in dead {
                 if let Some(e) = u.map.remove(&k) {
                     u.bytes -= e.bytes;
@@ -1820,6 +1851,13 @@ pub(crate) struct Enc<'g> {
     missing: bool,
     /// This `Enc`'s id in the texture pool (textures it may reuse at once).
     owner: u64,
+    /// Dynamic per-dispatch parameters, written once per submitted batch.
+    uniform_buffer: wgpu::Buffer,
+    uniform_stride: usize,
+    uniform_capacity: usize,
+    uniform_data: Vec<u8>,
+    /// Dynamic offset for the next dispatch in `uniform_data`.
+    uniform_offset: u32,
     /// `owner` is lent ([`Enc::lent`]) and outlives this `Enc`.
     lent: bool,
     /// Bounded memo for repeated, contentful static precomps in this frame.
@@ -1851,9 +1889,38 @@ impl Drop for Enc<'_> {
 }
 
 impl<'g> Enc<'g> {
+    fn uniform_ring(g: &GpuContext) -> (wgpu::Buffer, usize, usize, Vec<u8>) {
+        let align = g.device.limits().min_uniform_buffer_offset_alignment as usize;
+        let stride = PARAMS_SIZE.div_ceil(align.max(1)) * align.max(1);
+        let capacity = (stride * UNIFORM_DISPATCHES).min(g.device.limits().max_buffer_size as usize);
+        let buffer = g.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("effectcraft dispatch uniforms"),
+            size: capacity as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        (buffer, stride, capacity, Vec::with_capacity(capacity))
+    }
+
     pub fn new(g: &'g GpuContext) -> Enc<'g> {
         let owner = g.pool.lock().map(|mut p| p.register()).unwrap_or(0);
-        Enc { g, enc: None, last_submit: None, pending: 0, missing: false, owner, lent: false, static_comps: HashMap::new(), static_comp_bytes: 0 }
+        let (uniform_buffer, uniform_stride, uniform_capacity, uniform_data) = Self::uniform_ring(g);
+        Enc {
+            g,
+            enc: None,
+            last_submit: None,
+            pending: 0,
+            missing: false,
+            owner,
+            uniform_buffer,
+            uniform_stride,
+            uniform_capacity,
+            uniform_data,
+            uniform_offset: 0,
+            lent: false,
+            static_comps: HashMap::new(),
+            static_comp_bytes: 0,
+        }
     }
 
     /// An `Enc` for self-contained work (an effect chain): once it is dropped, its working
@@ -1865,7 +1932,23 @@ impl<'g> Enc<'g> {
     /// effect's intermediates stayed allocated until the frame ended.
     pub(crate) fn lent(g: &'g GpuContext) -> Enc<'g> {
         let owner = g.pool.lock().map(|mut p| p.lend()).unwrap_or(0);
-        Enc { g, enc: None, last_submit: None, pending: 0, missing: false, owner, lent: true, static_comps: HashMap::new(), static_comp_bytes: 0 }
+        let (uniform_buffer, uniform_stride, uniform_capacity, uniform_data) = Self::uniform_ring(g);
+        Enc {
+            g,
+            enc: None,
+            last_submit: None,
+            pending: 0,
+            missing: false,
+            owner,
+            uniform_buffer,
+            uniform_stride,
+            uniform_capacity,
+            uniform_data,
+            uniform_offset: 0,
+            lent: true,
+            static_comps: HashMap::new(),
+            static_comp_bytes: 0,
+        }
     }
 
     pub fn static_comp(&mut self, key: &effectcraft_render::CompFrameKey) -> Option<GpuImage> {
@@ -1979,13 +2062,20 @@ impl<'g> Enc<'g> {
         groups: (u32, u32),
         ext: Option<[&wgpu::Buffer; 4]>,
     ) {
+        if self.uniform_offset as usize + self.uniform_stride > self.uniform_capacity {
+            self.submit();
+        }
         let KernelImages { src, aux, out } = images;
         let g = self.g;
         let Some(pipe) = g.pipeline(entry) else {
             self.missing = true;
             return;
         };
-        let ub = g.buffer_init(None, &p.bytes(), wgpu::BufferUsages::UNIFORM);
+        let uniform_offset = self.uniform_offset;
+        self.uniform_data.extend_from_slice(bytemuck::bytes_of(p));
+        let padded = uniform_offset as usize + self.uniform_stride;
+        self.uniform_data.resize(padded, 0);
+        self.uniform_offset += self.uniform_stride as u32;
         let sv = src.texture.create_view(&Default::default());
         let av = aux.map(|a| a.texture.create_view(&Default::default()));
         let ov = out.texture.create_view(&Default::default());
@@ -1993,7 +2083,14 @@ impl<'g> Enc<'g> {
             label: None,
             layout: &g.bgl,
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: ub.as_entire_binding() },
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: &self.uniform_buffer,
+                        offset: 0,
+                        size: std::num::NonZeroU64::new(PARAMS_SIZE as u64),
+                    }),
+                },
                 wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&sv) },
                 wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(av.as_ref().unwrap_or(&g.dummy_tex)) },
                 wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&ov) },
@@ -2017,7 +2114,7 @@ impl<'g> Enc<'g> {
         {
             let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some(entry), timestamp_writes: None });
             pass.set_pipeline(pipe);
-            pass.set_bind_group(0, &bg, &[]);
+            pass.set_bind_group(0, &bg, &[uniform_offset]);
             if let Some(b) = &bg_ext {
                 pass.set_bind_group(1, b, &[]);
             }
@@ -2025,7 +2122,7 @@ impl<'g> Enc<'g> {
         }
         self.pending += 1;
         // Keep command buffers (and the transient textures they hold) bounded.
-        if self.pending >= 256 {
+        if self.pending >= UNIFORM_DISPATCHES || self.uniform_offset as usize >= self.uniform_capacity {
             self.submit();
         }
     }
@@ -2041,10 +2138,22 @@ impl<'g> Enc<'g> {
         if src.width != dst.width || src.height != dst.height {
             return;
         }
+        self.copy_region(src, dst, (0, 0, src.width, src.height));
+    }
+
+    /// Copy a rectangle from one same-size canvas to another.
+    pub fn copy_region(&mut self, src: &GpuImage, dst: &GpuImage, region: (u32, u32, u32, u32)) {
+        if src.width != dst.width || src.height != dst.height {
+            return;
+        }
+        let (x0, y0, x1, y1) = region;
+        if x0 >= x1 || y0 >= y1 || x1 > src.width || y1 > src.height {
+            return;
+        }
         self.record(&[src, dst]).copy_texture_to_texture(
-            wgpu::TexelCopyTextureInfo { texture: &src.texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
-            wgpu::TexelCopyTextureInfo { texture: &dst.texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
-            wgpu::Extent3d { width: src.width, height: src.height, depth_or_array_layers: 1 },
+            wgpu::TexelCopyTextureInfo { texture: &src.texture, mip_level: 0, origin: wgpu::Origin3d { x: x0, y: y0, z: 0 }, aspect: wgpu::TextureAspect::All },
+            wgpu::TexelCopyTextureInfo { texture: &dst.texture, mip_level: 0, origin: wgpu::Origin3d { x: x0, y: y0, z: 0 }, aspect: wgpu::TextureAspect::All },
+            wgpu::Extent3d { width: x1 - x0, height: y1 - y0, depth_or_array_layers: 1 },
         );
     }
 
@@ -2100,7 +2209,12 @@ impl<'g> Enc<'g> {
     /// Submit recorded work.
     pub fn submit(&mut self) {
         if let Some((enc, id)) = self.enc.take() {
+            if !self.uniform_data.is_empty() {
+                self.g.queue.write_buffer(&self.uniform_buffer, 0, &self.uniform_data);
+            }
             self.last_submit = Some(self.g.queue.submit([enc.finish()]));
+            self.uniform_data.clear();
+            self.uniform_offset = 0;
             if let Ok(mut p) = self.g.pool.lock() {
                 p.close(id);
             }
