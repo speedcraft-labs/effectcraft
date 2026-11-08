@@ -14,6 +14,7 @@
 
 use std::sync::{Arc, OnceLock};
 
+use craft_resample::downsample2_floor_rgba;
 use effectcraft_color::{BlendMode, ColorSpace, Label};
 use effectcraft_keyframe::{Keyframe, ShapePath, Value};
 use effectcraft_project::build::{self, Ids};
@@ -885,8 +886,8 @@ fn backend_selection_and_display_frames() {
     }
 }
 
-/// The display texture carries a full mip chain, each level the 2 × 2 mean of the one above, so the
-/// viewer minifies a frame without aliasing (#417).
+/// The display texture carries a full mip chain matching the shared floor-sized RGBA reducer, so
+/// the viewer minifies a frame without aliasing (#417).
 #[test]
 fn display_frames_are_mipmapped() {
     let Some(g) = gpu() else { return };
@@ -897,36 +898,43 @@ fn display_frames_are_mipmapped() {
     assert_eq!(f.texture.mip_level_count(), crate::context::mip_levels(f.width, f.height));
     assert_eq!(f.texture.mip_level_count(), u32::BITS - f.width.max(f.height).leading_zeros());
     let base = g.read_display(&f).expect("readback");
-    // Level 1, copied out to read it back.
-    let (w1, h1) = (f.width / 2, f.height / 2);
-    let tex = g.device().create_texture(&wgpu::TextureDescriptor {
-        label: None,
-        size: wgpu::Extent3d { width: w1, height: h1, depth_or_array_layers: 1 },
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::Rgba8Unorm,
-        usage: wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::COPY_DST,
-        view_formats: &[],
-    });
-    let mut e = crate::context::Enc::new(&g.ctx);
-    e.record(&[]).copy_texture_to_texture(
-        wgpu::TexelCopyTextureInfo { texture: &f.texture, mip_level: 1, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
-        wgpu::TexelCopyTextureInfo { texture: &tex, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
-        wgpu::Extent3d { width: w1, height: h1, depth_or_array_layers: 1 },
-    );
-    let level1 = e.read_texture(&tex, w1, h1, 4).expect("level 1");
-    let at = |x: u32, y: u32, c: usize| base[((y * f.width + x) * 4) as usize + c] as f32;
+    let mut current_pixels = base.as_chunks::<4>().0.iter().map(|px| px.map(f32::from)).collect::<Vec<_>>();
+    let (mut current_width, mut current_height) = (f.width, f.height);
     let mut varied = false;
-    for y in 0..h1 {
-        for x in 0..w1 {
-            for c in 0..4 {
-                let want = (at(2 * x, 2 * y, c) + at(2 * x + 1, 2 * y, c) + at(2 * x, 2 * y + 1, c) + at(2 * x + 1, 2 * y + 1, c)) / 4.0;
-                let got = level1[((y * w1 + x) * 4) as usize + c] as f32;
-                assert!((want - got).abs() <= 1.0, "({x}, {y}) channel {c}: {got} against the mean {want}");
-                varied |= want != at(2 * x, 2 * y, c);
+    for mip_level in 1..f.texture.mip_level_count() {
+        let (expected_w, expected_h, expected) =
+            downsample2_floor_rgba(&current_pixels, current_width as usize, current_height as usize).expect("non-empty source mip");
+        let (width, height) = ((f.width >> mip_level).max(1), (f.height >> mip_level).max(1));
+        assert_eq!((width as usize, height as usize), (expected_w, expected_h));
+        let tex = g.device().create_texture(&wgpu::TextureDescriptor {
+            label: None,
+            size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let mut e = crate::context::Enc::new(&g.ctx);
+        e.record(&[]).copy_texture_to_texture(
+            wgpu::TexelCopyTextureInfo { texture: &f.texture, mip_level, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            wgpu::TexelCopyTextureInfo { texture: &tex, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+        );
+        let actual = e.read_texture(&tex, width, height, 4).expect("read mip level");
+        for y in 0..height {
+            for x in 0..width {
+                for c in 0..4 {
+                    let want = expected[(y as usize) * expected_w + x as usize][c];
+                    let got = actual[((y * width + x) * 4) as usize + c];
+                    assert!((want.round() as i32 - got as i32).abs() <= 1, "({x}, {y}) channel {c}: {got} against the shared mean {want}");
+                    varied |= want != current_pixels[((2 * y).min(current_height - 1) * current_width + (2 * x).min(current_width - 1)) as usize][c];
+                }
             }
         }
+        current_pixels = actual.as_chunks::<4>().0.iter().map(|px| px.map(f32::from)).collect();
+        (current_width, current_height) = (width, height);
     }
     assert!(varied, "the scene has edges to average");
 }
