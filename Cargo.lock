@@ -1160,7 +1160,7 @@ dependencies = [
 [[package]]
 name = "craft-resample"
 version = "0.1.0"
-source = "git+https://github.com/speedcraft-labs/craft-libs?branch=algo%2F161-image-resample#fd21a0a80a8e4f4c183a8e0da0953e1b033b817d"
+source = "git+https://github.com/storytold/craft-libs?rev=fd21a0a80a8e4f4c183a8e0da0953e1b033b817d#fd21a0a80a8e4f4c183a8e0da0953e1b033b817d"
 dependencies = [
  "rayon",
 ]
