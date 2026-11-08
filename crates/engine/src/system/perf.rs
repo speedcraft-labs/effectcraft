@@ -708,7 +708,9 @@ mod tests {
             assert!(p.comp(id).is_some_and(|nested| !nested.layers.is_empty()), "every realistic precomp instance has content");
             *repeated_precomps.entry(id).or_insert(0usize) += 1;
         }
-        assert_eq!(repeated_precomps.values().sum::<usize>(), (spec.main_layers / 10).min(500));
+        // Main also contains the top of the nested-comp chain, in addition to the reusable
+        // graphic precomps.
+        assert_eq!(repeated_precomps.values().sum::<usize>(), usize::from(spec.nest_depth > 0) + (spec.main_layers / 10).min(500));
         assert!(repeated_precomps.values().any(|instances| *instances > 1), "realistic frame should reuse contentful precomps");
         let mut session = Session::default();
         session.replace_project(p, None);
