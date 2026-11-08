@@ -5,8 +5,8 @@ use super::fx_host::{FxHost, essential_overrides};
 use super::opts::{Collapse3d, LayerTiming, MAX_THROUGH, RenderOpts, Through};
 use super::{
     Arc, AutoKey, AutoPick, BlendMode, Buf, Comp, EffectCtx, EffectEnv, EvalCtx, Footage, FootageKind, FrameBlend, FrameRate, GroupKind, Image, ItemId,
-    ItemKind, Layer, LayerCache, LayerSource, Params, Project, Quality, Region, Renderer, Tick, WarpOpts, cache, color, masks, shapes, styles, text, three_d,
-    vec2,
+    ItemKind, Layer, LayerCache, LayerSource, Params, Project, Quality, Region, Renderer, StyledLayer, Tick, WarpOpts, cache, color, masks, shapes, styles,
+    text, three_d, vec2,
 };
 use effectcraft_keyframe::Value;
 use effectcraft_project::{LayerId, Node, PropGroup};
@@ -943,6 +943,62 @@ impl<'a> Renderer<'a> {
             && !layer.blend_mode.is_stencil()
             && self.quality(layer) != Quality::Wireframe
             && !props_have_expression(&layer.props, 0)
+    }
+
+    /// Whether this top-level 2D layer can have its CPU pixels prepared in parallel for a GPU
+    /// compositor. The workers only build ordinary layer buffers; all GPU calls remain on the
+    /// compositor thread.
+    pub fn can_prepare_gpu_layer(&self, layer: &Layer) -> bool {
+        self.depth == 0
+            && self.profile.is_none()
+            && self.opts.roi.is_none()
+            && self.opts.view.is_none()
+            && self.outer.is_none()
+            && self.collapse3d.is_none()
+            && self.inherited.is_none()
+            && !self.through_lost
+            && self.through.iter().all(Option::is_none)
+            && self.can_prepare_layer(layer)
+            && !matches!(layer.source, LayerSource::Comp { .. })
+            && !(layer.switches.effects && layer.effects().is_some_and(|fx| !fx.children.is_empty()))
+    }
+
+    /// Prepare a bounded batch in parallel for an accelerator that still composites each layer
+    /// in stack order. The CPU-only renderer clone keeps worker tasks away from the GPU backend.
+    pub fn prepare_gpu_layer_batch(&self, ctx: &EvalCtx, layers: &[&Layer], occluded: &[bool], width: u32, height: u32) -> Option<Vec<Option<StyledLayer>>> {
+        if layers.len() != occluded.len() || layers.iter().any(|layer| !self.can_prepare_gpu_layer(layer)) {
+            return None;
+        }
+        let mut cpu = self.clone();
+        cpu.accel = None;
+        let mut unquantized = cpu.clone();
+        unquantized.pipe.levels = None;
+        Some(
+            layers
+                .par_iter()
+                .zip(occluded.par_iter())
+                .map(|(&layer, &skip)| {
+                    if skip || cpu.layer_opacity(ctx, layer) <= 0.0 || cpu.layer_outside_canvas(ctx, layer, width, height) {
+                        return None;
+                    }
+                    // With no layer cache, plain layers can upload their masked source directly;
+                    // the GPU quantizes each source texel before sampling, matching the CPU's
+                    // pre-transform quantization while avoiding a full CPU image pass. Preserve
+                    // the regular path whenever cached buffers, styles, motion blur or a blend
+                    // space conversion make that ordering observable elsewhere.
+                    let defer_quantize = self.cache.is_none()
+                        && self.pipe.levels.is_some()
+                        && self.pipe.to_blend().is_none()
+                        && !cpu.mb_on(ctx, layer)
+                        && !styles::active(ctx, layer);
+                    let renderer = if defer_quantize { &unquantized } else { &cpu };
+                    renderer.styled_for_draw(ctx, layer, None).map(|mut st| {
+                        st.quantize_source = defer_quantize;
+                        renderer.styled_to_blend(st)
+                    })
+                })
+                .collect(),
+        )
     }
 
     /// Prepare bounded batches so a 5,000-layer frame never retains thousands of full layer

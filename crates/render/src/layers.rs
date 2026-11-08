@@ -51,7 +51,7 @@ impl<'a> Renderer<'a> {
     pub(crate) fn styled(&self, ctx: &EvalCtx, layer: &Layer, mut timing: Option<&mut LayerTiming>) -> Option<StyledLayer> {
         let (content, ckey) = self.content_buf_timed(ctx, layer, timing.as_deref_mut())?;
         if !styles::active(ctx, layer) {
-            return Some(StyledLayer { passes: vec![], body: content.clone(), content, key: ckey, ckey, plain: true });
+            return Some(StyledLayer { passes: vec![], body: content.clone(), content, key: ckey, ckey, plain: true, quantize_source: false });
         }
         let modes = styles::pass_modes(ctx, layer);
         let key = ckey.map(|k| cache::styles_key(ctx, layer, k));
@@ -60,7 +60,7 @@ impl<'a> Renderer<'a> {
         {
             let passes: Option<Vec<_>> = modes.iter().enumerate().map(|(i, m)| c.get(cache::derive(k, i as u64 + 1)).map(|b| (b, *m))).collect();
             if let Some(passes) = passes {
-                return Some(StyledLayer { passes, body, content, key, ckey, plain: false });
+                return Some(StyledLayer { passes, body, content, key, ckey, plain: false, quantize_source: false });
             }
         }
         let t0 = web_time::Instant::now();
@@ -80,7 +80,7 @@ impl<'a> Renderer<'a> {
                 *b = c.insert(cache::derive(k, i as u64 + 1), b.clone());
             }
         }
-        Some(StyledLayer { passes, body, content, key, ckey, plain: false })
+        Some(StyledLayer { passes, body, content, key, ckey, plain: false, quantize_source: false })
     }
 
     /// The styled layer's buffers in the blending space.
@@ -466,7 +466,7 @@ impl<'a> Renderer<'a> {
     pub(crate) fn styled_for_draw(&self, ctx: &EvalCtx, layer: &Layer, timing: Option<&mut LayerTiming>) -> Option<StyledLayer> {
         if let Some(buf) = self.plain_solid_mip(ctx, layer) {
             let body = Arc::new(buf);
-            return Some(StyledLayer { passes: vec![], body: body.clone(), content: body, key: None, ckey: None, plain: true });
+            return Some(StyledLayer { passes: vec![], body: body.clone(), content: body, key: None, ckey: None, plain: true, quantize_source: false });
         }
         self.styled(ctx, layer, timing)
     }
@@ -521,7 +521,7 @@ impl<'a> Renderer<'a> {
 
     /// Skip bounded 2D layers whose complete draw footprint is covered by later opaque solids.
     /// The input is in bottom-to-top order; coverage is accumulated from top to bottom.
-    pub(crate) fn occluded_bounded_layers(&self, ctx: &EvalCtx, layers: &[&Layer], width: u32, height: u32) -> Vec<bool> {
+    pub fn occluded_bounded_layers(&self, ctx: &EvalCtx, layers: &[&Layer], width: u32, height: u32) -> Vec<bool> {
         let mut culled = vec![false; layers.len()];
         if layers.len() < 64 || width == 0 || height == 0 {
             return culled;
@@ -815,6 +815,15 @@ pub struct StyledLayer {
     ckey: Option<u64>,
     /// No layer styles: composite `body` the usual way.
     pub plain: bool,
+    /// The GPU will quantize these unquantized source pixels before sampling.
+    pub(crate) quantize_source: bool,
+}
+
+impl StyledLayer {
+    /// Whether the accelerator should quantize body texels before filtering and blending them.
+    pub fn quantize_source(&self) -> bool {
+        self.quantize_source
+    }
 }
 
 /// Where a layer buffer lands (see [`Renderer::placement`]).
