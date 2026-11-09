@@ -1752,17 +1752,19 @@ impl GpuContext {
                 bytes.par_chunks_exact_mut(4).zip(img.data.par_iter()).with_min_len(4096).for_each(|(dst, px)| {
                     let alpha = ((px[3].clamp(0.0, 1.0) * 255.0 + 0.5) as u32).min(255) as u8;
                     let a = alpha as f32 / 255.0;
-                    dst[0] = (px[0].clamp(0.0, a) * 255.0 + 0.5).clamp(0.0, 255.0) as u8;
-                    dst[1] = (px[1].clamp(0.0, a) * 255.0 + 0.5).clamp(0.0, 255.0) as u8;
-                    dst[2] = (px[2].clamp(0.0, a) * 255.0 + 0.5).clamp(0.0, 255.0) as u8;
+                    // The input clamp bounds the scaled channel to [0, 255.5], and float-to-u8
+                    // conversion saturates at 255, so a second clamp is unnecessary.
+                    dst[0] = (px[0].clamp(0.0, a) * 255.0 + 0.5) as u8;
+                    dst[1] = (px[1].clamp(0.0, a) * 255.0 + 0.5) as u8;
+                    dst[2] = (px[2].clamp(0.0, a) * 255.0 + 0.5) as u8;
                     dst[3] = alpha;
                 });
             } else {
                 bytes.par_chunks_exact_mut(4).zip(img.data.par_iter()).with_min_len(4096).for_each(|(dst, px)| {
-                    dst[0] = (px[0].clamp(0.0, 1.0) * 255.0 + 0.5).clamp(0.0, 255.0) as u8;
-                    dst[1] = (px[1].clamp(0.0, 1.0) * 255.0 + 0.5).clamp(0.0, 255.0) as u8;
-                    dst[2] = (px[2].clamp(0.0, 1.0) * 255.0 + 0.5).clamp(0.0, 255.0) as u8;
-                    dst[3] = (px[3].clamp(0.0, 1.0) * 255.0 + 0.5).clamp(0.0, 255.0) as u8;
+                    dst[0] = (px[0].clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+                    dst[1] = (px[1].clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+                    dst[2] = (px[2].clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+                    dst[3] = (px[3].clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
                 });
             }
             let texture = self.device.create_texture(&wgpu::TextureDescriptor {
