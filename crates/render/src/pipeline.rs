@@ -4,9 +4,9 @@ use super::frames::{blend_frames, cineon_frame, content_bounds, field_frame, fra
 use super::fx_host::{FxHost, essential_overrides};
 use super::opts::{Collapse3d, LayerTiming, MAX_THROUGH, RenderOpts, Through};
 use super::{
-    Arc, AutoKey, AutoPick, BlendMode, Buf, Comp, EffectCtx, EffectEnv, EvalCtx, Footage, FootageKind, FrameBlend, FrameRate, GroupKind, Image, ItemId,
-    ItemKind, Layer, LayerCache, LayerSource, Params, Project, Quality, Region, Renderer, StyledLayer, Tick, WarpOpts, cache, color, masks, shapes, styles,
-    text, three_d, vec2,
+    Arc, AutoKey, AutoPick, BlendMode, Buf, Comp, EffectCtx, EffectEnv, EvalCtx, Footage, FootageKind, FrameBlend, FrameRate, GpuFootageSourceKey, GroupKind,
+    Image, ItemId, ItemKind, Layer, LayerCache, LayerSource, Params, Project, Quality, Region, Renderer, StyledLayer, Tick, WarpOpts, cache, color, masks,
+    shapes, styles, text, three_d, vec2,
 };
 use effectcraft_keyframe::Value;
 use effectcraft_project::{LayerId, Node, PropGroup};
@@ -17,6 +17,7 @@ use std::sync::{Mutex, OnceLock};
 const COMP_FRAME_CACHE_BYTES: usize = 128 * 1024 * 1024;
 const COMP_FRAME_CACHE_SINGLE: usize = 8 * 1024 * 1024;
 const SHAPE_SOURCE_CACHE_BYTES: usize = 64 * 1024 * 1024;
+const FOOTAGE_BUFFER_CACHE_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Default)]
 struct ShapeSourceCacheInner {
@@ -45,6 +46,42 @@ impl ShapeSourceCache {
             return existing.clone();
         }
         if inner.bytes.saturating_add(bytes) > SHAPE_SOURCE_CACHE_BYTES {
+            inner.entries.clear();
+            inner.bytes = 0;
+        }
+        inner.bytes += bytes;
+        inner.entries.insert(key, buf.clone());
+        buf
+    }
+}
+
+#[derive(Default)]
+struct FootageBufferCacheInner {
+    entries: HashMap<GpuFootageSourceKey, Arc<Buf>>,
+    bytes: usize,
+}
+
+/// Small, renderer-local cache for processed frames of repeated plain footage layers.
+#[derive(Default)]
+pub(crate) struct FootageBufferCache {
+    inner: Mutex<FootageBufferCacheInner>,
+}
+
+impl FootageBufferCache {
+    pub(crate) fn get(&self, key: GpuFootageSourceKey) -> Option<Arc<Buf>> {
+        self.inner.lock().ok()?.entries.get(&key).cloned()
+    }
+
+    pub(crate) fn insert(&self, key: GpuFootageSourceKey, buf: Arc<Buf>) -> Arc<Buf> {
+        let bytes = buf.img.data.len().saturating_mul(std::mem::size_of::<[f32; 4]>());
+        if bytes == 0 || bytes > FOOTAGE_BUFFER_CACHE_BYTES {
+            return buf;
+        }
+        let Ok(mut inner) = self.inner.lock() else { return buf };
+        if let Some(existing) = inner.entries.get(&key) {
+            return existing.clone();
+        }
+        if inner.bytes.saturating_add(bytes) > FOOTAGE_BUFFER_CACHE_BYTES {
             inner.entries.clear();
             inner.bytes = 0;
         }
@@ -460,6 +497,7 @@ impl<'a> Renderer<'a> {
             profile: None,
             comp_frames: Arc::new(CompFrameCache::default()),
             shape_sources: Arc::new(ShapeSourceCache::default()),
+            footage_buffers: Arc::new(FootageBufferCache::default()),
             cache_static_comps: true,
             accel: None,
             depth: 0,
@@ -1664,8 +1702,25 @@ impl<'a> Renderer<'a> {
             };
             return Some((buf, key));
         }
+        let footage_key = self.gpu_footage_source_key(ctx, layer, false);
+        if let Some(footage_key) = footage_key
+            && let Some(buf) = self.footage_buffers.get(footage_key)
+        {
+            if let Some(t) = timing.as_deref_mut() {
+                t.cached = true;
+            }
+            let buf = match (self.cache_to_keep(), key) {
+                (Some(cache), Some(k)) => cache.insert(k, buf),
+                _ => buf,
+            };
+            return Some((buf, key));
+        }
         let buf = self.masked_source(ctx, layer)?;
         let buf = Arc::new(self.apply_effects_timed(ctx, layer, buf, false, usize::MAX, timing.map(|t| &mut t.effects)));
+        let buf = match footage_key {
+            Some(k) => self.footage_buffers.insert(k, buf),
+            None => buf,
+        };
         // The buffer the cache keeps (another worker's, if it kept one first).
         let buf = match (self.cache_to_keep(), key) {
             (Some(c), Some(k)) => c.insert(k, buf),
