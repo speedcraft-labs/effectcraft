@@ -16,6 +16,43 @@ use std::sync::{Mutex, OnceLock};
 
 const COMP_FRAME_CACHE_BYTES: usize = 128 * 1024 * 1024;
 const COMP_FRAME_CACHE_SINGLE: usize = 8 * 1024 * 1024;
+const SHAPE_SOURCE_CACHE_BYTES: usize = 64 * 1024 * 1024;
+
+#[derive(Default)]
+struct ShapeSourceCacheInner {
+    entries: HashMap<u64, Arc<Buf>>,
+    bytes: usize,
+}
+
+/// Small, renderer-local cache of source rasters shared by identical static shape layers.
+#[derive(Default)]
+pub(crate) struct ShapeSourceCache {
+    inner: Mutex<ShapeSourceCacheInner>,
+}
+
+impl ShapeSourceCache {
+    fn get(&self, key: u64) -> Option<Arc<Buf>> {
+        self.inner.lock().ok()?.entries.get(&key).cloned()
+    }
+
+    fn insert(&self, key: u64, buf: Arc<Buf>) -> Arc<Buf> {
+        let bytes = buf.img.data.len().saturating_mul(std::mem::size_of::<[f32; 4]>());
+        if bytes == 0 || bytes > SHAPE_SOURCE_CACHE_BYTES {
+            return buf;
+        }
+        let Ok(mut inner) = self.inner.lock() else { return buf };
+        if let Some(existing) = inner.entries.get(&key) {
+            return existing.clone();
+        }
+        if inner.bytes.saturating_add(bytes) > SHAPE_SOURCE_CACHE_BYTES {
+            inner.entries.clear();
+            inner.bytes = 0;
+        }
+        inner.bytes += bytes;
+        inner.entries.insert(key, buf.clone());
+        buf
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct CompFrameKey {
@@ -422,6 +459,7 @@ impl<'a> Renderer<'a> {
             cache: None,
             profile: None,
             comp_frames: Arc::new(CompFrameCache::default()),
+            shape_sources: Arc::new(ShapeSourceCache::default()),
             cache_static_comps: true,
             accel: None,
             depth: 0,
@@ -1613,6 +1651,19 @@ impl<'a> Renderer<'a> {
             }
             return Some((b, key));
         }
+        let shape_key = self.static_shape_source_key(ctx, layer);
+        if let Some(shape_key) = shape_key
+            && let Some(buf) = self.shape_sources.get(shape_key)
+        {
+            if let Some(t) = timing.as_deref_mut() {
+                t.cached = true;
+            }
+            let buf = match (self.cache_to_keep(), key) {
+                (Some(cache), Some(k)) => cache.insert(k, buf),
+                _ => buf,
+            };
+            return Some((buf, key));
+        }
         let buf = self.masked_source(ctx, layer)?;
         let buf = Arc::new(self.apply_effects_timed(ctx, layer, buf, false, usize::MAX, timing.map(|t| &mut t.effects)));
         // The buffer the cache keeps (another worker's, if it kept one first).
@@ -1620,7 +1671,22 @@ impl<'a> Renderer<'a> {
             (Some(c), Some(k)) => c.insert(k, buf),
             _ => buf,
         };
+        let buf = match shape_key {
+            Some(k) => self.shape_sources.insert(k, buf),
+            None => buf,
+        };
         Some((buf, key))
+    }
+
+    fn static_shape_source_key(&self, ctx: &EvalCtx, layer: &Layer) -> Option<u64> {
+        if !matches!(layer.source, LayerSource::Shape)
+            || layer.masks().is_some_and(|m| !m.children.is_empty())
+            || (layer.switches.effects && layer.effects().is_some_and(|fx| fx.groups().any(|g| g.enabled)))
+            || self.content_times(ctx, layer).is_some()
+        {
+            return None;
+        }
+        cache::static_shape_source_key(ctx, layer, self.raster_scale(ctx, layer), self.opts.scale, self.opts.draft, self.quality(layer), self.pipe.key())
     }
 
     /// A layer's input at the context time: source → masks → its first `effects` effects
