@@ -56,7 +56,7 @@ use fx_host::FxHost;
 use fx_host::MAX_FX_DEPTH;
 pub(crate) use fx_host::comp_scene;
 pub use fx_host::essential_overrides;
-pub use layers::{Placement, StyledLayer};
+pub use layers::{GpuFootageSourceKey, Placement, StyledLayer};
 pub(crate) use opts::Collapse3d;
 pub use opts::{LayerTiming, RenderOpts};
 use opts::{MAX_THROUGH, Through};
