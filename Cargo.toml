@@ -59,7 +59,12 @@ effectcraft-helper-host = { path = "crates/helper-host" }
 # foundation
 thiserror = "2"
 serde = { version = "1", features = ["derive", "rc"] }
+<<<<<<< HEAD
 serde_json = { version = "1", features = ["float_roundtrip"] }
+=======
+serde_json = { version = "1", features = ["float_roundtrip", "raw_value"] }
+simd-json = "0.19"
+>>>>>>> 0fc23907 (perf(project): SIMD parse large opens at 0.71x baseline (#13))
 log = "0.4"
 # All date/time conversion goes through chrono (no hand-rolled calendar code beyond the 400-year range extension; AGENTS.md).
 chrono = { version = "0.4.45", default-features = false, features = ["std"] }
