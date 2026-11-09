@@ -1,5 +1,6 @@
 //! Device, pipelines, textures, uploads and readback.
 
+use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Instant;
@@ -57,6 +58,10 @@ const BASE_WGSL: [&str; 2] = [include_str!("shaders/common.wgsl"), include_str!(
 /// The family whose module also gets the adapter's median implementation
 /// ([`crate::fx_noise::MedianKernel::source`]), chosen when the context is created.
 const MEDIAN_FAMILY: &str = "fx_noise";
+
+thread_local! {
+    static RGBA8_UPLOAD_SCRATCH: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+}
 
 /// Kernel families: each is compiled as a module of its own, `BASE_WGSL` plus its file and the
 /// files it borrows functions from, built the first time one of its kernels is. A pipeline then
@@ -1735,42 +1740,50 @@ impl GpuContext {
         if !self.fits(img.width, img.height) {
             return None;
         }
-        let mut bytes = vec![0; img.data.len() * 4];
-        if quantize {
-            bytes.par_chunks_exact_mut(4).zip(img.data.par_iter()).with_min_len(4096).for_each(|(dst, px)| {
-                let alpha = ((px[3].clamp(0.0, 1.0) * 255.0 + 0.5) as u32).min(255) as u8;
-                let a = alpha as f32 / 255.0;
-                dst[0] = (px[0].clamp(0.0, a) * 255.0 + 0.5).clamp(0.0, 255.0) as u8;
-                dst[1] = (px[1].clamp(0.0, a) * 255.0 + 0.5).clamp(0.0, 255.0) as u8;
-                dst[2] = (px[2].clamp(0.0, a) * 255.0 + 0.5).clamp(0.0, 255.0) as u8;
-                dst[3] = alpha;
+        let byte_len = img.data.len() * 4;
+        // write_texture copies this slice before returning; keep the high-water buffer for the next layer.
+        RGBA8_UPLOAD_SCRATCH.with(|scratch| {
+            let mut storage = scratch.borrow_mut();
+            if storage.len() < byte_len {
+                storage.resize(byte_len, 0);
+            }
+            let bytes = &mut storage[..byte_len];
+            if quantize {
+                bytes.par_chunks_exact_mut(4).zip(img.data.par_iter()).with_min_len(4096).for_each(|(dst, px)| {
+                    let alpha = ((px[3].clamp(0.0, 1.0) * 255.0 + 0.5) as u32).min(255) as u8;
+                    let a = alpha as f32 / 255.0;
+                    dst[0] = (px[0].clamp(0.0, a) * 255.0 + 0.5).clamp(0.0, 255.0) as u8;
+                    dst[1] = (px[1].clamp(0.0, a) * 255.0 + 0.5).clamp(0.0, 255.0) as u8;
+                    dst[2] = (px[2].clamp(0.0, a) * 255.0 + 0.5).clamp(0.0, 255.0) as u8;
+                    dst[3] = alpha;
+                });
+            } else {
+                bytes.par_chunks_exact_mut(4).zip(img.data.par_iter()).with_min_len(4096).for_each(|(dst, px)| {
+                    dst[0] = (px[0].clamp(0.0, 1.0) * 255.0 + 0.5).clamp(0.0, 255.0) as u8;
+                    dst[1] = (px[1].clamp(0.0, 1.0) * 255.0 + 0.5).clamp(0.0, 255.0) as u8;
+                    dst[2] = (px[2].clamp(0.0, 1.0) * 255.0 + 0.5).clamp(0.0, 255.0) as u8;
+                    dst[3] = (px[3].clamp(0.0, 1.0) * 255.0 + 0.5).clamp(0.0, 255.0) as u8;
+                });
+            }
+            let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("8-bit layer source"),
+                size: wgpu::Extent3d { width: img.width.max(1), height: img.height.max(1), depth_or_array_layers: 1 },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
             });
-        } else {
-            bytes.par_chunks_exact_mut(4).zip(img.data.par_iter()).with_min_len(4096).for_each(|(dst, px)| {
-                dst[0] = (px[0].clamp(0.0, 1.0) * 255.0 + 0.5).clamp(0.0, 255.0) as u8;
-                dst[1] = (px[1].clamp(0.0, 1.0) * 255.0 + 0.5).clamp(0.0, 255.0) as u8;
-                dst[2] = (px[2].clamp(0.0, 1.0) * 255.0 + 0.5).clamp(0.0, 255.0) as u8;
-                dst[3] = (px[3].clamp(0.0, 1.0) * 255.0 + 0.5).clamp(0.0, 255.0) as u8;
-            });
-        }
-        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("8-bit layer source"),
-            size: wgpu::Extent3d { width: img.width.max(1), height: img.height.max(1), depth_or_array_layers: 1 },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8Unorm,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
-        self.transfers.count(true, bytes.len());
-        self.queue.write_texture(
-            wgpu::TexelCopyTextureInfo { texture: &texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
-            &bytes,
-            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(img.width * 4), rows_per_image: Some(img.height) },
-            wgpu::Extent3d { width: img.width, height: img.height, depth_or_array_layers: 1 },
-        );
-        Some(GpuImage::new(texture, img.width, img.height))
+            self.transfers.count(true, byte_len);
+            self.queue.write_texture(
+                wgpu::TexelCopyTextureInfo { texture: &texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+                bytes,
+                wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(img.width * 4), rows_per_image: Some(img.height) },
+                wgpu::Extent3d { width: img.width, height: img.height, depth_or_array_layers: 1 },
+            );
+            Some(GpuImage::new(texture, img.width, img.height))
+        })
     }
 
     /// Entries in the layer upload cache.
