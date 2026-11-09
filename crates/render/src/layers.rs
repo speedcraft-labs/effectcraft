@@ -32,7 +32,15 @@ pub struct GpuFootageSourceKey {
     time: Tick,
     scale: u64,
     proxy: bool,
+    static_source: bool,
     quantize_source: bool,
+}
+
+impl GpuFootageSourceKey {
+    /// Whether the source is a still image whose upload can be reused across frames.
+    pub fn is_static(&self) -> bool {
+        self.static_source
+    }
 }
 
 /// A motion-blur shutter: the comp's, or for a collapsed precomp's layers the outermost
@@ -87,6 +95,7 @@ impl<'a> Renderer<'a> {
             time,
             scale: self.opts.scale.to_bits(),
             proxy: proxy.is_some(),
+            static_source: source.kind == super::FootageKind::Still,
             quantize_source,
         })
     }
