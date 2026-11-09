@@ -1511,6 +1511,24 @@ fn upload_cache_drops_textures_of_freed_buffers() {
     assert!(kept <= before + 1, "the upload cache kept {kept} textures of freed buffers (had {before})");
 }
 
+#[test]
+fn rgba8_upload_cache_distinguishes_quantized_sources() {
+    let Some(g) = gpu() else { return };
+    let mut img = Image::new(1, 1);
+    img.data[0] = [0.8, 0.2, 0.1, 0.5];
+    let buf = Arc::new(effectcraft_effects::Buf { img, offset: [0.0; 2], scale: 1.0 });
+    let before = g.ctx.transfer_stats();
+    let _quantized = g.ctx.upload_buf_8bit(&buf, true).expect("quantized source fits the GPU");
+    let once = g.ctx.transfer_stats();
+    let _unquantized = g.ctx.upload_buf_8bit(&buf, false).expect("unquantized source fits the GPU");
+    let twice = g.ctx.transfer_stats();
+    let _cached = g.ctx.upload_buf_8bit(&buf, true).expect("quantized source cache hit");
+    let cached = g.ctx.transfer_stats();
+    assert_eq!(once.uploads - before.uploads, 1, "first quantized upload");
+    assert_eq!(twice.uploads - once.uploads, 1, "unquantized upload must not reuse quantized bytes");
+    assert_eq!(cached.uploads, twice.uploads, "repeated quantized upload should hit its cache entry");
+}
+
 /// The device the compositor owns asks for `MemoryUsage` so freed textures give
 /// their allocator blocks back, while its label and limits stay as they were.
 #[test]

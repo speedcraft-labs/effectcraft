@@ -148,8 +148,10 @@ fn draw_comp<'a>(e: &mut Enc, r: &Renderer<'a>, ctx: &EvalCtx<'a>, canvas: &mut 
     // Quantizing uploaded texels is equivalent to quantizing CPU-rendered sources only when
     // the renderer is already in the blending space. A color-space conversion must keep its
     // full-precision input until after conversion.
-    // Preserve RGBA32Float filtering until compact uploads reproduce the baseline hash exactly.
-    let compact_8bit_sources = false;
+    // Quantized source layers can use compact uploads without changing the frame hash. High-bit
+    // sources still use RGBA32Float. Keep duplicate footage hits in the encoder's format-specific
+    // source cache and avoid staging a redundant float copy first.
+    let compact_8bit_sources = true;
     let mut i = 0;
     while i < visible.len() {
         // A device that ran out of memory (or was lost) on an earlier layer fails every later
@@ -182,7 +184,19 @@ fn draw_comp<'a>(e: &mut Enc, r: &Renderer<'a>, ctx: &EvalCtx<'a>, canvas: &mut 
                             continue;
                         }
                         let key = r.gpu_footage_source_key(ctx, layer, st.quantize_source());
-                        uploaded[offset] = Some(if let Some(key) = key { e.stage_footage_source(key, &st.body)? } else { e.stage_upload_buf(&st.body)? });
+                        uploaded[offset] = Some(if compact_8bit_sources && st.quantize_source() {
+                            if let Some(key) = key {
+                                e.upload_footage_source_8bit(key, &st.body, true)?
+                            } else {
+                                let image = e.g.upload_buf_8bit(&st.body, true)?;
+                                e.uses(&image);
+                                image
+                            }
+                        } else if let Some(key) = key {
+                            e.stage_footage_source(key, &st.body)?
+                        } else {
+                            e.stage_upload_buf(&st.body)?
+                        });
                     }
                     e.flush_staged_uploads();
                     for (offset, st) in prepared.into_iter().enumerate() {
@@ -199,8 +213,16 @@ fn draw_comp<'a>(e: &mut Enc, r: &Renderer<'a>, ctx: &EvalCtx<'a>, canvas: &mut 
                                 if let (Some(color), Some(size)) = (st.solid_color, st.solid_size) {
                                     ping_pong.draw_solid(e, color, size, matrix, opts, levels, quantize_source)
                                 } else {
-                                    let src = if compact_8bit_sources {
-                                        e.g.upload_buf_8bit(&st.body, st.quantize_source())?
+                                    let src = if compact_8bit_sources && st.quantize_source() {
+                                        if let Some(src) = uploaded[offset].take() {
+                                            src
+                                        } else if let Some(key) = r.gpu_footage_source_key(ctx, layer, true) {
+                                            e.upload_footage_source_8bit(key, &st.body, true)?
+                                        } else {
+                                            let image = e.g.upload_buf_8bit(&st.body, true)?;
+                                            e.uses(&image);
+                                            image
+                                        }
                                     } else if let Some(src) = uploaded[offset].take() {
                                         src
                                     } else if let Some(key) = r.gpu_footage_source_key(ctx, layer, st.quantize_source()) {
