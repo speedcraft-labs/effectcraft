@@ -1,6 +1,6 @@
 use super::settings::{Marker, yes};
 use super::{ColorSpace, Deserialize, FrameRate, Serialize, Tick};
-use serde::de::{Error as _, MapAccess, SeqAccess, Visitor};
+use serde::de::{DeserializeSeed, Error as _, MapAccess, SeqAccess, Visitor};
 use serde::{Deserializer, Serializer};
 use std::ops::{Deref, DerefMut};
 use std::sync::{Arc, OnceLock};
@@ -153,6 +153,93 @@ impl<'de> Deserialize<'de> for SequenceString {
     }
 }
 
+struct SequencePathSeed<'a> {
+    raw: &'a mut String,
+    first: &'a mut bool,
+    plain_absolute_local: &'a mut bool,
+}
+
+impl<'de> DeserializeSeed<'de> for SequencePathSeed<'_> {
+    type Value = ();
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct PathVisitor<'a>(SequencePathSeed<'a>);
+
+        impl PathVisitor<'_> {
+            fn append(self, path: &str) {
+                if !*self.0.first {
+                    self.0.raw.push(',');
+                }
+                *self.0.first = false;
+                *self.0.plain_absolute_local &= plain_absolute_local(path);
+                append_json_string(self.0.raw, path);
+            }
+        }
+
+        impl Visitor<'_> for PathVisitor<'_> {
+            type Value = ();
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a sequence path string")
+            }
+
+            fn visit_str<E>(self, path: &str) -> Result<Self::Value, E> {
+                self.append(path);
+                Ok(())
+            }
+
+            fn visit_borrowed_str<E>(self, path: &str) -> Result<Self::Value, E> {
+                self.append(path);
+                Ok(())
+            }
+
+            fn visit_string<E>(self, path: String) -> Result<Self::Value, E> {
+                self.append(&path);
+                Ok(())
+            }
+        }
+
+        deserializer.deserialize_str(PathVisitor(self))
+    }
+}
+
+fn append_json_string(output: &mut String, value: &str) {
+    use std::fmt::Write as _;
+
+    output.push('"');
+    for ch in value.chars() {
+        match ch {
+            '"' => output.push_str("\\\""),
+            '\\' => output.push_str("\\\\"),
+            '\u{08}' => output.push_str("\\b"),
+            '\u{0c}' => output.push_str("\\f"),
+            '\n' => output.push_str("\\n"),
+            '\r' => output.push_str("\\r"),
+            '\t' => output.push_str("\\t"),
+            ch if ch <= '\u{1f}' => {
+                let _ = write!(output, "\\u{:04x}", ch as u32);
+            }
+            ch => output.push(ch),
+        }
+    }
+    output.push('"');
+}
+
+fn sequence_files_from_seq<'de, A>(mut seq: A) -> Result<SequenceFiles, A::Error>
+where
+    A: SeqAccess<'de>,
+{
+    let mut raw = String::from("[");
+    let mut first = true;
+    let mut plain_absolute_local = true;
+    while seq.next_element_seed(SequencePathSeed { raw: &mut raw, first: &mut first, plain_absolute_local: &mut plain_absolute_local })?.is_some() {}
+    raw.push(']');
+    Ok(SequenceFiles { raw: Some(Arc::from(raw)), parsed: OnceLock::new(), plain_absolute_local: OnceLock::from(plain_absolute_local) })
+}
+
 impl<'de> Deserialize<'de> for SequenceFiles {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -173,18 +260,14 @@ impl<'de> Deserialize<'de> for SequenceFiles {
             where
                 D: Deserializer<'de>,
             {
-                Vec::<String>::deserialize(deserializer).map(SequenceFiles::from)
+                deserializer.deserialize_seq(FilesVisitor)
             }
 
-            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+            fn visit_seq<A>(self, seq: A) -> Result<Self::Value, A::Error>
             where
                 A: SeqAccess<'de>,
             {
-                let mut paths = Vec::with_capacity(seq.size_hint().unwrap_or(0));
-                while let Some(path) = seq.next_element()? {
-                    paths.push(path);
-                }
-                Ok(SequenceFiles::from(paths))
+                sequence_files_from_seq(seq)
             }
 
             fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>

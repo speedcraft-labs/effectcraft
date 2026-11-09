@@ -48,7 +48,7 @@ pub(crate) fn open(s: &mut Session, p: &Value) -> Result<Value> {
     let profile_open = false;
     let started = web_time::Instant::now();
     let mut stage = started;
-    let bytes = s.services.read_file(path).map_err(|e| EngineError::Other(format!("cannot read {path}: {e}")))?;
+    let mut bytes = s.services.read_file(path).map_err(|e| EngineError::Other(format!("cannot read {path}: {e}")))?;
     let bytes_len = bytes.len();
     let read_ms = stage.elapsed().as_secs_f64() * 1e3;
     stage = web_time::Instant::now();
@@ -56,10 +56,10 @@ pub(crate) fn open(s: &mut Session, p: &Value) -> Result<Value> {
     // serde parses it directly without first allocating and validating a second full-size String.
     let (mut proj, repaired, view, saved_by) = if is_xml_bytes(&bytes) {
         let text = String::from_utf8(bytes).map_err(|_| EngineError::Other("not a text project file".into()))?;
-        let json = crate::xml_project::from_xml(&text).map_err(EngineError::Other)?;
-        Project::from_file_json_repaired(json.as_bytes())
+        let mut json = crate::xml_project::from_xml(&text).map_err(EngineError::Other)?.into_bytes();
+        Project::from_file_json_repaired_in_place(&mut json)
     } else {
-        Project::from_file_json_repaired(&bytes)
+        Project::from_file_json_repaired_in_place(&mut bytes)
     }
     .map_err(|e| EngineError::Other(format!("{path} is not a project EffectCraft can open: {e}")))?;
     let parse_ms = stage.elapsed().as_secs_f64() * 1e3;

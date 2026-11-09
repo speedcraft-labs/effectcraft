@@ -520,6 +520,14 @@ impl Project {
     /// `savedBy` and the saved view next to the project fields, so parsing them separately would
     /// rescan a large file for each small metadata object.
     pub fn from_file_json_repaired(bytes: &[u8]) -> Result<(Project, Vec<String>, SavedView, Option<String>), ProjectError> {
+        let mut owned = bytes.to_vec();
+        Self::from_file_json_repaired_in_place(&mut owned)
+    }
+
+    /// [`Project::from_file_json_repaired`] using a mutable input buffer. Native builds parse in
+    /// place with simd-json; callers that already own the file bytes can avoid a second 125 MB
+    /// allocation and copy. The buffer is scratch space and may be modified.
+    pub fn from_file_json_repaired_in_place(bytes: &mut [u8]) -> Result<(Project, Vec<String>, SavedView, Option<String>), ProjectError> {
         #[cfg(not(target_arch = "wasm32"))]
         let profile_open = std::env::var_os("EFFECTCRAFT_PROFILE_OPEN").is_some();
         #[cfg(target_arch = "wasm32")]
@@ -548,6 +556,9 @@ impl Project {
             comp_times: Option<serde_json::Value>,
         }
 
+        #[cfg(not(target_arch = "wasm32"))]
+        let parsed = simd_json::serde::from_slice::<ProjectFile>(bytes);
+        #[cfg(target_arch = "wasm32")]
         let parsed = serde_json::from_slice::<ProjectFile>(bytes);
         let file = parsed.map_err(|e| ProjectError::Invalid(e.to_string()))?;
         #[cfg(not(target_arch = "wasm32"))]
