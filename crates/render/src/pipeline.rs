@@ -5,8 +5,8 @@ use super::fx_host::{FxHost, essential_overrides};
 use super::opts::{Collapse3d, LayerTiming, MAX_THROUGH, RenderOpts, Through};
 use super::{
     Arc, AutoKey, AutoPick, BlendMode, Buf, Comp, EffectCtx, EffectEnv, EvalCtx, Footage, FootageKind, FrameBlend, FrameRate, GroupKind, Image, ItemId,
-    ItemKind, Layer, LayerCache, LayerSource, Params, Project, Quality, Region, Renderer, Tick, WarpOpts, cache, color, masks, shapes, styles, text, three_d,
-    vec2,
+    ItemKind, Layer, LayerCache, LayerSource, Params, Project, Quality, Region, Renderer, StyledLayer, Tick, WarpOpts, cache, color, masks, shapes, styles,
+    text, three_d, vec2,
 };
 use effectcraft_keyframe::Value;
 use effectcraft_project::{LayerId, Node, PropGroup};
@@ -18,7 +18,7 @@ const COMP_FRAME_CACHE_BYTES: usize = 128 * 1024 * 1024;
 const COMP_FRAME_CACHE_SINGLE: usize = 8 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-struct CompFrameKey {
+pub struct CompFrameKey {
     project: usize,
     comp: ItemId,
     time: i64,
@@ -724,9 +724,18 @@ impl<'a> Renderer<'a> {
     }
 
     fn comp_frame_cache_key(&self, comp_id: ItemId, t: Tick) -> Option<CompFrameKey> {
+        self.comp_frame_cache_key_for(comp_id, t, false)
+    }
+
+    /// A static nested comp raster can be reused by the GPU within a top-level frame.
+    pub fn gpu_static_comp_frame_key(&self, comp_id: ItemId, t: Tick) -> Option<CompFrameKey> {
+        self.cache_static_comps.then(|| self.comp_frame_cache_key_for(comp_id, t, true)).flatten()
+    }
+
+    fn comp_frame_cache_key_for(&self, comp_id: ItemId, t: Tick, gpu: bool) -> Option<CompFrameKey> {
         if self.depth == 0
             || self.profile.is_some()
-            || self.active_accel().is_some()
+            || (!gpu && self.active_accel().is_some())
             || self.opts.roi.is_some()
             || self.opts.view.is_some()
             || self.footage.called_off()
@@ -934,6 +943,62 @@ impl<'a> Renderer<'a> {
             && !layer.blend_mode.is_stencil()
             && self.quality(layer) != Quality::Wireframe
             && !props_have_expression(&layer.props, 0)
+    }
+
+    /// Whether this top-level 2D layer can have its CPU pixels prepared in parallel for a GPU
+    /// compositor. The workers only build ordinary layer buffers; all GPU calls remain on the
+    /// compositor thread.
+    pub fn can_prepare_gpu_layer(&self, layer: &Layer) -> bool {
+        self.depth == 0
+            && self.profile.is_none()
+            && self.opts.roi.is_none()
+            && self.opts.view.is_none()
+            && self.outer.is_none()
+            && self.collapse3d.is_none()
+            && self.inherited.is_none()
+            && !self.through_lost
+            && self.through.iter().all(Option::is_none)
+            && self.can_prepare_layer(layer)
+            && !matches!(layer.source, LayerSource::Comp { .. })
+            && !(layer.switches.effects && layer.effects().is_some_and(|fx| !fx.children.is_empty()))
+    }
+
+    /// Prepare a bounded batch in parallel for an accelerator that still composites each layer
+    /// in stack order. The CPU-only renderer clone keeps worker tasks away from the GPU backend.
+    pub fn prepare_gpu_layer_batch(&self, ctx: &EvalCtx, layers: &[&Layer], occluded: &[bool], width: u32, height: u32) -> Option<Vec<Option<StyledLayer>>> {
+        if layers.len() != occluded.len() || layers.iter().any(|layer| !self.can_prepare_gpu_layer(layer)) {
+            return None;
+        }
+        let mut cpu = self.clone();
+        cpu.accel = None;
+        let mut unquantized = cpu.clone();
+        unquantized.pipe.levels = None;
+        Some(
+            layers
+                .par_iter()
+                .zip(occluded.par_iter())
+                .map(|(&layer, &skip)| {
+                    if skip || cpu.layer_opacity(ctx, layer) <= 0.0 || cpu.layer_outside_canvas(ctx, layer, width, height) {
+                        return None;
+                    }
+                    // With no layer cache, plain layers can upload their masked source directly;
+                    // the GPU quantizes each source texel before sampling, matching the CPU's
+                    // pre-transform quantization while avoiding a full CPU image pass. Preserve
+                    // the regular path whenever cached buffers, styles, motion blur or a blend
+                    // space conversion make that ordering observable elsewhere.
+                    let defer_quantize = self.cache.is_none()
+                        && self.pipe.levels.is_some()
+                        && self.pipe.to_blend().is_none()
+                        && !cpu.mb_on(ctx, layer)
+                        && !styles::active(ctx, layer);
+                    let renderer = if defer_quantize { &unquantized } else { &cpu };
+                    renderer.styled_for_gpu_draw(ctx, layer).map(|mut st| {
+                        st.quantize_source = defer_quantize;
+                        renderer.styled_to_blend(st)
+                    })
+                })
+                .collect(),
+        )
     }
 
     /// Prepare bounded batches so a 5,000-layer frame never retains thousands of full layer
@@ -1410,6 +1475,20 @@ impl<'a> Renderer<'a> {
     /// the full-resolution solid, then box-filters it for minification; every level of that box
     /// filter is the same uniform pixel, so these allocations and copies are redundant.
     pub(crate) fn plain_solid_mip(&self, ctx: &EvalCtx, layer: &Layer) -> Option<Buf> {
+        let (width, height, scale, color) = self.plain_solid_mip_data(ctx, layer)?;
+        Some(Buf { img: Image::filled(width, height, color), offset: [0.0; 2], scale })
+    }
+
+    /// The compact upload-free representation used by the GPU batch path.
+    pub(crate) fn plain_solid_gpu_mip(&self, ctx: &EvalCtx, layer: &Layer) -> Option<(Buf, [f32; 4], (u32, u32))> {
+        let (width, height, scale, color) = self.plain_solid_mip_data(ctx, layer)?;
+        // Placement only needs the buffer's scale and offset. Keep a valid 1×1 image here;
+        // the GPU shader uses `solid_color` and the separately retained logical dimensions.
+        let buf = Buf { img: Image::filled(1, 1, color), offset: [0.0; 2], scale };
+        Some((buf, color, (width, height)))
+    }
+
+    fn plain_solid_mip_data(&self, ctx: &EvalCtx, layer: &Layer) -> Option<(u32, u32, f64, [f32; 4])> {
         if self.accel.is_some()
             || layer.is_3d()
             || layer.switches.adjustment
@@ -1433,7 +1512,7 @@ impl<'a> Renderer<'a> {
             color = conv.apply(color);
         }
         let px = self.pipe.quantize_px([color[0], color[1], color[2], 1.0]);
-        Some(Buf { img: Image::filled(width, height, px), offset: [0.0; 2], scale: scale * factor })
+        Some((width, height, scale * factor, px))
     }
 
     /// Fully processed layer buffer (source → masks → effects → layer styles, flattened).
