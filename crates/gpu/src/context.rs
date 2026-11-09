@@ -1736,13 +1736,23 @@ impl GpuContext {
             return None;
         }
         let mut bytes = vec![0; img.data.len() * 4];
-        bytes.par_chunks_exact_mut(4).zip(img.data.par_iter()).with_min_len(4096).for_each(|(dst, px)| {
-            let a = if quantize { ((px[3].clamp(0.0, 1.0) * 255.0 + 0.5) as u32).min(255) as f32 / 255.0 } else { px[3] };
-            for (dst, value) in dst.iter_mut().zip([px[0], px[1], px[2], a]) {
-                let v = if quantize { value.clamp(0.0, a) } else { value.clamp(0.0, 1.0) };
-                *dst = (v * 255.0 + 0.5).clamp(0.0, 255.0) as u8;
-            }
-        });
+        if quantize {
+            bytes.par_chunks_exact_mut(4).zip(img.data.par_iter()).with_min_len(4096).for_each(|(dst, px)| {
+                let alpha = ((px[3].clamp(0.0, 1.0) * 255.0 + 0.5) as u32).min(255) as u8;
+                let a = alpha as f32 / 255.0;
+                dst[0] = (px[0].clamp(0.0, a) * 255.0 + 0.5).clamp(0.0, 255.0) as u8;
+                dst[1] = (px[1].clamp(0.0, a) * 255.0 + 0.5).clamp(0.0, 255.0) as u8;
+                dst[2] = (px[2].clamp(0.0, a) * 255.0 + 0.5).clamp(0.0, 255.0) as u8;
+                dst[3] = alpha;
+            });
+        } else {
+            bytes.par_chunks_exact_mut(4).zip(img.data.par_iter()).with_min_len(4096).for_each(|(dst, px)| {
+                dst[0] = (px[0].clamp(0.0, 1.0) * 255.0 + 0.5).clamp(0.0, 255.0) as u8;
+                dst[1] = (px[1].clamp(0.0, 1.0) * 255.0 + 0.5).clamp(0.0, 255.0) as u8;
+                dst[2] = (px[2].clamp(0.0, 1.0) * 255.0 + 0.5).clamp(0.0, 255.0) as u8;
+                dst[3] = (px[3].clamp(0.0, 1.0) * 255.0 + 0.5).clamp(0.0, 255.0) as u8;
+            });
+        }
         let texture = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("8-bit layer source"),
             size: wgpu::Extent3d { width: img.width.max(1), height: img.height.max(1), depth_or_array_layers: 1 },
