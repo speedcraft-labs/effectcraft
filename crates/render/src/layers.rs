@@ -43,6 +43,45 @@ impl GpuFootageSourceKey {
     }
 }
 
+#[cfg(test)]
+mod footage_buffer_cache_tests {
+    use super::GpuFootageSourceKey;
+    use crate::pipeline::FootageBufferCache;
+    use crate::{Buf, Image};
+    use effectcraft_project::ItemId;
+    use effectcraft_time::Tick;
+    use std::sync::Arc;
+
+    fn key(item: u64) -> GpuFootageSourceKey {
+        GpuFootageSourceKey {
+            project: 1,
+            item: ItemId(item),
+            time: Tick::ZERO,
+            scale: 1.0f64.to_bits(),
+            proxy: false,
+            static_source: true,
+            quantize_source: false,
+        }
+    }
+
+    #[test]
+    fn processed_footage_buffers_are_shared_by_source_identity() {
+        let cache = FootageBufferCache::default();
+        let first = Arc::new(Buf { img: Image::filled(2, 2, [0.2, 0.4, 0.6, 1.0]), offset: [0.0; 2], scale: 1.0 });
+        assert!(Arc::ptr_eq(&cache.insert(key(7), first.clone()), &first));
+        assert!(Arc::ptr_eq(&cache.get(key(7)).unwrap(), &first));
+        assert!(cache.get(key(8)).is_none());
+    }
+
+    #[test]
+    fn oversized_footage_frames_are_not_retained() {
+        let cache = FootageBufferCache::default();
+        let buf = Arc::new(Buf { img: Image::filled(2049, 2049, [0.0; 4]), offset: [0.0; 2], scale: 1.0 });
+        assert!(Arc::ptr_eq(&cache.insert(key(7), buf.clone()), &buf));
+        assert!(cache.get(key(7)).is_none());
+    }
+}
+
 /// A motion-blur shutter: the comp's, or for a collapsed precomp's layers the outermost
 /// containing comp's (they are drawn into its frames).
 #[derive(Clone, Copy)]
