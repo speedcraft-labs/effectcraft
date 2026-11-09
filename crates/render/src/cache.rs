@@ -22,7 +22,7 @@ use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex};
 
 use effectcraft_effects::Buf;
-use effectcraft_project::{FootageKind, ItemKind, Layer, LayerSource, Node, PropGroup};
+use effectcraft_project::{FootageKind, ItemKind, Layer, LayerSource, Node, PropGroup, Quality};
 
 use crate::eval::EvalCtx;
 
@@ -432,6 +432,51 @@ fn hash_debug(h: &mut KeyHasher, v: &impl std::fmt::Debug) {
     use std::fmt::Write;
     let _ = write!(h, "{v:?}");
     Hasher::write_u8(h, 0xff);
+}
+
+/// Key for a static shape's source raster, independent of layer transform and opacity.
+/// `None` for any animated property, which could change the source between frames.
+pub(crate) fn static_shape_source_key(ctx: &EvalCtx, layer: &Layer, scale: f64, output_scale: f64, draft: bool, quality: Quality, pipe: u64) -> Option<u64> {
+    if time_dependent(layer, false) {
+        return None;
+    }
+    fn visit(ctx: &EvalCtx, layer: &Layer, group: &PropGroup, h: &mut KeyHasher) -> bool {
+        group.match_id.hash(h);
+        group.enabled.hash(h);
+        hash_debug(h, &group.kind);
+        for node in &group.children {
+            match node {
+                Node::Prop(prop) => {
+                    if !prop.keys.is_empty() || prop.has_expression() {
+                        return false;
+                    }
+                    prop.match_id.hash(h);
+                    hash_debug(h, &ctx.value(layer, prop));
+                }
+                Node::Group(sub) => {
+                    if !visit(ctx, layer, sub, h) {
+                        return false;
+                    }
+                }
+            }
+        }
+        true
+    }
+
+    let group = layer.props.sub("contents")?;
+    let mut h = KeyHasher(0xcbf2_9ce4_8422_2325);
+    if !visit(ctx, layer, group, &mut h) {
+        return None;
+    }
+    (ctx.project as *const _ as usize).hash(&mut h);
+    ctx.comp.width.hash(&mut h);
+    ctx.comp.height.hash(&mut h);
+    scale.to_bits().hash(&mut h);
+    output_scale.to_bits().hash(&mut h);
+    draft.hash(&mut h);
+    hash_debug(&mut h, &quality);
+    pipe.hash(&mut h);
+    Some(h.finish())
 }
 
 /// Time-based layer content: does any part of the source/effects read the clock directly
