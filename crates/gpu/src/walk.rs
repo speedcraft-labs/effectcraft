@@ -170,6 +170,21 @@ fn draw_comp<'a>(e: &mut Enc, r: &Renderer<'a>, ctx: &EvalCtx<'a>, canvas: &mut 
                 for start in (i..end).step_by(BATCH) {
                     let stop = (start + BATCH).min(end);
                     let prepared = r.prepare_gpu_layer_batch(ctx, &visible[start..stop], &occluded[start..stop], canvas.width, canvas.height)?;
+                    let mut uploaded = vec![None; prepared.len()];
+                    for (offset, st) in prepared.iter().enumerate() {
+                        let Some(st) = st.as_ref() else { continue };
+                        let layer = visible[start + offset];
+                        if !st.plain || r.layer_opacity(ctx, layer) <= 0.0 || st.solid_color.is_some() {
+                            continue;
+                        }
+                        let placement = r.placement(ctx, layer, &st.body);
+                        if !matches!(placement.matrices.as_slice(), [_]) {
+                            continue;
+                        }
+                        let key = r.gpu_footage_source_key(ctx, layer, st.quantize_source());
+                        uploaded[offset] = Some(if let Some(key) = key { e.stage_footage_source(key, &st.body)? } else { e.stage_upload_buf(&st.body)? });
+                    }
+                    e.flush_staged_uploads();
                     for (offset, st) in prepared.into_iter().enumerate() {
                         e.g.check_health().ok()?;
                         let Some(st) = st else { continue };
@@ -186,6 +201,8 @@ fn draw_comp<'a>(e: &mut Enc, r: &Renderer<'a>, ctx: &EvalCtx<'a>, canvas: &mut 
                                 } else {
                                     let src = if compact_8bit_sources {
                                         e.g.upload_buf_8bit(&st.body, st.quantize_source())?
+                                    } else if let Some(src) = uploaded[offset].take() {
+                                        src
                                     } else if let Some(key) = r.gpu_footage_source_key(ctx, layer, st.quantize_source()) {
                                         e.upload_footage_source(key, &st.body)?
                                     } else {
