@@ -33,6 +33,7 @@ const EFFECT_ENTRIES: &[&str] = &[
     "box_h",
     "box_v",
     "gaussian_sample",
+    "gaussian_sample_exact",
     "gaussian_forward",
     "gaussian_backward",
     "directional",

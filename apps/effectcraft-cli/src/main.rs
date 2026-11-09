@@ -23,8 +23,9 @@
 //! effectcraft-cli render --template T.ectemplate [--values V.json] --out FILE
 //! effectcraft-cli render-frame --template T.ectemplate [--values V.json] [--time S] [--out F.png]
 //! effectcraft-cli render F.ecproj --queue                    render the project's Render Queue
-//! effectcraft-cli bench [--comp C] [--time S] [--scale K] [--n N] [--play N] [--gpu [--adv3d]]   render timings
+//! effectcraft-cli bench [--comp C] [--time S] [--scale K] [--n N] [--play N] [--gpu [--adv3d] [--gpu-only]]   render timings
 //!     (--gpu: CPU vs GPU ms/frame for every comp at Full and Half)
+//!     (--gpu-only: one cold GPU frame for perf profiling)
 //! effectcraft-cli bench --ops [--small] [--layers N] [--comps N] [--footage N] [--realistic]   everyday-operation timings
 //!     on a large generated project (open, save, auto-save, undo/redo, timeline, Project panel)
 //! effectcraft-cli bench --roto [--frames N] [--sam2 model.safetensors] [--mobilesam mobile_sam.pt] [--fixes] [--clip FRAMES --truth MASKS] [--json]   Roto Brush trackers on synthetic clips with known mattes
@@ -121,9 +122,10 @@ const USAGE: &str = "usage: effectcraft-cli <info|commands|exec|run|props|get|se
                                            --progress: progress lines on stderr when it is not a terminal
                                            (progress <frames done> <total> <seconds elapsed> <seconds left|->)
   render/render-frame --template T.ectemplate [--values V.json]   render one template instance
-  bench [--comp C] [--time S] [--scale K] [--n N] [--play N] [--gpu [--adv3d]]   per-layer/effect render timings;
+  bench [--comp C] [--time S] [--scale K] [--n N] [--play N] [--gpu [--adv3d] [--gpu-only]]   per-layer/effect render timings;
                                            --play N renders N consecutive frames with/without the layer cache;
-                                           --gpu compares CPU and GPU ms/frame for every comp at Full and Half
+                                           --gpu compares CPU and GPU ms/frame for every comp at Full and Half;
+                                           --gpu-only renders one GPU frame for perf profiling
   bench --ops [--small] [--layers N] [--comps N] [--footage N] [--realistic]
                                            everyday operations on a large generated project: startup, open,
                                            save, auto-save, edits + undo/redo, timeline, Project panel
@@ -204,6 +206,7 @@ const FLAGS: &[&str] = &[
     "--demo",
     "--empty",
     "--gpu",
+    "--gpu-only",
     "--list",
     "--schemas",
     "--enabled",
@@ -1492,6 +1495,52 @@ fn bench_gpu(s: &Session, args: &Args) -> Result<(), Failure> {
     let project = &project;
     note!("GPU: {} — median of {n} runs (ms/frame)", effectcraft_render::Accelerator::name(&gpu));
     note!("GPU init (adapter + eager pipelines): {gpu_init_ms:.2} ms");
+    if args.flag("--gpu-only") {
+        let Some(cid) = comps.first().copied() else { return Ok(()) };
+        let Some(comp) = project.comp(cid) else { return Ok(()) };
+        let t = Tick::from_seconds_f64(args.num("--time")?.unwrap_or(3.0).min(comp.duration.seconds() * 0.5));
+        let scale = args.num("--scale")?.unwrap_or(1.0);
+        let mut r = Renderer::new(project, s.footage.as_ref(), RenderOpts { scale, backend: Backend::Gpu, ..Default::default() });
+        r.expr = s.expr.as_deref();
+        r.accel = Some(&gpu);
+        let transfers = gpu.context().transfer_stats();
+        let pipelines = gpu.context().pipeline_build_stats();
+        let precomps = gpu.context().static_precomp_stats();
+        let pool = gpu.context().pool_stats();
+        let start = std::time::Instant::now();
+        let frame = r.comp_frame(cid, t);
+        let first_frame_ms = start.elapsed().as_secs_f64() * 1000.0;
+        gpu.wait();
+        let pixel_hash = frame
+            .data
+            .iter()
+            .flatten()
+            .flat_map(|channel| channel.to_bits().to_le_bytes())
+            .fold(0xcbf29ce484222325, |hash, byte| (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3));
+        let transfers_after = gpu.context().transfer_stats();
+        let pipelines_after = gpu.context().pipeline_build_stats();
+        let precomps_after = gpu.context().static_precomp_stats();
+        let pool_after = gpu.context().pool_stats();
+        note!("GPU-only first frame: {}x{} {first_frame_ms:.2} ms, hash {pixel_hash:016x}", frame.width, frame.height);
+        note!(
+            "  shader modules {} ({:.2} ms), lazy pipelines {} ({:.2} ms), pipeline cache {}/{} hits; static precomps {}/{} hits/misses; uploads {} ({:.1} MB), readbacks {} ({:.1} MB), texture pool {}/{} hits/misses",
+            pipelines_after.shader_modules - pipelines.shader_modules,
+            (pipelines_after.shader_module_ns - pipelines.shader_module_ns) as f64 / 1.0e6,
+            pipelines_after.pipelines - pipelines.pipelines,
+            (pipelines_after.pipeline_ns - pipelines.pipeline_ns) as f64 / 1.0e6,
+            pipelines_after.cache_hits - pipelines.cache_hits,
+            pipelines_after.requests - pipelines.requests,
+            precomps_after.hits - precomps.hits,
+            precomps_after.misses - precomps.misses,
+            transfers_after.uploads - transfers.uploads,
+            (transfers_after.upload_bytes - transfers.upload_bytes) as f64 / (1u64 << 20) as f64,
+            transfers_after.readbacks - transfers.readbacks,
+            (transfers_after.readback_bytes - transfers.readback_bytes) as f64 / (1u64 << 20) as f64,
+            pool_after.0 - pool.0,
+            pool_after.1 - pool.1,
+        );
+        return Ok(());
+    }
     note!(
         "{:<28} {:>5} {:>10} {:>9} {:>9} {:>9} {:>9} {:>9} {:>8} {:>9} {:>9} {:>11}",
         "comp",
