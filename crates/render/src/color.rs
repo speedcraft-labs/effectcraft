@@ -228,9 +228,9 @@ fn quantize_rect(img: &mut Image, r: PxRect, levels: f32) {
     let (x0, x1) = (r.x0 as usize, r.x1 as usize);
     let rows = (r.y1 - r.y0) as usize;
     let quantize_row = |row: &mut [[f32; 4]]| {
-        // Runs of all-zero pixels (+0.0 in every channel) quantise to themselves: skip them a
-        // cache line at a time (sparse shape, precomp and glow buffers are mostly empty).
-        let (blocks, rest) = row[x0..x1].as_chunks_mut::<4>();
+        // Runs of all-zero pixels (+0.0 in every channel) quantise to themselves: skip them in
+        // blocks (sparse shape, precomp and glow buffers are mostly empty).
+        let (blocks, rest) = row[x0..x1].as_chunks_mut::<16>();
         for b in blocks {
             if b.as_flattened().iter().fold(0, |a, v| a | v.to_bits()) != 0 {
                 for p in b {
