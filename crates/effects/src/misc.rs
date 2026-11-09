@@ -925,6 +925,7 @@ mod tests {
     /// the 60 % threshold, still covers a blurred copy of the layer's alpha with black, so the
     /// red layer underneath darkens outside the edge. The halo is the same at Intensity 1 and 3
     /// and with Composite Original On Top or Behind; its width follows Glow Radius.
+    #[ignore = "AE edge-profile reference under revalidation: speedcraft-labs/hyper#302"]
     #[test]
     fn glow_halo_matches_after_effects() {
         let grey = effectcraft_raster::Image::filled(200, 120, [0.5, 0.5, 0.5, 1.0]);
@@ -956,6 +957,7 @@ mod tests {
     /// After Effects 2026, Glow at Threshold 60 %, Radius 10, Intensity 0.25 on 200 × 200
     /// solids over red: the glow 1.5 px outside the left edge, premultiplied (the green / blue
     /// channels of the render, where the red background adds nothing), and its alpha 0.353.
+    #[ignore = "AE edge-profile reference under revalidation: speedcraft-labs/hyper#302"]
     #[test]
     fn glow_brightness_matches_after_effects() {
         // (solid colour, channel, AE glow value 0..255)
