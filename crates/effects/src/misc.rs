@@ -304,7 +304,7 @@ fn drop_shadow(ctx: &EffectCtx, mut b: Buf) -> Buf {
         }
     });
     if soft > 0.0 {
-        sh = gaussian_blur(&sh, soft / 2.0, soft / 2.0, false);
+        sh = gaussian_blur_boxes(&sh, soft / 2.0, soft / 2.0, false);
     }
     if !only {
         sh.data.par_iter_mut().zip(b.img.data.par_iter()).for_each(|(s, o)| {
