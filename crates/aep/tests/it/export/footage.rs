@@ -288,7 +288,9 @@ fn what_cannot_be_written_is_reported() {
     add_footage(&mut p, c, "bmp", still(r"C:\m\a.bmp", 8, 8));
     add_footage(&mut p, c, "ntsc", Footage { kind: FootageKind::Video, frame_rate: FrameRate::FPS_29_97, ..still(r"C:\m\a.mp4", 8, 8) });
     let mut gaps = seq(r"C:\m", "g_", 1, 3, 2, ".png", FrameRate::new(25, 1));
-    gaps.sequence.remove(1);
+    let mut files = gaps.sequence.to_vec();
+    files.remove(1);
+    gaps.sequence = files.into();
     add_footage(&mut p, c, "gaps", gaps);
     add_footage(&mut p, c, "nopath", still("", 8, 8));
     add_footage(&mut p, c, "mp3", Footage { kind: FootageKind::Audio, ..still(r"C:\m\a.mp3", 0, 0) });
