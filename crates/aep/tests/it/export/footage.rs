@@ -17,7 +17,7 @@ fn still(path: &str, w: u32, h: u32) -> Footage {
 
 fn seq(dir: &str, prefix: &str, start: u32, n: u32, digits: usize, suffix: &str, rate: FrameRate) -> Footage {
     let files: Vec<String> = (start..start + n).map(|k| format!("{dir}\\{prefix}{k:0digits$}{suffix}")).collect();
-    let mut f = Footage { kind: FootageKind::Sequence, frame_rate: rate, sequence: files.clone(), ..still(&files[0], 64, 48) };
+    let mut f = Footage { kind: FootageKind::Sequence, frame_rate: rate, sequence: files.clone().into(), ..still(&files[0], 64, 48) };
     f.sync_sequence_duration();
     f
 }
