@@ -1104,7 +1104,7 @@ dependencies = [
 [[package]]
 name = "craft-blur"
 version = "0.1.0"
-source = "git+https://github.com/speedcraft-labs/craft-libs?rev=f96804de204bde13cdaa0dc64793259069c99a1e#f96804de204bde13cdaa0dc64793259069c99a1e"
+source = "git+https://github.com/speedcraft-labs/craft-libs?rev=bd4514470391e50388cb399d9531ced2ec8d87f3#bd4514470391e50388cb399d9531ced2ec8d87f3"
 
 [[package]]
 name = "craft-docpath"
