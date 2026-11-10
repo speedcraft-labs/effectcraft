@@ -2098,14 +2098,14 @@ impl<'g> Enc<'g> {
         Some(image)
     }
 
-    /// Like [`Self::upload_footage_source_8bit`], but batch non-static transfers with float sources.
+    /// Like [`Self::upload_footage_source_8bit`], but batch compact transfers with float sources.
     pub fn stage_footage_source_8bit(&mut self, key: effectcraft_render::GpuFootageSourceKey, buf: &Arc<Buf>, quantize: bool) -> Option<GpuImage> {
         let cache_key = (key, true);
         if let Some(image) = self.footage_sources.get(&cache_key).cloned() {
             self.uses(&image);
             return Some(image);
         }
-        let image = if key.is_static() { self.g.upload_buf_8bit(buf, quantize)? } else { self.stage_upload_buf_8bit(buf, quantize)? };
+        let image = self.stage_upload_buf_8bit(buf, quantize)?;
         self.uses(&image);
         let bytes = image.width as usize * image.height as usize * 4;
         if bytes <= FRAME_SOURCE_CACHE_BYTES && self.footage_source_bytes.saturating_add(bytes) <= FRAME_SOURCE_CACHE_BYTES {
