@@ -273,9 +273,7 @@ fn file_open_parses_project_and_metadata_together() {
 fn file_open_keeps_sequence_paths_deferred() {
     let (mut project, _) = project_with_layer();
     let paths = vec!["/media/shot_0001.exr".to_string(), "relative/quote\"line\nbreak.exr".to_string()];
-    let mut footage = super::Footage::default();
-    footage.kind = super::FootageKind::Sequence;
-    footage.sequence = paths.clone().into();
+    let footage = super::Footage { kind: super::FootageKind::Sequence, sequence: paths.clone().into(), ..super::Footage::default() };
     project.add_item("Sequence", effectcraft_color::Label::None, None, ItemKind::Footage(footage));
 
     let json = project.to_file_json().unwrap();

@@ -149,13 +149,6 @@ impl<'e, 'g> GpuFx<'e, 'g> {
         GpuFx { e, b: Some(GBuf { img, offset, scale }), levels, cpu_shadow: None, gpu_dirty: false }
     }
 
-    /// A layer source has already been rendered on the CPU. If its first GPU effect declines
-    /// the current settings, use those exact source pixels for the CPU effect instead of
-    /// reading the just-uploaded texture back from the device.
-    pub fn with_cpu_shadow(e: &'e mut Enc<'g>, img: GpuImage, source: std::sync::Arc<Buf>, levels: Option<f32>) -> Self {
-        Self { e, b: Some(GBuf { img, offset: source.offset, scale: source.scale }), levels, cpu_shadow: Some(source), gpu_dirty: false }
-    }
-
     /// The result: (image, offset, scale); `None` when a step failed.
     pub fn finish(self) -> Option<(GpuImage, [f64; 2], f64)> {
         self.b.map(|b| (b.img, b.offset, b.scale))
