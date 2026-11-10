@@ -3,7 +3,7 @@
 use effectcraft_color::luminance;
 use effectcraft_keyframe::Value;
 use effectcraft_project::ParamUi;
-use effectcraft_raster::{Image, gaussian_blur, hash_noise};
+use effectcraft_raster::{Image, gaussian_blur, gaussian_blur_boxes, hash_noise};
 use rayon::prelude::*;
 
 use crate::{Buf, EffectCtx, EffectSpec, col, num, p, popup, slider};
@@ -597,7 +597,7 @@ fn linear_wipe_blurred(ctx: &EffectCtx, mut b: Buf) -> Buf {
     // Three box passes per axis (the measured shape; the GPU runs the same passes). Below
     // Feather ~2 they leave the anti-aliased edge alone.
     if sigma > 1e-3 {
-        mask = gaussian_blur(&mask, sigma, sigma, true);
+        mask = gaussian_blur_boxes(&mask, sigma, sigma, true);
     }
     for (px, m) in b.img.data.iter_mut().zip(mask.data.iter()) {
         let k = m[3].clamp(0.0, 1.0);

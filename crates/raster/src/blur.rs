@@ -128,10 +128,33 @@ fn box_passes(img: &Image, rx: &[usize], ry: &[usize], repeat: bool) -> Image {
     a
 }
 
+/// Box radii for `n` passes approximating a Gaussian of `sigma` (Kovesi / "boxes for Gauss").
+fn box_radii(sigma: f64, n: usize) -> Vec<usize> {
+    if sigma <= 0.0 {
+        return vec![0; n];
+    }
+    let w_ideal = (12.0 * sigma * sigma / n as f64 + 1.0).sqrt();
+    let mut wl = w_ideal.floor() as i64;
+    if wl % 2 == 0 {
+        wl -= 1;
+    }
+    let wu = wl + 2;
+    let m_ideal = (12.0 * sigma * sigma - (n as i64 * wl * wl) as f64 - 4.0 * n as f64 * wl as f64 - 3.0 * n as f64) / (-4.0 * wl as f64 - 4.0);
+    let m = m_ideal.round() as i64;
+    (0..n as i64).map(|i| (((if i < m { wl } else { wu }) - 1) / 2).max(0) as usize).collect()
+}
+
 /// Separable box blur with given radii, `iterations` passes.
 pub fn box_blur(img: &Image, rx: usize, ry: usize, iterations: usize, repeat: bool) -> Image {
     let n = iterations.max(1);
     box_passes(img, &vec![rx; n], &vec![ry; n], repeat)
+}
+
+/// Gaussian approximation using three box passes per axis.
+pub fn gaussian_blur_boxes(img: &Image, sigma_x: f64, sigma_y: f64, repeat: bool) -> Image {
+    let rx = if sigma_x > 0.05 { box_radii(sigma_x, 3) } else { vec![] };
+    let ry = if sigma_y > 0.05 { box_radii(sigma_y, 3) } else { vec![] };
+    box_passes(img, &rx, &ry, repeat)
 }
 
 /// Variance-calibrated Gaussian blur. craft-blur uses its sampled kernel below 2.5 px and the
