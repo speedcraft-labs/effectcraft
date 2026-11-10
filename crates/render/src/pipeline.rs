@@ -594,7 +594,7 @@ impl<'a> Renderer<'a> {
         }
         // (the generation before any read: a file dropped while `make` runs makes it stale)
         let log = self.cache.and_then(LayerCache::drop_generation).map_or_else(ReadLog::new, ReadLog::starting_at);
-        let out = make(&Renderer { reads: Some(&log), ..*self });
+        let out = make(&Renderer { reads: Some(&log), ..self.clone() });
         let files = log.into_files();
         if let Some(own) = self.reads {
             own.note_all(&files);
@@ -1910,13 +1910,13 @@ impl<'a> Renderer<'a> {
     /// (what the motion tracker analyses, like After Effects' Layer panel). `None` for layers
     /// without pixels.
     pub fn layer_source(&self, ctx: &EvalCtx, layer: &Layer) -> Option<Buf> {
-        Renderer { whole_raster: true, ..*self }.source(ctx, layer)
+        Renderer { whole_raster: true, ..self.clone() }.source(ctx, layer)
     }
 
     /// Layer-space pixels after masks and effects, including content outside the viewport.
     /// Expression sampleImage reads this rather than the frame-oriented clipped buffer.
     pub fn layer_content(&self, ctx: &EvalCtx, layer: &Layer) -> Option<Arc<Buf>> {
-        Renderer { whole_raster: true, ..*self }.content_buf(ctx, layer)
+        Renderer { whole_raster: true, ..self.clone() }.content_buf(ctx, layer)
     }
 
     /// A 3D model or primitive layer rendered on its own, through the comp's camera: what an
@@ -2019,7 +2019,7 @@ impl<'a> Renderer<'a> {
     /// so scrubbing reuses frames rendered for earlier output frames.
     pub fn layer_input(&self, ctx: &EvalCtx, layer: &Layer, effects: usize) -> Option<Arc<Buf>> {
         // The Layer panel, analysis tools and effect inputs read the whole layer, not the viewport.
-        Renderer { whole_raster: true, ..*self }.whole_layer_input(ctx, layer, effects)
+        Renderer { whole_raster: true, ..self.clone() }.whole_layer_input(ctx, layer, effects)
     }
 
     fn whole_layer_input(&self, ctx: &EvalCtx, layer: &Layer, effects: usize) -> Option<Arc<Buf>> {
