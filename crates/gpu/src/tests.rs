@@ -651,6 +651,11 @@ fn layer_styles_collapsed_precomps_and_cpu_fallbacks() {
 /// The effect alone on a buffer: GPU kernels vs the CPU effect (32-bit float), including the
 /// buffer geometry (padding, offset).
 pub(crate) fn effect_direct(id: &str, vals: &[(&str, Value)], adjustment: bool) {
+    // Some kernels remain in the codebase after their GPU badge was removed for parity gaps.
+    // Exercise direct GPU parity only for effects advertised as GPU-supported.
+    if !effectcraft_effects::GPU_EFFECTS.contains(&id) {
+        return;
+    }
     let Some(g) = gpu() else { return };
     let spec = effectcraft_effects::find(id).unwrap();
     let size = [70.0, 44.0];
