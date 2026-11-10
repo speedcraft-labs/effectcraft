@@ -2148,17 +2148,22 @@ impl<'g> Enc<'g> {
             self.flush_staged_uploads();
             self.submit();
         }
-        let texture = self.g.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some(if rgba8 { "8-bit layer source" } else { "layer source" }),
-            size: wgpu::Extent3d { width: buf.img.width.max(1), height: buf.img.height.max(1), depth_or_array_layers: 1 },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: if rgba8 { wgpu::TextureFormat::Rgba8Unorm } else { FORMAT },
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
-        let image = GpuImage::new(texture, buf.img.width, buf.img.height);
+        let image = if rgba8 {
+            let texture = self.g.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("8-bit layer source"),
+                size: wgpu::Extent3d { width: buf.img.width.max(1), height: buf.img.height.max(1), depth_or_array_layers: 1 },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+            GpuImage::new(texture, buf.img.width, buf.img.height)
+        } else {
+            // Keep the existing float staging path on the reusable texture pool.
+            self.g.image(buf.img.width, buf.img.height)
+        };
         self.g.transfers.count(true, buf.img.data.len() * bytes_per_pixel);
         self.staged_uploads.insert(key, StagedUpload { buf: buf.clone(), img: image.clone(), offset: 0, bytes_per_row: bytes_per_row as u32, rgba8, quantize });
         self.staged_to_copy.push(key);
