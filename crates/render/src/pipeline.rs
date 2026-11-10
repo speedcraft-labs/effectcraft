@@ -57,37 +57,70 @@ impl ShapeSourceCache {
 
 #[derive(Default)]
 struct FootageBufferCacheInner {
-    entries: HashMap<GpuFootageSourceKey, Arc<Buf>>,
+    entries: HashMap<GpuFootageSourceKey, FootageBufferCacheEntry>,
     bytes: usize,
+    clock: u64,
+}
+
+struct FootageBufferCacheEntry {
+    buf: Arc<Buf>,
+    bytes: usize,
+    last_use: u64,
 }
 
 /// Small, renderer-local cache for processed frames of repeated plain footage layers.
-#[derive(Default)]
 pub(crate) struct FootageBufferCache {
     inner: Mutex<FootageBufferCacheInner>,
+    budget: usize,
+}
+
+impl Default for FootageBufferCache {
+    fn default() -> Self {
+        Self { inner: Mutex::new(FootageBufferCacheInner::default()), budget: FOOTAGE_BUFFER_CACHE_BYTES }
+    }
 }
 
 impl FootageBufferCache {
     pub(crate) fn get(&self, key: GpuFootageSourceKey) -> Option<Arc<Buf>> {
-        self.inner.lock().ok()?.entries.get(&key).cloned()
+        let mut inner = self.inner.lock().ok()?;
+        inner.clock = inner.clock.saturating_add(1);
+        let now = inner.clock;
+        let entry = inner.entries.get_mut(&key)?;
+        entry.last_use = now;
+        Some(entry.buf.clone())
     }
 
     pub(crate) fn insert(&self, key: GpuFootageSourceKey, buf: Arc<Buf>) -> Arc<Buf> {
         let bytes = buf.img.data.len().saturating_mul(std::mem::size_of::<[f32; 4]>());
-        if bytes == 0 || bytes > FOOTAGE_BUFFER_CACHE_BYTES {
+        if bytes == 0 || bytes > self.budget {
             return buf;
         }
         let Ok(mut inner) = self.inner.lock() else { return buf };
-        if let Some(existing) = inner.entries.get(&key) {
-            return existing.clone();
+        inner.clock = inner.clock.saturating_add(1);
+        let now = inner.clock;
+        if let Some(existing) = inner.entries.get_mut(&key) {
+            existing.last_use = now;
+            return existing.buf.clone();
         }
-        if inner.bytes.saturating_add(bytes) > FOOTAGE_BUFFER_CACHE_BYTES {
-            inner.entries.clear();
-            inner.bytes = 0;
+        while inner.bytes.saturating_add(bytes) > self.budget {
+            let Some(oldest) = inner.entries.iter().min_by_key(|(_, entry)| entry.last_use).map(|(key, _)| *key) else { break };
+            if let Some(entry) = inner.entries.remove(&oldest) {
+                inner.bytes = inner.bytes.saturating_sub(entry.bytes);
+            }
         }
-        inner.bytes += bytes;
-        inner.entries.insert(key, buf.clone());
+        inner.bytes = inner.bytes.saturating_add(bytes);
+        inner.entries.insert(key, FootageBufferCacheEntry { buf: buf.clone(), bytes, last_use: now });
         buf
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_budget_for_tests(budget: usize) -> Self {
+        Self { inner: Mutex::new(FootageBufferCacheInner::default()), budget }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn bytes_for_tests(&self) -> usize {
+        self.inner.lock().map(|inner| inner.bytes).unwrap_or_default()
     }
 }
 

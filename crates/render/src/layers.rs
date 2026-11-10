@@ -80,6 +80,24 @@ mod footage_buffer_cache_tests {
         assert!(Arc::ptr_eq(&cache.insert(key(7), buf.clone()), &buf));
         assert!(cache.get(key(7)).is_none());
     }
+
+    #[test]
+    fn cache_overflow_evicts_oldest_frame_and_keeps_recent_frames() {
+        let cache = FootageBufferCache::with_budget_for_tests(128);
+        let first = Arc::new(Buf { img: Image::filled(2, 2, [0.1, 0.2, 0.3, 1.0]), offset: [0.0; 2], scale: 1.0 });
+        let second = Arc::new(Buf { img: Image::filled(2, 2, [0.2, 0.3, 0.4, 1.0]), offset: [0.0; 2], scale: 1.0 });
+        let third = Arc::new(Buf { img: Image::filled(2, 2, [0.3, 0.4, 0.5, 1.0]), offset: [0.0; 2], scale: 1.0 });
+
+        cache.insert(key(1), first);
+        cache.insert(key(2), second);
+        assert!(cache.get(key(1)).is_some());
+        cache.insert(key(3), third);
+
+        assert!(cache.get(key(1)).is_some());
+        assert!(cache.get(key(2)).is_none());
+        assert!(cache.get(key(3)).is_some());
+        assert_eq!(cache.bytes_for_tests(), 128);
+    }
 }
 
 /// A motion-blur shutter: the comp's, or for a collapsed precomp's layers the outermost
