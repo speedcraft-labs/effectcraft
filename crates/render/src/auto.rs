@@ -74,10 +74,11 @@ impl AutoPick {
             m.clear();
         }
         let s = m.entry(key).or_default();
-        // Warm up both sides, alternating, GPU first.
+        // Warm up both sides, alternating. On a readback key, show a CPU frame before probing the
+        // GPU: its first render can include large source uploads and a full-frame readback.
         let gpu_warm = s.declined || s.gpu_frames >= Self::WARMUP;
-        if !gpu_warm && s.gpu_frames <= s.cpu_frames {
-            return true;
+        if !gpu_warm && s.gpu_frames < Self::WARMUP && s.cpu_frames < Self::WARMUP {
+            return if key.display { s.gpu_frames <= s.cpu_frames } else { s.gpu_frames > s.cpu_frames };
         }
         if s.cpu_frames < Self::WARMUP {
             return false;
