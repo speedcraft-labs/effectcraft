@@ -290,10 +290,7 @@ fn drop_shadow(ctx: &EffectCtx, mut b: Buf) -> Buf {
     let dist = ctx.params.f("distance") * b.scale;
     let soft = ctx.params.f("softness") * b.scale;
     let only = ctx.params.b("shadowOnly");
-    // The sampled Gaussian has finite 3σ support. The recursive filter has an infinite tail, so
-    // retain 5σ around the source to keep the local shadow identical to a comp-covered render.
-    let blur_pad = if effectcraft_raster::gaussian_is_exact(soft * 0.5, soft * 0.5) { soft * 1.5 } else { soft * 2.5 };
-    let pad = (dist + blur_pad).ceil() as u32 + 2;
+    let pad = (dist + soft * 1.5).ceil() as u32 + 2;
     if !ctx.adjustment {
         b.pad(pad);
     }

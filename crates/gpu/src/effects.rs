@@ -1,7 +1,6 @@
 //! GPU effects: the same steps as the CPU effects in `effectcraft-effects` (padding, blur
 //! radii, parameter conversions), with the pixel loops as compute kernels.
 
-use craft_blur::{Gaussian, Quality, Separable};
 use effectcraft_effects::{Buf, EffectCtx};
 use effectcraft_raster::Sampling;
 use effectcraft_render::FxStep;
@@ -330,79 +329,11 @@ pub(crate) fn box_passes(e: &mut Enc, img: &GpuImage, rx: &[usize], ry: &[usize]
     cur
 }
 
-/// craft-blur's sampled or recursive Gaussian, with one line per GPU invocation.
+/// raster::gaussian_blur (3 box passes per axis).
 pub(crate) fn gaussian_blur(e: &mut Enc, img: &GpuImage, sx: f64, sy: f64, repeat: bool) -> GpuImage {
-    let mut cur = img.clone();
-    for (sigma, vertical) in [(sx, false), (sy, true)] {
-        if sigma <= 0.0 || !sigma.is_finite() {
-            continue;
-        }
-        let sigma = sigma as f32;
-        let Ok(filter) = Gaussian::new(sigma, Quality::RecursiveRaw) else { continue };
-        let mut p = Params::default();
-        match filter.separable() {
-            Separable::Kernel(weights) => {
-                let radius = weights.len() / 2;
-                if radius > 8 {
-                    continue;
-                }
-                p.u[0] = [radius as u32, vertical as u32, repeat as u32, 0];
-                for (i, weight) in weights.iter().enumerate() {
-                    let Some(channel) = p.f.get_mut(1 + i / 4).and_then(|v| v.get_mut(i % 4)) else { break };
-                    *channel = *weight;
-                }
-                let out = e.scratch(cur.width, cur.height);
-                e.pixels("gaussian_sample", &p, &cur, None, &out, None);
-                cur = out;
-            }
-            Separable::Recursive(coefficients) => {
-                p.f[0] = [coefficients.feedback[0] as f32, coefficients.feedback[1] as f32, coefficients.feedback[2] as f32, coefficients.gain as f32];
-                for (row, boundary) in coefficients.boundary.iter().enumerate() {
-                    let Some(dst) = p.f.get_mut(row + 1) else { break };
-                    for (channel, value) in dst.iter_mut().zip(boundary) {
-                        *channel = *value as f32;
-                    }
-                }
-                p.u[0] = [vertical as u32, repeat as u32, 0, 0];
-                let lines = if vertical { (cur.width, 1) } else { (1, cur.height) };
-                let forward = e.scratch(cur.width, cur.height);
-                e.dispatch("gaussian_forward", &p, crate::context::KernelImages { src: &cur, aux: None, out: &forward }, None, lines);
-                let out = e.scratch(cur.width, cur.height);
-                e.dispatch("gaussian_backward", &p, crate::context::KernelImages { src: &forward, aux: Some(&cur), out: &out }, None, lines);
-                cur = out;
-            }
-            Separable::Boxes(_) => {}
-        }
-    }
-    cur
-}
-
-/// The raster backend's small-sigma sampled Gaussian, accumulated in CPU tap order.
-fn gaussian_blur_exact_gpu(e: &mut Enc, img: &GpuImage, sx: f64, sy: f64, repeat: bool) -> GpuImage {
-    let mut cur = img.clone();
-    for (sigma, vertical) in [(sx, false), (sy, true)] {
-        if !sigma.is_finite() || sigma <= 1e-3 {
-            continue;
-        }
-        let radius = (sigma * 3.0).ceil() as i64;
-        let mut weights: Vec<f64> = (-radius..=radius).map(|tap| (-((tap * tap) as f64) / (2.0 * sigma * sigma)).exp()).collect();
-        let total: f64 = weights.iter().sum();
-        weights.iter_mut().for_each(|weight| *weight /= total);
-
-        let mut p = Params::default();
-        p.u[0] = [radius as u32, vertical as u32, repeat as u32, 0];
-        for (tap, weight) in weights.iter().enumerate() {
-            let hi = *weight as f32;
-            let lo = (*weight - f64::from(hi)) as f32;
-            let first = tap * 2;
-            p.f[1 + first / 4][first % 4] = hi;
-            p.f[1 + (first + 1) / 4][(first + 1) % 4] = lo;
-        }
-        let out = e.scratch(cur.width, cur.height);
-        e.pixels("gaussian_sample_exact", &p, &cur, None, &out, None);
-        cur = out;
-    }
-    cur
+    let rx = if sx > 0.05 { box_radii(sx, 3) } else { vec![] };
+    let ry = if sy > 0.05 { box_radii(sy, 3) } else { vec![] };
+    box_passes(e, img, &rx, &ry, repeat)
 }
 
 fn dims_xy(dim: u32) -> (f64, f64) {
@@ -419,6 +350,11 @@ fn gaussian(e: &mut Enc, ctx: &EffectCtx, mut b: GBuf) -> Option<GBuf> {
         return Some(b);
     }
     let (kx, ky) = dims_xy(ctx.params.e("dimensions"));
+    let (sx, sy) = (s * kx, s * ky);
+    // Small sigmas use the CPU's sampled kernel (#1939).
+    if effectcraft_raster::gaussian_is_exact(sx, sy) {
+        return None;
+    }
     let repeat = ctx.params.b("repeatEdge");
     if !repeat && !ctx.adjustment {
         b.pad(e, (s * 3.0).ceil() as u32)?;
@@ -426,12 +362,7 @@ fn gaussian(e: &mut Enc, ctx: &EffectCtx, mut b: GBuf) -> Option<GBuf> {
         // The edge it repeats is the layer's, not the painted content's (#1205).
         b.cover(e, ctx.layer_size)?;
     }
-    let (sx, sy) = (s * kx, s * ky);
-    b.img = if effectcraft_raster::gaussian_is_exact(sx, sy) {
-        gaussian_blur_exact_gpu(e, &b.img, sx, sy, repeat || ctx.adjustment)
-    } else {
-        gaussian_blur(e, &b.img, sx, sy, repeat || ctx.adjustment)
-    };
+    b.img = gaussian_blur(e, &b.img, sx, sy, repeat || ctx.adjustment);
     Some(b)
 }
 
@@ -517,10 +448,7 @@ fn drop_shadow(e: &mut Enc, ctx: &EffectCtx, mut b: GBuf) -> Option<GBuf> {
     let dist = ctx.params.f("distance") * b.scale;
     let soft = ctx.params.f("softness") * b.scale;
     let only = ctx.params.b("shadowOnly");
-    // Match the CPU kernel: sampled Gaussians have finite 3σ support; the recursive filter has
-    // an infinite tail, so retain 5σ around the source for the covered-render reference.
-    let blur_pad = if effectcraft_raster::gaussian_is_exact(soft * 0.5, soft * 0.5) { soft * 1.5 } else { soft * 2.5 };
-    let pad = (dist + blur_pad).ceil() as u32 + 2;
+    let pad = (dist + soft * 1.5).ceil() as u32 + 2;
     if !ctx.adjustment {
         b.pad(e, pad)?;
     }
