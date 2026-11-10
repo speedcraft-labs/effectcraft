@@ -2201,26 +2201,34 @@ impl<'g> Enc<'g> {
                 let stride = upload.bytes_per_row as usize;
                 let base = upload.offset as usize;
                 if upload.rgba8 {
-                    mapped
-                        .slice(base..base + stride * upload.img.height as usize)
-                        .par_chunks_mut(stride)
-                        .zip(upload.buf.img.data.par_chunks(upload.img.width as usize))
-                        .for_each(|(dst_row, src_row)| {
-                            dst_row[..row_bytes].par_chunks_exact_mut(4).zip(src_row.par_iter()).for_each(|(dst, px)| {
-                                if upload.quantize {
-                                    let alpha = (px[3] * 255.0 + 0.5) as u8;
-                                    dst[0] = ((px[0] * 255.0 + 0.5) as u8).min(alpha);
-                                    dst[1] = ((px[1] * 255.0 + 0.5) as u8).min(alpha);
-                                    dst[2] = ((px[2] * 255.0 + 0.5) as u8).min(alpha);
-                                    dst[3] = alpha;
-                                } else {
-                                    dst[0] = (px[0] * 255.0 + 0.5) as u8;
-                                    dst[1] = (px[1] * 255.0 + 0.5) as u8;
-                                    dst[2] = (px[2] * 255.0 + 0.5) as u8;
-                                    dst[3] = (px[3] * 255.0 + 0.5) as u8;
-                                }
+                    RGBA8_UPLOAD_SCRATCH.with(|scratch| {
+                        let mut storage = scratch.borrow_mut();
+                        let byte_len = upload.buf.img.data.len() * 4;
+                        if storage.len() < byte_len {
+                            storage.resize(byte_len, 0);
+                        }
+                        let bytes = &mut storage[..byte_len];
+                        if upload.quantize {
+                            bytes.par_chunks_exact_mut(4).zip(upload.buf.img.data.par_iter()).with_min_len(4096).for_each(|(dst, px)| {
+                                let alpha = (px[3] * 255.0 + 0.5) as u8;
+                                dst[0] = ((px[0] * 255.0 + 0.5) as u8).min(alpha);
+                                dst[1] = ((px[1] * 255.0 + 0.5) as u8).min(alpha);
+                                dst[2] = ((px[2] * 255.0 + 0.5) as u8).min(alpha);
+                                dst[3] = alpha;
                             });
-                        });
+                        } else {
+                            bytes.par_chunks_exact_mut(4).zip(upload.buf.img.data.par_iter()).with_min_len(4096).for_each(|(dst, px)| {
+                                dst[0] = (px[0] * 255.0 + 0.5) as u8;
+                                dst[1] = (px[1] * 255.0 + 0.5) as u8;
+                                dst[2] = (px[2] * 255.0 + 0.5) as u8;
+                                dst[3] = (px[3] * 255.0 + 0.5) as u8;
+                            });
+                        }
+                        for row in 0..upload.img.height as usize {
+                            let src = &bytes[row * row_bytes..(row + 1) * row_bytes];
+                            mapped.slice(base + row * stride..base + row * stride + row_bytes).copy_from_slice(src);
+                        }
+                    });
                 } else {
                     let source = bytemuck::cast_slice::<[f32; 4], u8>(&upload.buf.img.data);
                     for row in 0..upload.img.height as usize {
