@@ -68,7 +68,7 @@ mod footage_buffer_cache_tests {
     fn processed_footage_buffers_are_shared_by_source_identity() {
         let cache = FootageBufferCache::default();
         let first = Arc::new(Buf { img: Image::filled(2, 2, [0.2, 0.4, 0.6, 1.0]), offset: [0.0; 2], scale: 1.0 });
-        let files = Arc::default();
+        let files: Arc<crate::reads::ReadFiles> = Arc::default();
         let (inserted, inserted_files) = cache.insert(key(7), first.clone(), files.clone());
         assert!(Arc::ptr_eq(&inserted, &first));
         assert!(Arc::ptr_eq(&inserted_files, &files));
