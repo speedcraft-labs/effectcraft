@@ -561,10 +561,10 @@ fn composite_src(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, shape:
         return Some(());
     }
     if r.track_matte(ctx, layer).is_none() && !layer.preserve_transparency {
-        *canvas = place_src(e, r, ctx, layer, shape, src, canvas, layer.blend_mode, opacity, r.pipe().levels)?;
+        *canvas = place_src(e, r, ctx, layer, shape, src, canvas, layer.blend_mode, opacity, r.pipe().levels, false)?;
         return Some(());
     }
-    let iso = place_src(e, r, ctx, layer, shape, src, &e.zeros(canvas.width, canvas.height), BlendMode::Normal, 1.0, None)?;
+    let iso = place_src(e, r, ctx, layer, shape, src, &e.zeros(canvas.width, canvas.height), BlendMode::Normal, 1.0, None, false)?;
     composite_iso(e, r, ctx, layer, iso, canvas, opacity)
 }
 
