@@ -1529,6 +1529,26 @@ fn rgba8_upload_cache_distinguishes_quantized_sources() {
     assert_eq!(cached.uploads, twice.uploads, "repeated quantized upload should hit its cache entry");
 }
 
+#[test]
+fn staged_rgba8_upload_matches_direct_upload() {
+    let Some(g) = gpu() else { return };
+    let mut img = Image::new(3, 2);
+    img.data = vec![[0.8, 0.2, 0.1, 0.5], [0.1, 0.5, 0.9, 1.0], [1.2, -0.2, 0.4, 0.25], [0.0, 0.0, 0.0, 0.0], [0.6, 0.3, 0.2, 0.75], [0.4, 0.5, 0.6, 0.8]];
+    let direct_buf = Arc::new(effectcraft_effects::Buf { img: img.clone(), offset: [0.0; 2], scale: 1.0 });
+    let staged_buf = Arc::new(effectcraft_effects::Buf { img, offset: [0.0; 2], scale: 1.0 });
+    let direct_quantized = g.ctx.upload_buf_8bit(&direct_buf, true).expect("direct quantized upload");
+    let direct_unquantized = g.ctx.upload_buf_8bit(&direct_buf, false).expect("direct unquantized upload");
+    let mut e = crate::context::Enc::new(&g.ctx);
+    let staged_quantized = e.stage_upload_buf_8bit(&staged_buf, true).expect("staged quantized upload");
+    let staged_unquantized = e.stage_upload_buf_8bit(&staged_buf, false).expect("staged unquantized upload");
+    e.flush_staged_uploads();
+    e.submit();
+    let pixels =
+        |e: &mut crate::context::Enc<'_>, img: &crate::context::GpuImage| e.read_texture(&img.texture, img.width, img.height, 4).expect("read RGBA8 texture");
+    assert_eq!(pixels(&mut e, &staged_quantized), pixels(&mut e, &direct_quantized));
+    assert_eq!(pixels(&mut e, &staged_unquantized), pixels(&mut e, &direct_unquantized));
+}
+
 /// The device the compositor owns asks for `MemoryUsage` so freed textures give
 /// their allocator blocks back, while its label and limits stay as they were.
 #[test]

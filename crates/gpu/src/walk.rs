@@ -185,13 +185,7 @@ fn draw_comp<'a>(e: &mut Enc, r: &Renderer<'a>, ctx: &EvalCtx<'a>, canvas: &mut 
                         }
                         let key = r.gpu_footage_source_key(ctx, layer, st.quantize_source());
                         uploaded[offset] = Some(if compact_8bit_sources && st.quantize_source() {
-                            if let Some(key) = key {
-                                e.upload_footage_source_8bit(key, &st.body, true)?
-                            } else {
-                                let image = e.g.upload_buf_8bit(&st.body, true)?;
-                                e.uses(&image);
-                                image
-                            }
+                            if let Some(key) = key { e.stage_footage_source_8bit(key, &st.body, true)? } else { e.stage_upload_buf_8bit(&st.body, true)? }
                         } else if let Some(key) = key {
                             e.stage_footage_source(key, &st.body)?
                         } else {
