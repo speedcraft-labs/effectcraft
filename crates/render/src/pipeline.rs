@@ -3,397 +3,13 @@ use super::footage::{FootageSource, is_vector_footage};
 use super::frames::{blend_frames, cineon_frame, content_bounds, field_frame, frame_blend_mode, frame_position, frame_size, interpret_pixels, roi_inside};
 use super::fx_host::{FxHost, essential_overrides};
 use super::opts::{Collapse3d, LayerTiming, MAX_THROUGH, RenderOpts, Through};
+use super::reads::{ReadFiles, ReadLog};
 use super::{
-    Arc, AutoKey, AutoPick, BlendMode, Buf, Comp, EffectCtx, EffectEnv, EvalCtx, Footage, FootageKind, FrameBlend, FrameRate, GpuFootageSourceKey, GroupKind,
-    Image, ItemId, ItemKind, Layer, LayerCache, LayerSource, Params, Project, Quality, Region, Renderer, StyledLayer, Tick, WarpOpts, cache, color, masks,
-    shapes, styles, text, three_d, vec2,
+    Arc, AutoKey, AutoPick, BlendMode, Buf, Comp, EffectCtx, EffectEnv, EvalCtx, Footage, FootageKind, FrameBlend, FrameRate, GroupKind, Image, ItemId,
+    ItemKind, Layer, LayerCache, LayerSource, Params, Project, Quality, Region, Renderer, Tick, cache, color, masks, shapes, styles, text, three_d, vec2,
 };
 use effectcraft_keyframe::Value;
-use effectcraft_project::{LayerId, Node, PropGroup};
-use rayon::prelude::*;
-use std::collections::{HashMap, HashSet};
-use std::sync::{Mutex, OnceLock};
-
-const COMP_FRAME_CACHE_BYTES: usize = 128 * 1024 * 1024;
-const COMP_FRAME_CACHE_SINGLE: usize = 8 * 1024 * 1024;
-const SHAPE_SOURCE_CACHE_BYTES: usize = 64 * 1024 * 1024;
-const FOOTAGE_BUFFER_CACHE_BYTES: usize = 64 * 1024 * 1024;
-
-#[derive(Default)]
-struct ShapeSourceCacheInner {
-    entries: HashMap<u64, Arc<Buf>>,
-    bytes: usize,
-}
-
-/// Small, renderer-local cache of source rasters shared by identical static shape layers.
-#[derive(Default)]
-pub(crate) struct ShapeSourceCache {
-    inner: Mutex<ShapeSourceCacheInner>,
-}
-
-impl ShapeSourceCache {
-    fn get(&self, key: u64) -> Option<Arc<Buf>> {
-        self.inner.lock().ok()?.entries.get(&key).cloned()
-    }
-
-    fn insert(&self, key: u64, buf: Arc<Buf>) -> Arc<Buf> {
-        let bytes = buf.img.data.len().saturating_mul(std::mem::size_of::<[f32; 4]>());
-        if bytes == 0 || bytes > SHAPE_SOURCE_CACHE_BYTES {
-            return buf;
-        }
-        let Ok(mut inner) = self.inner.lock() else { return buf };
-        if let Some(existing) = inner.entries.get(&key) {
-            return existing.clone();
-        }
-        if inner.bytes.saturating_add(bytes) > SHAPE_SOURCE_CACHE_BYTES {
-            inner.entries.clear();
-            inner.bytes = 0;
-        }
-        inner.bytes += bytes;
-        inner.entries.insert(key, buf.clone());
-        buf
-    }
-}
-
-#[derive(Default)]
-struct FootageBufferCacheInner {
-    entries: HashMap<GpuFootageSourceKey, Arc<Buf>>,
-    bytes: usize,
-}
-
-/// Small, renderer-local cache for processed frames of repeated plain footage layers.
-#[derive(Default)]
-pub(crate) struct FootageBufferCache {
-    inner: Mutex<FootageBufferCacheInner>,
-}
-
-impl FootageBufferCache {
-    pub(crate) fn get(&self, key: GpuFootageSourceKey) -> Option<Arc<Buf>> {
-        self.inner.lock().ok()?.entries.get(&key).cloned()
-    }
-
-    pub(crate) fn insert(&self, key: GpuFootageSourceKey, buf: Arc<Buf>) -> Arc<Buf> {
-        let bytes = buf.img.data.len().saturating_mul(std::mem::size_of::<[f32; 4]>());
-        if bytes == 0 || bytes > FOOTAGE_BUFFER_CACHE_BYTES {
-            return buf;
-        }
-        let Ok(mut inner) = self.inner.lock() else { return buf };
-        if let Some(existing) = inner.entries.get(&key) {
-            return existing.clone();
-        }
-        if inner.bytes.saturating_add(bytes) > FOOTAGE_BUFFER_CACHE_BYTES {
-            inner.entries.clear();
-            inner.bytes = 0;
-        }
-        inner.bytes += bytes;
-        inner.entries.insert(key, buf.clone());
-        buf
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct CompFrameKey {
-    project: usize,
-    comp: ItemId,
-    time: i64,
-    scale: u64,
-    options: u8,
-}
-
-#[derive(Default)]
-struct CompFrameCacheInner {
-    entries: HashMap<CompFrameKey, Arc<Image>>,
-    in_flight: HashMap<CompFrameKey, Arc<OnceLock<Arc<Image>>>>,
-    static_comps: HashMap<(usize, ItemId, i64), bool>,
-    bytes: usize,
-    #[cfg(test)]
-    hits: usize,
-}
-
-/// A bounded, one-frame memo for small static precomps reused by many layers.
-#[derive(Default)]
-pub(crate) struct CompFrameCache(Mutex<CompFrameCacheInner>);
-
-impl CompFrameCache {
-    fn clear(&self) {
-        if let Ok(mut inner) = self.0.lock() {
-            inner.entries.clear();
-            inner.in_flight.clear();
-            inner.static_comps.clear();
-            inner.bytes = 0;
-            #[cfg(test)]
-            {
-                inner.hits = 0;
-            }
-        }
-    }
-
-    fn render(&self, key: CompFrameKey, render: impl FnOnce() -> Image) -> Image {
-        let (flight, _owner) = {
-            let Ok(mut inner) = self.0.lock() else { return render() };
-            if let Some(image) = inner.entries.get(&key).cloned() {
-                #[cfg(test)]
-                {
-                    inner.hits += 1;
-                }
-                return (*image).clone();
-            }
-            match inner.in_flight.get(&key) {
-                // Waiting on a OnceLock blocks a Rayon worker. If all workers in a layer batch
-                // become waiters before the owner runs, the owner can never make progress. A
-                // duplicate render in that case is bounded to the current batch and is safe;
-                // later layers reuse the cached image.
-                Some(_) if rayon::current_thread_index().is_some() => (None, false),
-                Some(flight) => (Some(flight.clone()), false),
-                None => {
-                    let flight = Arc::new(OnceLock::new());
-                    inner.in_flight.insert(key, flight.clone());
-                    (Some(flight), true)
-                }
-            }
-        };
-        let Some(flight) = flight else {
-            let image = Arc::new(render());
-            self.insert(key, &image);
-            return (*image).clone();
-        };
-        #[cfg(test)]
-        if !_owner && let Ok(mut inner) = self.0.lock() {
-            inner.hits += 1;
-        }
-        let image = flight.get_or_init(|| Arc::new(render())).clone();
-        self.insert(key, &image);
-        if let Ok(mut inner) = self.0.lock()
-            && inner.in_flight.get(&key).is_some_and(|current| Arc::ptr_eq(current, &flight))
-        {
-            inner.in_flight.remove(&key);
-        }
-        (*image).clone()
-    }
-
-    fn insert(&self, key: CompFrameKey, image: &Image) {
-        let bytes = image.data.len().saturating_mul(std::mem::size_of::<effectcraft_raster::Px>());
-        if bytes == 0 || bytes > COMP_FRAME_CACHE_SINGLE {
-            return;
-        }
-        let Ok(mut inner) = self.0.lock() else { return };
-        if inner.entries.contains_key(&key) {
-            return;
-        }
-        if inner.bytes.saturating_add(bytes) > COMP_FRAME_CACHE_BYTES {
-            inner.entries.clear();
-            inner.bytes = 0;
-        }
-        inner.entries.insert(key, Arc::new(image.clone()));
-        inner.bytes += bytes;
-    }
-
-    fn is_static(&self, project: &Project, id: ItemId, time: Tick) -> bool {
-        let key = (project as *const Project as usize, id, time.0);
-        if let Ok(inner) = self.0.lock()
-            && let Some(&is_static) = inner.static_comps.get(&key)
-        {
-            return is_static;
-        }
-        let mut path = HashSet::new();
-        let is_static = comp_is_static(project, id, time, &mut path, 0);
-        if let Ok(mut inner) = self.0.lock() {
-            inner.static_comps.insert(key, is_static);
-        }
-        is_static
-    }
-
-    #[cfg(test)]
-    pub(crate) fn hits(&self) -> usize {
-        self.0.lock().map(|inner| inner.hits).unwrap_or(0)
-    }
-}
-
-#[cfg(test)]
-mod comp_frame_cache_tests {
-    use super::{CompFrameCache, CompFrameKey};
-    use crate::{ItemKind, LayerSource, NoFootage, Project, RenderOpts, Renderer};
-    use effectcraft_color::Label;
-    use effectcraft_keyframe::Value;
-    use effectcraft_project::{Comp, Solid};
-    use effectcraft_time::{FrameRate, Tick};
-    use std::sync::{
-        Arc, Barrier,
-        atomic::{AtomicUsize, Ordering},
-    };
-
-    #[test]
-    fn concurrent_static_precomp_misses_do_not_block_rayon_workers() {
-        use rayon::prelude::*;
-
-        let cache = Arc::new(CompFrameCache::default());
-        let barrier = Arc::new(Barrier::new(2));
-        let render_calls = Arc::new(AtomicUsize::new(0));
-        let key = CompFrameKey { project: 1, comp: effectcraft_project::ItemId(1), time: 0, scale: 1.0f64.to_bits(), options: 0 };
-        let pool = rayon::ThreadPoolBuilder::new().num_threads(2).build().expect("two-worker pool");
-        let images = pool.install(|| {
-            (0..2)
-                .into_par_iter()
-                .map(|_| {
-                    let barrier = barrier.clone();
-                    let render_calls = render_calls.clone();
-                    cache.render(key, move || {
-                        render_calls.fetch_add(1, Ordering::SeqCst);
-                        barrier.wait();
-                        crate::Image::filled(1, 1, [0.2, 0.4, 0.6, 1.0])
-                    })
-                })
-                .collect::<Vec<_>>()
-        });
-
-        assert_eq!(render_calls.load(Ordering::SeqCst), 2);
-        assert_eq!(images[0], images[1]);
-        assert_eq!(cache.render(key, || panic!("cached frame should be reused")), images[0]);
-        assert_eq!(cache.hits(), 1);
-    }
-
-    #[test]
-    fn static_precomp_cache_preserves_pixels_for_repeated_layers() {
-        let mut project = Project::default();
-        let main = Comp::new(200, 100, FrameRate::FPS_30, Tick::from_seconds_f64(1.0));
-        let main_id = project.add_item("Main", Label::None, None, ItemKind::Comp(Arc::new(main.clone())));
-
-        let mut plate = Comp::new(40, 20, FrameRate::FPS_30, Tick::from_seconds_f64(1.0));
-        let solid_id =
-            project.add_item("Plate solid", Label::Red, None, ItemKind::Solid(Solid { color: [0.3, 0.6, 0.9], width: 40, height: 20, pixel_aspect: 1.0 }));
-        plate.layers = vec![effectcraft_project::build::layer(&mut project, &plate, "Plate", LayerSource::Solid { item: solid_id }, (40, 20), None)].into();
-        let plate_id = project.add_item("Static plate", Label::Sandstone, None, ItemKind::Comp(Arc::new(plate)));
-
-        let mut layers = Vec::new();
-        for index in 0..4 {
-            let mut layer =
-                effectcraft_project::build::layer(&mut project, &main, &format!("Plate {index}"), LayerSource::Comp { item: plate_id }, (40, 20), None);
-            assert!(layer.props.prop_mut("transform/opacity").is_some_and(|prop| {
-                prop.value = Value::Scalar(40.0 + index as f64 * 10.0);
-                true
-            }));
-            layers.push(layer);
-        }
-        assert!(project.comp_mut(main_id).is_some_and(|comp| {
-            comp.layers = layers.into();
-            true
-        }));
-
-        let footage = NoFootage;
-        let mut uncached = Renderer::new(&project, &footage, RenderOpts::default());
-        uncached.cache_static_comps = false;
-        let expected = uncached.comp_frame(main_id, Tick::ZERO);
-
-        let cached = Renderer::new(&project, &footage, RenderOpts::default());
-        let actual = cached.comp_frame(main_id, Tick::ZERO);
-        assert_eq!(actual, expected);
-    }
-
-    #[test]
-    fn parallel_prepared_layers_match_serial_stack_order() {
-        let mut project = Project::default();
-        let main = Comp::new(200, 100, FrameRate::FPS_30, Tick::from_seconds_f64(1.0));
-        let main_id = project.add_item("Main", Label::None, None, ItemKind::Comp(Arc::new(main.clone())));
-
-        let mut plate = Comp::new(40, 20, FrameRate::FPS_30, Tick::from_seconds_f64(1.0));
-        let solid_id =
-            project.add_item("Plate solid", Label::Red, None, ItemKind::Solid(Solid { color: [0.3, 0.6, 0.9], width: 40, height: 20, pixel_aspect: 1.0 }));
-        plate.layers = vec![effectcraft_project::build::layer(&mut project, &plate, "Plate", LayerSource::Solid { item: solid_id }, (40, 20), None)].into();
-        let plate_id = project.add_item("Static plate", Label::Sandstone, None, ItemKind::Comp(Arc::new(plate)));
-
-        let modes = [crate::BlendMode::Normal, crate::BlendMode::Multiply, crate::BlendMode::Screen, crate::BlendMode::Add];
-        let mut layers = Vec::new();
-        for index in 0..32 {
-            let mut layer =
-                effectcraft_project::build::layer(&mut project, &main, &format!("Plate {index}"), LayerSource::Comp { item: plate_id }, (40, 20), None);
-            layer.blend_mode = modes[index % modes.len()];
-            assert!(layer.props.prop_mut("transform/opacity").is_some_and(|prop| {
-                prop.value = Value::Scalar([43.0, 61.0, 79.0, 94.0][index % 4]);
-                true
-            }));
-            assert!(layer.props.prop_mut("transform/position").is_some_and(|prop| {
-                let x = if index % 7 == 0 { -100.0 } else { 20.0 + (index * 7 % 160) as f64 };
-                let y = if index % 11 == 0 { -80.0 } else { 20.0 + (index * 11 % 60) as f64 };
-                prop.value = Value::Vec3([x, y, 0.0]);
-                true
-            }));
-            layers.push(layer);
-        }
-        assert!(project.comp_mut(main_id).is_some_and(|comp| {
-            comp.layers = layers.into();
-            true
-        }));
-
-        let footage = NoFootage;
-        let opts = RenderOpts { motion_blur: false, ..RenderOpts::default() };
-        let mut serial = Renderer::new(&project, &footage, opts);
-        let profile = std::sync::Mutex::new(Vec::new());
-        serial.profile = Some(&profile); // Forces the ordinary full-frame layer path.
-        let expected = serial.comp_frame(main_id, Tick::ZERO);
-
-        let parallel = Renderer::new(&project, &footage, opts);
-        let actual = parallel.comp_frame(main_id, Tick::ZERO);
-        assert_eq!(actual, expected);
-    }
-}
-
-fn props_are_static(group: &PropGroup, depth: usize) -> bool {
-    depth < crate::MAX_FX_DEPTH
-        && group.children.iter().all(|node| match node {
-            Node::Prop(prop) => prop.keys.is_empty() && !prop.has_expression(),
-            Node::Group(sub) => props_are_static(sub, depth + 1),
-        })
-}
-
-fn props_have_expression(group: &PropGroup, depth: usize) -> bool {
-    depth >= crate::MAX_FX_DEPTH
-        || group.children.iter().any(|node| match node {
-            Node::Prop(prop) => prop.has_expression(),
-            Node::Group(sub) => props_have_expression(sub, depth + 1),
-        })
-}
-
-fn comp_is_static(project: &Project, id: ItemId, time: Tick, path: &mut HashSet<ItemId>, depth: usize) -> bool {
-    if depth >= crate::MAX_FX_DEPTH || !path.insert(id) {
-        return false;
-    }
-    let Some(comp) = project.comp(id) else {
-        path.remove(&id);
-        return false;
-    };
-    let ctx = EvalCtx::new(project, id, comp, time);
-    let static_layers = !comp.layers.is_empty()
-        && comp.layers.iter().all(|layer| {
-            if !layer.switches.video
-                || layer.is_3d()
-                || layer.parent.is_some()
-                || layer.switches.adjustment
-                || layer.switches.collapse
-                || layer.preserve_transparency
-                || layer.track_matte.is_some()
-                || layer.masks().is_some_and(|m| !m.children.is_empty())
-                || layer.switches.effects && layer.effects().is_some_and(|fx| fx.groups().any(|group| group.enabled))
-                || !props_are_static(&layer.props, 0)
-                || styles::active(&ctx, layer)
-            {
-                return false;
-            }
-            match layer.source {
-                LayerSource::Solid { item } => project.item(item).is_some_and(|it| it.proxy.is_none() && matches!(&it.kind, ItemKind::Solid(_))),
-                LayerSource::Text | LayerSource::Shape => true,
-                LayerSource::Footage { item } => project
-                    .item(ctx.media_item(layer, item))
-                    .is_some_and(|it| it.proxy.is_none() && matches!(&it.kind, ItemKind::Footage(f) if f.kind == FootageKind::Still)),
-                LayerSource::Comp { item } => {
-                    let nested_time = ctx.nested_time(layer);
-                    project.item(item).is_some_and(|it| it.proxy.is_none()) && comp_is_static(project, item, nested_time, path, depth + 1)
-                }
-                _ => false,
-            }
-        });
-    path.remove(&id);
-    static_layers
-}
+use effectcraft_project::LayerId;
 
 /// Coordinate space and stack range shared by CPU and accelerated effect evaluation.
 #[derive(Clone, Copy)]
@@ -401,6 +17,24 @@ pub(crate) struct EffectStack {
     pub adjustment: bool,
     pub limit: usize,
     pub origin: [f64; 2],
+}
+
+/// A footage layer's source as the decoded picture itself (see [`Renderer::footage_picture`]):
+/// its buffer in layer space is `img` at offset `[0, 0]` and `scale`; in effect space (what
+/// [`Renderer::layer_input`] gives) at `effect_offset`.
+#[derive(Clone, Debug)]
+pub struct FootagePicture {
+    pub img: Arc<Image>,
+    pub scale: f64,
+    pub effect_offset: [f64; 2],
+}
+
+/// How a decoded footage frame becomes a layer buffer ([`Renderer::footage_buf`]).
+enum FootageLayout {
+    /// Its own pixels, at this buffer scale.
+    Native { scale: f64 },
+    /// Resampled to `width`×`height` at this buffer scale.
+    Resample { width: u32, height: u32, scale: f64 },
 }
 
 /// A property value an Essential Properties override gives a layer of a collapsed precomp.
@@ -486,19 +120,16 @@ fn collapsed_instance(ctx: &EvalCtx, layer: &Layer, item: ItemId) -> Option<(Vec
 }
 
 impl<'a> Renderer<'a> {
+    /// A renderer over `project` and `footage` with the given options.
     pub fn new(project: &'a Project, footage: &'a dyn FootageSource, opts: RenderOpts) -> Renderer<'a> {
-        super::configure_parallelism();
         Renderer {
             project,
             footage,
             expr: None,
             opts,
             cache: None,
+            reads: None,
             profile: None,
-            comp_frames: Arc::new(CompFrameCache::default()),
-            shape_sources: Arc::new(ShapeSourceCache::default()),
-            footage_buffers: Arc::new(FootageBufferCache::default()),
-            cache_static_comps: true,
             accel: None,
             depth: 0,
             pipe: color::Pipe::of(&project.settings),
@@ -510,6 +141,7 @@ impl<'a> Renderer<'a> {
             top: true,
             through: [None; MAX_THROUGH],
             through_lost: false,
+            whole_raster: false,
         }
     }
 
@@ -517,6 +149,67 @@ impl<'a> Renderer<'a> {
     /// called off, as they may have come back empty ([`FootageSource::called_off`], #329).
     pub(crate) fn cache_to_keep(&self) -> Option<&'a LayerCache> {
         self.cache.filter(|_| !self.footage.called_off())
+    }
+
+    /// `read`, a read of this render's footage source, with the files it uses noted in
+    /// [`Renderer::reads`] (see [`FootageSource::recording`]).
+    pub(crate) fn read<R>(&self, read: impl FnOnce() -> Option<R>) -> Option<R> {
+        let Some(log) = self.reads else { return read() };
+        let (mut read, mut out) = (Some(read), None);
+        self.footage.recording(log, &mut || out = read.take().and_then(|f| f()));
+        out
+    }
+
+    /// `ctx` noting what it reads (fonts, `sampleImage`) in this render's [`Renderer::reads`]:
+    /// a context made by an outer render carries that render's log, not the one of the buffer
+    /// [`Renderer::recorded`] makes.
+    pub(crate) fn with_reads<'c>(&'c self, ctx: &EvalCtx<'c>) -> EvalCtx<'c> {
+        EvalCtx { reads: self.reads, ..*ctx }
+    }
+
+    /// The buffer the layer cache keeps under `key`, with the files it was made of noted in
+    /// [`Renderer::reads`].
+    pub(crate) fn cached(&self, key: Option<u64>) -> Option<(Arc<Buf>, Arc<ReadFiles>)> {
+        let (buf, files) = self.cache?.get(key?)?;
+        if let Some(log) = self.reads {
+            log.note_all(&files);
+        }
+        Some((buf, files))
+    }
+
+    /// Keep `buf`, made of `files`, under `key` (see [`Renderer::recorded`]): the buffer the cache
+    /// keeps (another worker's, if it kept one first), or `buf` when nothing is kept, with the
+    /// files that buffer was made of. Another worker's files are noted in [`Renderer::reads`]
+    /// too: its pixels are the ones this render uses (a file that changed between the two reads
+    /// then has two identities, and the list is incomplete).
+    pub(crate) fn keep(&self, key: Option<u64>, buf: Arc<Buf>, files: &Arc<ReadFiles>) -> (Arc<Buf>, Arc<ReadFiles>) {
+        let (Some(c), Some(k)) = (self.cache_to_keep(), key) else { return (buf, files.clone()) };
+        let (kept, kept_files) = c.insert(k, buf, files.clone());
+        if !Arc::ptr_eq(&kept_files, files)
+            && let Some(log) = self.reads
+        {
+            log.note_all(&kept_files);
+        }
+        (kept, kept_files)
+    }
+
+    /// Run `make`, which makes a buffer to keep under `key` in the layer cache, on this renderer
+    /// with its reads noted apart: what `make` returns and the files it read (from the footage
+    /// source, or the files of cached buffers it used), which go to [`Renderer::reads`] too. A
+    /// cached buffer then reports the files it was made of whichever render uses it. Without a
+    /// cache or a key, `make` runs on this renderer as it is (no files: nothing is kept).
+    pub(crate) fn recorded<T>(&self, key: Option<u64>, make: impl FnOnce(&Renderer<'_>) -> T) -> (T, Arc<ReadFiles>) {
+        if key.is_none() || self.cache.is_none() {
+            return (make(self), Arc::default());
+        }
+        // (the generation before any read: a file dropped while `make` runs makes it stale)
+        let log = self.cache.and_then(LayerCache::drop_generation).map_or_else(ReadLog::new, ReadLog::starting_at);
+        let out = make(&Renderer { reads: Some(&log), ..*self });
+        let files = log.into_files();
+        if let Some(own) = self.reads {
+            own.note_all(&files);
+        }
+        (out, Arc::new(files))
     }
 
     /// A layer's Quality switch, limited by the precomp layers above it when
@@ -531,6 +224,24 @@ impl<'a> Renderer<'a> {
             Some((q, _)) if rank(q) > rank(layer.switches.quality) => q,
             _ => layer.switches.quality,
         }
+    }
+
+    /// What this renderer passes down to the layers it draws beyond their own switches
+    /// ([`RenderOpts::nested_switches`], the switches inherited from the precomp layers above,
+    /// motion blur on): part of the cache key of a buffer that reads other layers.
+    pub(crate) fn nested_look(&self) -> u64 {
+        let inherited = match self.inherited {
+            None => 0,
+            Some((q, mb)) => {
+                let q = match q {
+                    Quality::Best => 0,
+                    Quality::Draft => 1,
+                    Quality::Wireframe => 2,
+                };
+                1 + q * 2 + u64::from(mb)
+            }
+        };
+        0x6e65_7374_0000_0000 | inherited << 2 | u64::from(self.opts.nested_switches) << 1 | u64::from(self.opts.motion_blur)
     }
 
     /// A layer's Motion Blur switch, limited by the precomp layers above it.
@@ -566,7 +277,9 @@ impl<'a> Renderer<'a> {
             top: false,
             through: [None; MAX_THROUGH],
             through_lost: false,
-            ..self.clone()
+            // Effects and nested renders need whole layer-space pixels.
+            whole_raster: true,
+            ..*self
         }
     }
 
@@ -664,16 +377,7 @@ impl<'a> Renderer<'a> {
             *slot = Some(link);
         }
         Some((
-            Renderer {
-                opts: self.nested_opts(),
-                depth: self.depth + 1,
-                outer,
-                opacity_mul: opacity,
-                collapse3d: Some(c3),
-                through,
-                through_lost,
-                ..self.clone()
-            },
+            Renderer { opts: self.nested_opts(), depth: self.depth + 1, outer, opacity_mul: opacity, collapse3d: Some(c3), through, through_lost, ..*self },
             nctx,
         ))
     }
@@ -715,8 +419,9 @@ impl<'a> Renderer<'a> {
         }
         let (scale, draft, blur) = (self.raster_scale(ctx, layer), self.opts.draft, self.mb_on(ctx, layer));
         let prev = ctx.time - ctx.comp.frame_rate.frame_duration();
-        let now = cache::layer_key(ctx, layer, scale, draft, blur);
-        now.is_some() && now == cache::layer_key(&ctx.at(prev), layer, scale, draft, blur)
+        let before = ctx.at(prev);
+        let now = self.clipped_key(ctx, layer, cache::layer_key(ctx, layer, scale, draft, blur));
+        now.is_some() && now == self.clipped_key(&before, layer, cache::layer_key(&before, layer, scale, draft, blur))
     }
 
     /// Rasterisation scale of a layer's source: the output scale, or — for text and shape layers,
@@ -750,12 +455,71 @@ impl<'a> Renderer<'a> {
         // a whole number maps the unit vectors to lengths a hair over 1, which must stay 1 (#390:
         // rounded up to 2^¼, unscaled text was drawn larger and resampled, softer).
         let mut k = 2f64.powf((k.log2() * 4.0 - 1e-6).ceil() / 4.0).clamp(1.0 / 16.0, 64.0);
-        // Keep the buffer within about 16 million pixels.
+        // Keep the buffer within about 16 million pixels (of the part the output shows, when
+        // only that is rasterised: see `raster_clip`).
         if let Some(b) = content_bounds(ctx, layer) {
+            let b = match self.raster_clip(ctx, layer) {
+                Some(c) => {
+                    let r = kurbo::Rect::new(b[0], b[1], b[2], b[3]).intersect(c);
+                    [r.x0, r.y0, r.x1, r.y1]
+                }
+                None => b,
+            };
             let area = ((b[2] - b[0]) * (b[3] - b[1])).max(1.0) * s * s;
             k = k.min((16.0e6 / area).sqrt().max(1.0));
         }
         s * k
+    }
+
+    /// The layer-space part of a 3D text or shape layer the output shows, when only that part
+    /// needs rasterising (#1388: text close to the camera was rasterised whole at up to 16
+    /// million pixels, a quarter gigabyte per frame worker, though the frame showed a fraction
+    /// of it; behind the camera it was rasterised and not drawn). `None` rasterises it whole:
+    /// whenever pixels outside the frame can matter — effects, layer styles, masks, motion blur,
+    /// depth of field, lights (shadows and transmission), Advanced 3D, per-character 3D, a
+    /// collapsed 2D transform — or the visible part can't be bounded (see
+    /// [`three_d::compose::visible_clip`]).
+    pub(crate) fn raster_clip(&self, ctx: &EvalCtx, layer: &Layer) -> Option<kurbo::Rect> {
+        if self.whole_raster || !layer.is_3d() || !matches!(layer.source, LayerSource::Text | LayerSource::Shape) || self.outer.is_some() {
+            return None;
+        }
+        if (layer.switches.effects && layer.effects().is_some_and(|fx| !fx.children.is_empty()))
+            || layer.masks().is_some_and(|m| !m.children.is_empty())
+            || styles::active(ctx, layer)
+            || ctx.comp.layers.iter().any(|l| matches!(l.source, LayerSource::Light { .. }))
+            || self.is_adv3d(ctx)
+            || (matches!(layer.source, LayerSource::Text) && (text::per_char_3d(ctx, layer) || text::animator_blur(ctx, layer)))
+        {
+            return None;
+        }
+        let v = three_d::compose::visible_clip(self, ctx, layer)?;
+        if v.area() <= 0.0 {
+            // Behind the camera.
+            return Some(v);
+        }
+        let b = content_bounds(ctx, layer).map(|b| kurbo::Rect::new(b[0], b[1], b[2], b[3]))?;
+        if v.x0 <= b.x0 && v.y0 <= b.y0 && v.x1 >= b.x1 && v.y1 >= b.y1 {
+            return None;
+        }
+        // Whole cells of a layer-space grid whose cell is about a quarter of the part that shows,
+        // rounded down to a power of two: a moving camera keeps one raster (and its cache entry)
+        // while that part stays within the same cells, and a dolly changes the grid only at each
+        // doubling. The cells cover at most about 2.25 times the part that shows. Worth it only
+        // when it leaves out at least half of the content.
+        let c = 2f64.powf(((v.width().max(v.height()) / 4.0).max(1e-6)).log2().floor());
+        let snap = |v: f64, up: bool| if up { (v / c).ceil() * c } else { (v / c).floor() * c };
+        // (Not cut to the content bounds: a stroke or a glyph's padding reaches past them.)
+        let cells = kurbo::Rect::new(snap(v.x0, false), snap(v.y0, false), snap(v.x1, true), snap(v.y1, true));
+        (cells.is_finite() && cells.intersect(b).area() <= b.area() * 0.5).then_some(cells)
+    }
+
+    /// A layer content cache key that also names the part rasterised ([`Self::raster_clip`]).
+    pub(crate) fn clipped_key(&self, ctx: &EvalCtx, layer: &Layer, key: Option<u64>) -> Option<u64> {
+        let k = key?;
+        Some(match self.raster_clip(ctx, layer) {
+            Some(c) => raster_clip_key(k, c),
+            None => k,
+        })
     }
 
     /// Draw a Wireframe-quality layer: its bounds as a one-pixel outline.
@@ -765,14 +529,25 @@ impl<'a> Renderer<'a> {
         }
     }
 
+    /// The evaluation context of `comp` at `t`, carrying this renderer's expressions, footage and read log.
     pub(crate) fn ctx(&self, comp_id: ItemId, comp: &'a Comp, t: Tick) -> EvalCtx<'a> {
-        EvalCtx { project: self.project, comp_id, comp, time: t, expr: self.expr, footage: Some(self.footage), property_overrides: &[], media_overrides: &[] }
+        EvalCtx {
+            project: self.project,
+            comp_id,
+            comp,
+            time: t,
+            expr: self.expr,
+            footage: Some(self.footage),
+            property_overrides: &[],
+            media_overrides: &[],
+            reads: self.reads,
+        }
     }
 
     /// This renderer with another accelerator (or none): the passes of
     /// [`passes::in_passes`] render with the accelerator, its CPU fallback without.
     pub fn with_accel(&self, accel: Option<&'a dyn Accelerator>) -> Renderer<'a> {
-        Renderer { accel, ..self.clone() }
+        Renderer { accel, ..*self }
     }
 
     /// The accelerator to use for this render, if any (see [`Backend`]).
@@ -788,66 +563,22 @@ impl<'a> Renderer<'a> {
     /// Render a composition at comp time `t` (transparent background, comp size × scale).
     /// Top-level frames go to the GPU when [`Self::active_accel`] is set and handles them.
     pub fn comp_frame(&self, comp_id: ItemId, t: Tick) -> Image {
-        if self.depth == 0 {
-            self.comp_frames.clear();
-        }
-        if self.cache_static_comps
-            && let Some(key) = self.comp_frame_cache_key(comp_id, t)
-        {
-            return self.comp_frames.render(key, || self.comp_frame_uncached(comp_id, t));
-        }
-        self.comp_frame_uncached(comp_id, t)
+        self.comp_frame_with(comp_id, t, false, |a| Ok::<_, std::convert::Infallible>(a.comp_frame(self, comp_id, t))).unwrap_or_else(|never| match never {})
     }
 
-    fn comp_frame_cache_key(&self, comp_id: ItemId, t: Tick) -> Option<CompFrameKey> {
-        self.comp_frame_cache_key_for(comp_id, t, false)
+    /// Render a frame, validating the accelerated attempt before starting any CPU fallback.
+    /// The caller's scope must run only the accelerator, not this whole method: a GPU fault
+    /// must release failed resources before a potentially large CPU render (#3357).
+    /// A scope error returns immediately; the caller can then retry with a fresh CPU renderer
+    /// without accelerator-produced cache entries. Healthy declines and Auto timing retain
+    /// the same behavior as [`Self::comp_frame`]. Its fallback disables acceleration for
+    /// effects too: GPU work must never escape the supplied error scope.
+    pub fn comp_frame_scoped<E>(&self, comp_id: ItemId, t: Tick, scope: impl FnOnce(&dyn Accelerator) -> Result<Option<Image>, E>) -> Result<Image, E> {
+        self.comp_frame_with(comp_id, t, true, scope)
     }
 
-    /// A static nested comp raster can be reused by the GPU within a top-level frame.
-    pub fn gpu_static_comp_frame_key(&self, comp_id: ItemId, t: Tick) -> Option<CompFrameKey> {
-        self.cache_static_comps.then(|| self.comp_frame_cache_key_for(comp_id, t, true)).flatten()
-    }
-
-    fn comp_frame_cache_key_for(&self, comp_id: ItemId, t: Tick, gpu: bool) -> Option<CompFrameKey> {
-        if self.depth == 0
-            || self.profile.is_some()
-            || (!gpu && self.active_accel().is_some())
-            || self.opts.roi.is_some()
-            || self.opts.view.is_some()
-            || self.footage.called_off()
-            || self.outer.is_some()
-            || self.collapse3d.is_some()
-            || self.through_lost
-            || self.through.iter().any(Option::is_some)
-        {
-            return None;
-        }
-        let (inherited_quality, inherited_motion_blur) = self.inherited.map_or((0, false), |(quality, motion_blur)| {
-            (
-                match quality {
-                    Quality::Best => 0,
-                    Quality::Draft => 1,
-                    Quality::Wireframe => 2,
-                },
-                motion_blur,
-            )
-        });
-        self.comp_frames.is_static(self.project, comp_id, t).then_some(CompFrameKey {
-            project: self.project as *const Project as usize,
-            comp: comp_id,
-            time: t.0,
-            scale: self.opts.scale.to_bits(),
-            options: u8::from(self.opts.motion_blur)
-                | (u8::from(self.opts.draft) << 1)
-                | (u8::from(self.opts.nested_switches) << 2)
-                | (u8::from(self.opts.guides) << 3)
-                | (u8::from(self.opts.draft_shadows) << 4)
-                | (inherited_quality << 5)
-                | (u8::from(inherited_motion_blur) << 7),
-        })
-    }
-
-    fn comp_frame_uncached(&self, comp_id: ItemId, t: Tick) -> Image {
+    fn comp_frame_with<E>(&self, comp_id: ItemId, t: Tick, scoped: bool, scope: impl FnOnce(&dyn Accelerator) -> Result<Option<Image>, E>) -> Result<Image, E> {
+        let cpu = if scoped { self.with_accel(None) } else { self.with_accel(self.accel) };
         // Classic 3D runs composite on the GPU too (M12.7), so Auto sends 3D comps there as well;
         // Auto renders each comp on whichever compositor measured faster ([`AutoPick`]).
         if self.depth == 0
@@ -856,24 +587,24 @@ impl<'a> Renderer<'a> {
             let auto = self.frame_auto(a, comp_id, false);
             if auto.is_none_or(|(p, key)| p.choose(key)) {
                 let t0 = web_time::Instant::now();
-                if let Some(img) = a.comp_frame(self, comp_id, t) {
+                if let Some(img) = scope(a)? {
                     if let Some((p, key)) = auto {
                         p.record(key, true, t0.elapsed().as_secs_f64() * 1e3);
                     }
-                    return img;
+                    return Ok(img);
                 }
                 if let Some((p, key)) = auto {
                     p.declined(key);
                 }
             }
             let t0 = web_time::Instant::now();
-            let img = self.comp_frame_cpu(comp_id, t);
+            let img = cpu.comp_frame_cpu(comp_id, t);
             if let Some((p, key)) = auto {
                 p.record(key, false, t0.elapsed().as_secs_f64() * 1e3);
             }
-            return img;
+            return Ok(img);
         }
-        self.comp_frame_cpu(comp_id, t)
+        Ok(cpu.comp_frame_cpu(comp_id, t))
     }
 
     /// The Auto timing history and key for a top-level frame of `comp` (`None` unless the
@@ -898,7 +629,7 @@ impl<'a> Renderer<'a> {
             && comp.has_3d()
             && (roi_inside(r, comp.width, comp.height) || comp.renderer == effectcraft_project::Renderer::Advanced3D)
         {
-            let full = Renderer { opts: RenderOpts { roi: None, ..self.opts }, ..self.clone() }.comp_frame(comp_id, t);
+            let full = Renderer { opts: RenderOpts { roi: None, ..self.opts }, ..*self }.comp_frame(comp_id, t);
             let (x0, y0) = ((r[0] * s).round() as i64, (r[1] * s).round() as i64);
             let (rw, rh) = (((r[2] * s).round() as u32).max(1), ((r[3] * s).round() as u32).max(1));
             let mut out = Image::new(rw, rh);
@@ -932,14 +663,15 @@ impl<'a> Renderer<'a> {
             self.pipe.quantize(&mut canvas);
         }
         // The top-level comp leaves the working space for the (sRGB) display / output.
+        let out = self.output_pipe();
         if self.depth == 0
-            && let Some(c) = self.pipe.output()
+            && let Some(c) = out.output()
         {
             color::convert(&mut canvas, &c);
             self.pipe.quantize(&mut canvas);
         }
         if self.depth == 0
-            && let Some((lin, mode, enc)) = self.pipe.output_hdr()
+            && let Some((lin, mode, enc)) = out.output_hdr()
         {
             color::output_hdr(&mut canvas, lin, mode, enc);
             self.pipe.quantize(&mut canvas);
@@ -952,21 +684,8 @@ impl<'a> Renderer<'a> {
     fn draw_comp(&self, ctx: &EvalCtx<'a>, canvas: &mut Image, mut blank: bool) {
         // Bottom-to-top, with runs of consecutive 3D layers depth-sorted (farthest first).
         let visible = self.visible_layers(ctx);
-        let occluded = self.occluded_bounded_layers(ctx, &visible, canvas.width, canvas.height);
-        let parallel_prepare = self.can_prepare_layers_parallel();
         let mut i = 0;
         while i < visible.len() {
-            if parallel_prepare && self.can_prepare_layer(visible[i]) {
-                let mut end = i + 1;
-                while end < visible.len() && self.can_prepare_layer(visible[end]) {
-                    end += 1;
-                }
-                if end - i >= 16 {
-                    self.draw_comp_parallel_prepared(ctx, &visible[i..end], &occluded[i..end], canvas, &mut blank);
-                    i = end;
-                    continue;
-                }
-            }
             if visible[i].is_3d() {
                 let mut j = i;
                 while j < visible.len() && visible[j].is_3d() {
@@ -977,13 +696,9 @@ impl<'a> Renderer<'a> {
                 self.pipe.quantize(canvas);
                 blank = false;
             } else {
-                let changed = if occluded[i] {
-                    Region::Empty
-                } else {
-                    match self.collapsed(ctx, visible[i]) {
-                        Some(collapsed) => self.draw_collapsed(ctx, visible[i], &collapsed, canvas, blank),
-                        None => self.draw_layer(ctx, visible[i], canvas, blank),
-                    }
+                let changed = match self.collapsed(ctx, visible[i]) {
+                    Some(collapsed) => self.draw_collapsed(ctx, visible[i], &collapsed, canvas, blank),
+                    None => self.draw_layer(ctx, visible[i], canvas, blank),
                 };
                 i += 1;
                 // 8/16 bpc: the comp is an integer buffer after every layer (only the pixels the
@@ -991,176 +706,6 @@ impl<'a> Renderer<'a> {
                 self.pipe.quantize_region(canvas, changed);
                 blank = false;
             }
-        }
-    }
-
-    /// Parallel source processing is safe when every layer can be prepared without reading the
-    /// current comp canvas. The row batch below keeps each output pixel's layer order intact.
-    fn can_prepare_layers_parallel(&self) -> bool {
-        self.depth == 0
-            && self.profile.is_none()
-            && self.active_accel().is_none()
-            && self.opts.roi.is_none()
-            && self.opts.view.is_none()
-            && self.outer.is_none()
-            && self.collapse3d.is_none()
-            && self.inherited.is_none()
-            && !self.through_lost
-            && self.through.iter().all(Option::is_none)
-    }
-
-    fn can_prepare_layer(&self, layer: &Layer) -> bool {
-        !layer.is_3d()
-            && !layer.switches.adjustment
-            && !layer.switches.collapse
-            && !layer.preserve_transparency
-            && layer.track_matte.is_none()
-            && layer.parent.is_none()
-            && !layer.blend_mode.is_stencil()
-            && self.quality(layer) != Quality::Wireframe
-            && !props_have_expression(&layer.props, 0)
-    }
-
-    /// Whether this top-level 2D layer can have its CPU pixels prepared in parallel for a GPU
-    /// compositor. The workers only build ordinary layer buffers; all GPU calls remain on the
-    /// compositor thread.
-    pub fn can_prepare_gpu_layer(&self, layer: &Layer) -> bool {
-        self.depth == 0
-            && self.profile.is_none()
-            && self.opts.roi.is_none()
-            && self.opts.view.is_none()
-            && self.outer.is_none()
-            && self.collapse3d.is_none()
-            && self.inherited.is_none()
-            && !self.through_lost
-            && self.through.iter().all(Option::is_none)
-            && self.can_prepare_layer(layer)
-            && !matches!(layer.source, LayerSource::Comp { .. })
-            && !(layer.switches.effects && layer.effects().is_some_and(|fx| !fx.children.is_empty()))
-    }
-
-    /// Prepare a bounded batch in parallel for an accelerator that still composites each layer
-    /// in stack order. The CPU-only renderer clone keeps worker tasks away from the GPU backend.
-    pub fn prepare_gpu_layer_batch(&self, ctx: &EvalCtx, layers: &[&Layer], occluded: &[bool], width: u32, height: u32) -> Option<Vec<Option<StyledLayer>>> {
-        if layers.len() != occluded.len() || layers.iter().any(|layer| !self.can_prepare_gpu_layer(layer)) {
-            return None;
-        }
-        let mut cpu = self.clone();
-        cpu.accel = None;
-        let mut unquantized = cpu.clone();
-        unquantized.pipe.levels = None;
-        Some(
-            layers
-                .par_iter()
-                .zip(occluded.par_iter())
-                .map(|(&layer, &skip)| {
-                    if skip || cpu.layer_opacity(ctx, layer) <= 0.0 || cpu.layer_outside_canvas(ctx, layer, width, height) {
-                        return None;
-                    }
-                    // With no layer cache, plain layers can upload their masked source directly;
-                    // the GPU quantizes each source texel before sampling, matching the CPU's
-                    // pre-transform quantization while avoiding a full CPU image pass. Preserve
-                    // the regular path whenever cached buffers, styles, motion blur or a blend
-                    // space conversion make that ordering observable elsewhere.
-                    let defer_quantize = self.cache.is_none()
-                        && self.pipe.levels.is_some()
-                        && self.pipe.to_blend().is_none()
-                        && !cpu.mb_on(ctx, layer)
-                        && !styles::active(ctx, layer);
-                    let renderer = if defer_quantize { &unquantized } else { &cpu };
-                    renderer.styled_for_gpu_draw(ctx, layer).map(|mut st| {
-                        st.quantize_source = defer_quantize;
-                        renderer.styled_to_blend(st)
-                    })
-                })
-                .collect(),
-        )
-    }
-
-    /// Prepare bounded batches so a 5,000-layer frame never retains thousands of full layer
-    /// buffers at once. The source pass is parallel; affine rows then visit the prepared layers
-    /// in stack order, so every pixel sees the same blend and quantisation sequence.
-    fn draw_comp_parallel_prepared(&self, ctx: &EvalCtx<'a>, layers: &[&Layer], occluded: &[bool], canvas: &mut Image, blank: &mut bool) {
-        const BATCH: usize = 32;
-        for start in (0..layers.len()).step_by(BATCH) {
-            let end = (start + BATCH).min(layers.len());
-            let prepared: Vec<_> = layers[start..end]
-                .par_iter()
-                .enumerate()
-                .map(|(offset, layer)| {
-                    if occluded[start + offset] || self.layer_outside_canvas(ctx, layer, canvas.width, canvas.height) {
-                        return None;
-                    }
-                    let opacity = ctx.opacity(layer) as f32 * self.opacity_mul;
-                    if opacity <= 0.0 || self.empty_precomp(ctx, layer) {
-                        return None;
-                    }
-                    self.styled_for_draw(ctx, layer, None).map(|st| (self.styled_to_blend(st), opacity))
-                })
-                .collect();
-
-            let row_plans: Option<Vec<_>> = if canvas.width > 0 {
-                prepared
-                    .par_iter()
-                    .zip(layers[start..end].par_iter())
-                    .enumerate()
-                    .map(|(offset, (prepared, layer))| -> Option<Option<_>> {
-                        let Some((st, opacity)) = prepared else { return Some(None) };
-                        if !st.plain {
-                            return None;
-                        }
-                        let placement = self.placement(ctx, layer, &st.body);
-                        let [matrix] = placement.matrices.as_slice() else { return None };
-                        let layer_blank = *blank && offset == 0;
-                        let footprint = self.footprint(ctx, layer, &st.body, *opacity, layer_blank);
-                        let quantize = if footprint == Region::Empty { None } else { self.pipe.levels };
-                        let opts = WarpOpts { sampling: placement.sampling, opacity: *opacity, mode: layer.blend_mode, seed: layer.id.0 as u32, clip: None };
-                        let plan = effectcraft_raster::prepare_warp_rows(
-                            &st.body.img,
-                            matrix,
-                            &opts,
-                            canvas.width,
-                            canvas.height,
-                            quantize,
-                            self.source_is_known_opaque(ctx, layer),
-                        )?;
-                        Some(Some(plan))
-                    })
-                    .collect::<Option<Vec<_>>>()
-            } else {
-                None
-            };
-
-            if let Some(row_plans) = row_plans {
-                let width = canvas.width as usize;
-                const TILE_ROWS: usize = 8;
-                let rows_per_tile = width * TILE_ROWS;
-                let mut tile_plans = vec![Vec::new(); canvas.height.div_ceil(TILE_ROWS as u32) as usize];
-                for plan in row_plans.iter().flatten() {
-                    let (y0, y1) = plan.y_bounds();
-                    if y0 < y1 {
-                        for tile_y in y0 / TILE_ROWS..=(y1 - 1) / TILE_ROWS {
-                            tile_plans[tile_y].push(plan);
-                        }
-                    }
-                }
-                canvas.data.par_chunks_mut(rows_per_tile).enumerate().for_each(|(tile_y, tile)| {
-                    for (dy, row) in tile.chunks_mut(width).enumerate() {
-                        let y = tile_y * TILE_ROWS + dy;
-                        for plan in &tile_plans[tile_y] {
-                            plan.blend_row(y, row);
-                        }
-                    }
-                });
-            } else {
-                let mut draw_blank = *blank;
-                for (layer, prepared) in layers[start..end].iter().zip(prepared) {
-                    let changed = prepared.map_or(Region::Empty, |(st, opacity)| self.draw_prepared_layer(ctx, layer, st, canvas, opacity, draw_blank));
-                    self.pipe.quantize_region(canvas, changed);
-                    draw_blank = false;
-                }
-            }
-            *blank = false;
         }
     }
 
@@ -1261,6 +806,7 @@ impl<'a> Renderer<'a> {
             working_linear: self.pipe.linear,
             float_depth: self.pipe.levels.is_none(),
             shutter: self.mb_on(ctx, layer).then_some((ctx.comp.shutter_angle, ctx.comp.shutter_phase, ctx.comp.motion_blur_samples)),
+            layer_span: crate::eval::layer_span(self.project, layer),
         };
         // Video effects in stack order (index, group, spec); disabled and audio effects skipped.
         let stack: Vec<(usize, &effectcraft_project::PropGroup, &'static effectcraft_effects::EffectSpec)> = fx
@@ -1377,11 +923,7 @@ impl<'a> Renderer<'a> {
                 let base = self.nested_through(layer);
                 let base = Renderer { opts: RenderOpts { scale: bs, ..base.opts }, ..base };
                 let sub = match &tmp {
-                    // These per-instance project copies can be dropped and their allocation
-                    // reused while another override is rendered in the same top-level frame.
-                    // The static-frame cache keys projects by address, so keep override renders
-                    // out of it rather than risk reusing pixels from a different override.
-                    Some(p) => Renderer { project: p, cache_static_comps: false, ..base },
+                    Some(p) => Renderer { project: p, ..base },
                     None => base,
                 };
                 // Frame blending between the nested comp's frames (time-stretched/remapped).
@@ -1408,7 +950,7 @@ impl<'a> Renderer<'a> {
                 // Continuously rasterised vector footage: drawn at the on-screen scale.
                 if layer.switches.collapse && is_vector_footage(f) {
                     let k = self.raster_scale(ctx, layer);
-                    if let Some(img) = self.footage.vector_frame(item, f, k) {
+                    if let Some(img) = self.read(|| self.footage.vector_frame(item, f, k)) {
                         let mut buf = Buf { img: (*img).clone(), offset: [0.0; 2], scale: k };
                         if let Some(c) = self.pipe.media_in(f) {
                             color::convert(&mut buf.img, &c);
@@ -1416,16 +958,27 @@ impl<'a> Renderer<'a> {
                         return Some(buf);
                     }
                 }
-                let lt = ctx.source_time(layer);
-                // The proxy is decoded instead, at its own size, and fills the footage's frame.
-                let proxy = self.proxy_for(item);
-                let pf = proxy.unwrap_or(f);
-                let size = self.reduced_size(f.width, f.height).filter(|_| proxy.is_none());
-                let img = self.footage_frame(ctx, layer, item, pf, lt, size)?;
+                let (img, pf) = self.footage_picture_of(ctx, layer, item, f)?;
                 Some(self.footage_buf(&img, pf, f.width, f.height))
             }
-            LayerSource::Text => Some(self.authored(text::render(ctx, layer, self.raster_scale(ctx, layer)))),
-            LayerSource::Shape => layer.props.sub("contents").map(|c| self.authored(shapes::render(ctx, layer, c, self.raster_scale(ctx, layer)))),
+            // (the font files go to this render's log, which `ctx` may not carry: see
+            // [`Renderer::with_reads`])
+            LayerSource::Text => {
+                // An Expression Selector evaluates per character: its results at other characters
+                // than the first are not in the layer's cache key (an amount reading a footage
+                // item's size by name, `textIndex == 1 ? 0 : footage("ref.png").width`), so the
+                // buffer is kept in memory only, never on disk (the frame's key covers them).
+                if cache::per_character_expressions(layer)
+                    && let Some(log) = self.reads
+                {
+                    log.mark_unkeyed();
+                }
+                Some(self.authored(text::render_in(&self.with_reads(ctx), layer, self.raster_scale(ctx, layer), self.raster_clip(ctx, layer))))
+            }
+            LayerSource::Shape => layer
+                .props
+                .sub("contents")
+                .map(|c| self.authored(shapes::render_in(ctx, layer, c, self.raster_scale(ctx, layer), self.raster_clip(ctx, layer)))),
             _ => None,
         }
     }
@@ -1440,19 +993,87 @@ impl<'a> Renderer<'a> {
     /// A decoded frame of `f` as a layer buffer covering `w`×`h` layer pixels (the footage's
     /// nominal size; proxies are scaled up to it), converted from its colour profile.
     fn footage_buf(&self, img: &Image, f: &Footage, w: u32, h: u32) -> Buf {
-        let s = self.opts.scale;
-        let k = if img.width > 0 { w.max(1) as f64 / img.width as f64 } else { 1.0 };
-        // Keep native pixels when downsampling is small; resample otherwise.
-        let mut buf = match self.reduced_size(w, h) {
-            // The source resampled it already (`FootageSource::frame_at_size`).
-            Some(size) if (img.width, img.height) == size => Buf { img: img.clone(), offset: [0.0; 2], scale: s },
-            Some((rw, rh)) if k <= 1.0 + 1e-9 => Buf { img: effectcraft_raster::resample(img, rw, rh), offset: [0.0; 2], scale: s },
-            _ => Buf { img: img.clone(), offset: [0.0; 2], scale: 1.0 / k },
+        let mut buf = match self.footage_layout(img, w, h) {
+            FootageLayout::Native { scale } => Buf { img: img.clone(), offset: [0.0; 2], scale },
+            FootageLayout::Resample { width, height, scale } => Buf { img: effectcraft_raster::resample(img, width, height), offset: [0.0; 2], scale },
         };
         if let Some(c) = self.pipe.media_in(f) {
             color::convert(&mut buf.img, &c);
         }
         buf
+    }
+
+    /// How [`Renderer::footage_buf`] lays out a decoded frame `img` of footage `w`×`h` layer
+    /// pixels: its own pixels, or resampled.
+    fn footage_layout(&self, img: &Image, w: u32, h: u32) -> FootageLayout {
+        let s = self.opts.scale;
+        let k = if img.width > 0 { w.max(1) as f64 / img.width as f64 } else { 1.0 };
+        // Keep native pixels when downsampling is small; resample otherwise.
+        match self.reduced_size(w, h) {
+            // The source resampled it already (`FootageSource::frame_at_size`).
+            Some(size) if (img.width, img.height) == size => FootageLayout::Native { scale: s },
+            Some((width, height)) if k <= 1.0 + 1e-9 => FootageLayout::Resample { width, height, scale: s },
+            _ => FootageLayout::Native { scale: 1.0 / k },
+        }
+    }
+
+    /// A footage layer's decoded frame at the context time (the proxy's when one is used) and
+    /// the footage it was decoded from: what [`Renderer::source`] makes the layer's buffer of.
+    fn footage_picture_of(&self, ctx: &EvalCtx, layer: &Layer, item: ItemId, f: &'a Footage) -> Option<(Arc<Image>, &'a Footage)> {
+        let lt = ctx.source_time(layer);
+        // The proxy is decoded instead, at its own size, and fills the footage's frame.
+        let proxy = self.proxy_for(item);
+        let pf = proxy.unwrap_or(f);
+        let size = self.reduced_size(f.width, f.height).filter(|_| proxy.is_none());
+        let img = self.footage_frame(ctx, layer, item, pf, lt, size)?;
+        Some((img, pf))
+    }
+
+    /// The decoded footage picture a layer's masked source is, bit for bit, with no copy: a
+    /// footage layer (not continuously rasterised vector footage) without masks whose frame
+    /// needs no colour conversion, no resampling and no quantisation (32 bpc). The buffer
+    /// [`Renderer::layer_input`] gives for no effects is this picture at `effect_offset` and
+    /// `scale`.
+    /// Layers showing the same frame get the same `Arc` (the footage source's cached frame), so
+    /// an accelerator uploads it once and shares the texture. `None`: the layer's buffer is
+    /// made the usual way (any of the above applies, or the frame is missing), and also when the
+    /// frame is made per call rather than served by the footage source (frame blending,
+    /// separate fields, Invert Alpha, Interpret As Linear Light, Cineon conversion: a new
+    /// picture each time, nothing to share) or when the layer cache already holds the layer's
+    /// buffer (served from memory as before, without asking the footage source).
+    pub fn footage_picture(&self, ctx: &EvalCtx, layer: &Layer) -> Option<FootagePicture> {
+        let LayerSource::Footage { item } = &layer.source else { return None };
+        if self.pipe.levels.is_some() || layer.masks().is_some_and(|m| !m.children.is_empty()) || frame_blend_mode(ctx, layer) != FrameBlend::Off {
+            return None;
+        }
+        let item = ctx.media_item(layer, *item);
+        let ItemKind::Footage(f) = &self.project.item(item)?.kind else { return None };
+        if !f.has_video || (layer.switches.collapse && is_vector_footage(f)) {
+            return None;
+        }
+        let pf = self.proxy_for(item).unwrap_or(f);
+        if self.pipe.media_in(pf).is_some()
+            || pf.fields != effectcraft_project::FieldOrder::Off
+            || pf.invert_alpha
+            || pf.linear_light_applies()
+            || pf.cineon_applies()
+        {
+            return None;
+        }
+        if let Some(cache) = self.cache {
+            let (scale, draft, blur) = (self.raster_scale(ctx, layer), self.opts.draft, self.mb_on(ctx, layer));
+            let content = self.content_key(ctx, layer, cache::layer_key(ctx, layer, scale, draft, blur));
+            let input = self.content_key(ctx, layer, cache::input_key(ctx, layer, scale, draft, blur, 0));
+            if [content, input].into_iter().flatten().any(|k| cache.holds(k)) {
+                return None;
+            }
+        }
+        let (img, _) = self.footage_picture_of(ctx, layer, item, f)?;
+        let FootageLayout::Native { scale } = self.footage_layout(&img, f.width, f.height) else { return None };
+        // `layer_input`'s rebase into effect space (`Buf::rebase` of a buffer at the origin).
+        let mut at = Buf { img: Image { width: 0, height: 0, data: Vec::new() }, offset: [0.0; 2], scale };
+        at.rebase(ctx.effect_bounds(layer).1);
+        Some(FootagePicture { img, scale, effect_offset: at.offset })
     }
 
     /// The size of `w` × `h` layer pixels in this render when it is reduced enough that footage
@@ -1479,7 +1100,7 @@ impl<'a> Renderer<'a> {
         if f.fields != effectcraft_project::FieldOrder::Off && matches!(f.kind, FootageKind::Video | FootageKind::Sequence) {
             let field_rate = FrameRate::new(f.frame_rate.num * 2, f.frame_rate.den);
             let i = field_rate.frame_at(t).max(0);
-            let img = cineon_frame(self.footage.frame_with(item, f, f.frame_rate.tick_of(i / 2), None, self.pipe.float_curve(f))?, f);
+            let img = cineon_frame(self.read(|| self.footage.frame_with(item, f, f.frame_rate.tick_of(i / 2), None, self.pipe.float_curve(f)))?, f);
             let dominant_upper = f.fields == effectcraft_project::FieldOrder::UpperFirst;
             // Upper field = even lines (0, 2, …).
             let parity = if (i % 2 == 0) == dominant_upper { 0 } else { 1 };
@@ -1492,6 +1113,8 @@ impl<'a> Renderer<'a> {
         if per_pixel { Some(Arc::new(interpret_pixels(&img, f, self.pipe.linear_footage_space(f)))) } else { Some(img) }
     }
 
+    /// The footage frame at source time `t` after frame blending: the average of the source frames one comp frame spans, else a blend of the two neighbouring frames, else the plain frame.
+    /// Log scans are converted first, and blended frames are cached.
     fn footage_frame_raw(&self, ctx: &EvalCtx, layer: &Layer, item: ItemId, f: &Footage, t: Tick, size: Option<(u32, u32)>) -> Option<Arc<Image>> {
         let mode = frame_blend_mode(ctx, layer);
         let float = self.pipe.float_curve(f);
@@ -1503,6 +1126,9 @@ impl<'a> Renderer<'a> {
                     use std::hash::{Hash, Hasher};
                     let mut h = std::collections::hash_map::DefaultHasher::new();
                     (0x00f8_a3e5_u64, item, i, (w as f32).to_bits(), mode as u8, f.frame_rate.num, f.frame_rate.den, &f.path, float).hash(&mut h);
+                    // Every file of a sequence: the key must tell two projects apart whose items
+                    // share an id and a first frame (on disk, no project-wide salt does, #3184).
+                    f.sequence.hash(&mut h);
                     (f.alpha as u8).hash(&mut h);
                     if f.alpha == effectcraft_project::AlphaMode::Premultiplied {
                         f.premul_color.map(f32::to_bits).hash(&mut h);
@@ -1513,24 +1139,22 @@ impl<'a> Renderer<'a> {
                     }
                     h.finish()
                 });
-                if let (Some(c), Some(k)) = (self.cache, key)
-                    && let Some(b) = c.get(k)
-                {
+                if let Some((b, _)) = self.cached(key) {
                     return Some(Arc::new(b.img.clone()));
                 }
                 // Log scans are converted before they blend: the conversion is not linear.
-                let a = self.footage.frame_with(item, f, f.frame_rate.tick_of(i), None, float).map(|a| cineon_frame(a, f));
-                let b = self.footage.frame_with(item, f, f.frame_rate.tick_of(i + 1), None, float).map(|b| cineon_frame(b, f));
+                let ((a, b), files) = self.recorded(key, |r| {
+                    let frame = |i| r.read(|| r.footage.frame_with(item, f, f.frame_rate.tick_of(i), None, float)).map(|a| cineon_frame(a, f));
+                    (frame(i), frame(i + 1))
+                });
                 if let (Some(a), Some(b)) = (a, b) {
                     let img = blend_frames(mode, &a, &b, w as f32);
-                    if let (Some(c), Some(k)) = (self.cache_to_keep(), key) {
-                        c.insert(k, Arc::new(Buf { img: img.clone(), offset: [0.0; 2], scale: 1.0 }));
-                    }
+                    let _kept = self.keep(key, Arc::new(Buf { img: img.clone(), offset: [0.0; 2], scale: 1.0 }), &files);
                     return Some(Arc::new(img));
                 }
             }
         }
-        self.footage.frame_with(item, f, t, size, float).map(|img| cineon_frame(img, f))
+        self.read(|| self.footage.frame_with(item, f, t, size, float)).map(|img| cineon_frame(img, f))
     }
 
     /// Source → masks, clamped/quantised to the project depth.
@@ -1547,106 +1171,57 @@ impl<'a> Renderer<'a> {
         Some(buf)
     }
 
-    /// Directly build the minified source for a plain solid. The normal raster path first fills
-    /// the full-resolution solid, then box-filters it for minification; every level of that box
-    /// filter is the same uniform pixel, so these allocations and copies are redundant.
-    pub(crate) fn plain_solid_mip(&self, ctx: &EvalCtx, layer: &Layer) -> Option<Buf> {
-        let (width, height, scale, color) = self.plain_solid_mip_data(ctx, layer)?;
-        Some(Buf { img: Image::filled(width, height, color), offset: [0.0; 2], scale })
-    }
-
-    /// The compact upload-free representation used by the GPU batch path.
-    pub(crate) fn plain_solid_gpu_mip(&self, ctx: &EvalCtx, layer: &Layer) -> Option<(Buf, [f32; 4], (u32, u32))> {
-        let (width, height, scale, color) = self.plain_solid_mip_data(ctx, layer)?;
-        // Placement only needs the buffer's scale and offset. Keep a valid 1×1 image here;
-        // the GPU shader uses `solid_color` and the separately retained logical dimensions.
-        let buf = Buf { img: Image::filled(1, 1, color), offset: [0.0; 2], scale };
-        Some((buf, color, (width, height)))
-    }
-
-    fn plain_solid_mip_data(&self, ctx: &EvalCtx, layer: &Layer) -> Option<(u32, u32, f64, [f32; 4])> {
-        if self.accel.is_some()
-            || layer.is_3d()
-            || layer.switches.adjustment
-            || layer.switches.collapse
-            || self.blurred(ctx, layer)
-            || layer.masks().is_some_and(|m| !m.children.is_empty())
-            || (layer.switches.effects && layer.effects().is_some_and(|fx| fx.groups().any(|g| g.enabled)))
-            || styles::active(ctx, layer)
-            || layer.track_matte.is_some()
-            || layer.preserve_transparency
-        {
-            return None;
-        }
-        let LayerSource::Solid { item } = &layer.source else { return None };
-        let ItemKind::Solid(sol) = &self.project.item(*item)?.kind else { return None };
-        let scale = self.opts.scale;
-        let (full_w, full_h) = (((sol.width as f64 * scale).ceil() as u32).max(1), ((sol.height as f64 * scale).ceil() as u32).max(1));
-        let (factor, width, height) = self.solid_mip(ctx, layer, full_w, full_h, scale)?;
-        let mut color = sol.color;
-        if let Some(conv) = self.pipe.authored_in() {
-            color = conv.apply(color);
-        }
-        let px = self.pipe.quantize_px([color[0], color[1], color[2], 1.0]);
-        Some((width, height, scale * factor, px))
-    }
-
     /// Fully processed layer buffer (source → masks → effects → layer styles, flattened).
     /// Served from the layer cache when the layer's content key matches.
     pub fn layer_buf(&self, ctx: &EvalCtx, layer: &Layer) -> Option<Arc<Buf>> {
-        self.layer_buf_keyed(ctx, layer).map(|(b, _)| b)
+        self.layer_buf_keyed(ctx, layer).map(|(b, _, _)| b)
     }
 
     /// [`Self::layer_buf`] in the blending space (linear with Blend Colors Using 1.0 Gamma).
     pub fn blend_layer_buf(&self, ctx: &EvalCtx, layer: &Layer) -> Option<Arc<Buf>> {
-        let (b, k) = self.layer_buf_keyed(ctx, layer)?;
-        Some(self.to_blend(b, k))
+        let (b, k, files) = self.layer_buf_keyed(ctx, layer)?;
+        Some(self.to_blend(b, k, &files))
     }
 
-    /// A buffer converted to the blending space (cached under a key derived from `key`).
-    pub(crate) fn to_blend(&self, b: Arc<Buf>, key: Option<u64>) -> Arc<Buf> {
+    /// A buffer converted to the blending space (cached under a key derived from `key`, with
+    /// `files`, the source files `b` was made of).
+    pub(crate) fn to_blend(&self, b: Arc<Buf>, key: Option<u64>, files: &Arc<ReadFiles>) -> Arc<Buf> {
         let Some(c) = self.pipe.to_blend() else { return b };
         let key = key.map(|k| cache::derive(k, 0x1ea7));
-        if let (Some(cache), Some(k)) = (self.cache, key)
-            && let Some(x) = cache.get(k)
-        {
+        if let Some((x, _)) = self.cached(key) {
             return x;
         }
         let mut nb = (*b).clone();
         color::convert(&mut nb.img, &c);
-        let nb = Arc::new(nb);
-        // The buffer the cache keeps (another worker's, if it kept one first).
-        match (self.cache_to_keep(), key) {
-            (Some(cache), Some(k)) => cache.insert(k, nb),
-            _ => nb,
-        }
+        self.keep(key, Arc::new(nb), files).0
     }
 
-    fn layer_buf_keyed(&self, ctx: &EvalCtx, layer: &Layer) -> Option<(Arc<Buf>, Option<u64>)> {
+    /// The flattened layer buffer, its cache key and the source files it was made of.
+    fn layer_buf_keyed(&self, ctx: &EvalCtx, layer: &Layer) -> Option<(Arc<Buf>, Option<u64>, Arc<ReadFiles>)> {
         let st = self.styled(ctx, layer, None)?;
         if st.passes.is_empty() {
-            return Some((st.body, st.key));
+            return Some((st.body, st.key, st.files));
         }
         let key = st.key.map(|k| cache::derive(k, 0xf1a7));
-        if let (Some(c), Some(k)) = (self.cache, key)
-            && let Some(b) = c.get(k)
-        {
-            return Some((b, key));
+        if let Some((b, files)) = self.cached(key) {
+            return Some((b, key, files));
         }
         let flat = Arc::new(styles::Styled { passes: st.passes.iter().map(|(b, m)| ((**b).clone(), *m)).collect(), body: (*st.body).clone() }.flatten());
-        // The buffer the cache keeps (another worker's, if it kept one first).
-        let flat = match (self.cache_to_keep(), key) {
-            (Some(c), Some(k)) => c.insert(k, flat),
-            _ => flat,
-        };
-        Some((flat, key))
+        let (flat, files) = self.keep(key, flat, &st.files);
+        Some((flat, key, files))
     }
 
     /// A layer's source pixels at the context time, before masks, effects and the transform
     /// (what the motion tracker analyses, like After Effects' Layer panel). `None` for layers
     /// without pixels.
     pub fn layer_source(&self, ctx: &EvalCtx, layer: &Layer) -> Option<Buf> {
-        self.source(ctx, layer)
+        Renderer { whole_raster: true, ..*self }.source(ctx, layer)
+    }
+
+    /// Layer-space pixels after masks and effects, including content outside the viewport.
+    /// Expression sampleImage reads this rather than the frame-oriented clipped buffer.
+    pub fn layer_content(&self, ctx: &EvalCtx, layer: &Layer) -> Option<Arc<Buf>> {
+        Renderer { whole_raster: true, ..*self }.content_buf(ctx, layer)
     }
 
     /// A 3D model or primitive layer rendered on its own, through the comp's camera: what an
@@ -1675,73 +1250,32 @@ impl<'a> Renderer<'a> {
 
     /// Layer pixels after source → masks → effects (no layer styles).
     pub fn content_buf(&self, ctx: &EvalCtx, layer: &Layer) -> Option<Arc<Buf>> {
-        self.content_buf_timed(ctx, layer, None).map(|(b, _)| b)
+        self.content_buf_timed(ctx, layer, None).map(|(b, _, _)| b)
     }
 
-    pub(crate) fn content_buf_timed(&self, ctx: &EvalCtx, layer: &Layer, mut timing: Option<&mut LayerTiming>) -> Option<(Arc<Buf>, Option<u64>)> {
+    /// [`Self::content_buf`], its cache key and the source files it was made of.
+    pub(crate) fn content_buf_timed(
+        &self,
+        ctx: &EvalCtx,
+        layer: &Layer,
+        mut timing: Option<&mut LayerTiming>,
+    ) -> Option<(Arc<Buf>, Option<u64>, Arc<ReadFiles>)> {
         let key = self.cache.and_then(|_| cache::layer_key(ctx, layer, self.raster_scale(ctx, layer), self.opts.draft, self.mb_on(ctx, layer)));
-        let key = self.content_key(ctx, layer, key);
-        if let (Some(c), Some(k)) = (self.cache, key)
-            && let Some(b) = c.get(k)
-        {
+        let key = self.content_key(ctx, layer, self.clipped_key(ctx, layer, key));
+        if let Some((b, files)) = self.cached(key) {
             if let Some(t) = timing.as_deref_mut() {
                 t.cached = true;
             }
-            return Some((b, key));
+            return Some((b, key, files));
         }
-        let shape_key = self.static_shape_source_key(ctx, layer);
-        if let Some(shape_key) = shape_key
-            && let Some(buf) = self.shape_sources.get(shape_key)
-        {
-            if let Some(t) = timing.as_deref_mut() {
-                t.cached = true;
-            }
-            let buf = match (self.cache_to_keep(), key) {
-                (Some(cache), Some(k)) => cache.insert(k, buf),
-                _ => buf,
-            };
-            return Some((buf, key));
-        }
-        let footage_key = self.gpu_footage_source_key(ctx, layer, false);
-        if let Some(footage_key) = footage_key
-            && let Some(buf) = self.footage_buffers.get(footage_key)
-        {
-            if let Some(t) = timing.as_deref_mut() {
-                t.cached = true;
-            }
-            let buf = match (self.cache_to_keep(), key) {
-                (Some(cache), Some(k)) => cache.insert(k, buf),
-                _ => buf,
-            };
-            return Some((buf, key));
-        }
-        let buf = self.masked_source(ctx, layer)?;
-        let buf = Arc::new(self.apply_effects_timed(ctx, layer, buf, false, usize::MAX, timing.map(|t| &mut t.effects)));
-        let buf = match footage_key {
-            Some(k) => self.footage_buffers.insert(k, buf),
-            None => buf,
-        };
-        // The buffer the cache keeps (another worker's, if it kept one first).
-        let buf = match (self.cache_to_keep(), key) {
-            (Some(c), Some(k)) => c.insert(k, buf),
-            _ => buf,
-        };
-        let buf = match shape_key {
-            Some(k) => self.shape_sources.insert(k, buf),
-            None => buf,
-        };
-        Some((buf, key))
-    }
-
-    fn static_shape_source_key(&self, ctx: &EvalCtx, layer: &Layer) -> Option<u64> {
-        if !matches!(layer.source, LayerSource::Shape)
-            || layer.masks().is_some_and(|m| !m.children.is_empty())
-            || (layer.switches.effects && layer.effects().is_some_and(|fx| fx.groups().any(|g| g.enabled)))
-            || self.content_times(ctx, layer).is_some()
-        {
-            return None;
-        }
-        cache::static_shape_source_key(ctx, layer, self.raster_scale(ctx, layer), self.opts.scale, self.opts.draft, self.quality(layer), self.pipe.key())
+        let (buf, files) = self.recorded(key, |r| {
+            // (what expressions read while it is made, at shutter times too, goes to its files)
+            let ctx = &r.with_reads(ctx);
+            let buf = r.masked_source(ctx, layer)?;
+            Some(r.apply_effects_timed(ctx, layer, buf, false, usize::MAX, timing.map(|t| &mut t.effects)))
+        });
+        let (buf, files) = self.keep(key, Arc::new(buf?), &files);
+        Some((buf, key, files))
     }
 
     /// A layer's input at the context time: source → masks → its first `effects` effects
@@ -1749,25 +1283,32 @@ impl<'a> Renderer<'a> {
     /// what effect `effects` sees. Served from / stored in the layer cache under its own key,
     /// so scrubbing reuses frames rendered for earlier output frames.
     pub fn layer_input(&self, ctx: &EvalCtx, layer: &Layer, effects: usize) -> Option<Arc<Buf>> {
+        // The Layer panel, analysis tools and effect inputs read the whole layer, not the viewport.
+        Renderer { whole_raster: true, ..*self }.whole_layer_input(ctx, layer, effects)
+    }
+
+    fn whole_layer_input(&self, ctx: &EvalCtx, layer: &Layer, effects: usize) -> Option<Arc<Buf>> {
         let key = self.cache.and_then(|_| cache::input_key(ctx, layer, self.raster_scale(ctx, layer), self.opts.draft, self.mb_on(ctx, layer), effects));
-        let key = self.content_key(ctx, layer, key);
-        if let (Some(c), Some(k)) = (self.cache, key)
-            && let Some(b) = c.get(k)
-        {
+        let key = self.content_key(ctx, layer, self.clipped_key(ctx, layer, key));
+        if let Some((b, _)) = self.cached(key) {
             return Some(b);
         }
-        let mut buf = self.masked_source(ctx, layer)?;
-        let origin = ctx.effect_bounds(layer).1;
-        buf.rebase(origin);
-        if effects > 0 {
-            buf = self.effect_space_stack(ctx, layer, buf, EffectStack { adjustment: false, limit: effects, origin }, None);
-        }
-        let buf = Arc::new(buf);
-        // The buffer the cache keeps (another worker's, if it kept one first).
-        let buf = match (self.cache_to_keep(), key) {
-            (Some(c), Some(k)) => c.insert(k, buf),
-            _ => buf,
-        };
-        Some(buf)
+        let (buf, files) = self.recorded(key, |r| {
+            let ctx = &r.with_reads(ctx);
+            let mut buf = r.masked_source(ctx, layer)?;
+            let origin = ctx.effect_bounds(layer).1;
+            buf.rebase(origin);
+            if effects > 0 {
+                buf = r.effect_space_stack(ctx, layer, buf, EffectStack { adjustment: false, limit: effects, origin }, None);
+            }
+            Some(buf)
+        });
+        Some(self.keep(key, Arc::new(buf?), &files).0)
     }
+}
+
+/// Snap cells can be finer than 1/16 unit: preserve every coordinate bit so visible
+/// clips cannot collide with another cell or the empty behind-camera raster.
+pub(crate) fn raster_clip_key(key: u64, clip: kurbo::Rect) -> u64 {
+    [clip.x0, clip.y0, clip.x1, clip.y1].iter().fold(cache::derive(key, 0xc11b), |key, coordinate| cache::derive(key, coordinate.to_bits()))
 }

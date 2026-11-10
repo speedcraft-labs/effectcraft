@@ -1,13 +1,10 @@
 //! Device, pipelines, textures, uploads and readback.
 
-use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, Mutex, Weak};
-use std::time::Instant;
 
 use effectcraft_effects::Buf;
 use effectcraft_raster::Image;
-use rayon::prelude::*;
 
 /// Compute entry points in `kernels.wgsl` (one pipeline each).
 const ENTRIES: &[&str] = &[
@@ -31,20 +28,7 @@ const ENTRIES: &[&str] = &[
 /// (building all ~200 up front kept Chrome's GPU process busy past its watchdog, #1590, and
 /// FXC took over a minute, #613), and one that fails to build (a driver's shader compiler
 /// rejecting it) leaves its effects to the CPU instead of turning the whole compositor off.
-const EFFECT_ENTRIES: &[&str] = &[
-    "box_h",
-    "box_v",
-    "gaussian_sample",
-    "gaussian_sample_exact",
-    "gaussian_forward",
-    "gaussian_backward",
-    "directional",
-    "glow_bright",
-    "glow_combine",
-    "shadow_make",
-    "shadow_combine",
-    "pointwise",
-];
+const EFFECT_ENTRIES: &[&str] = &["box_h", "box_v", "directional", "glow_bright", "glow_combine", "shadow_make", "shadow_combine", "pointwise"];
 
 /// Entry points that also bind group 1 (four read-only storage buffers; see
 /// [`Enc::dispatch_ext`]). Like the effect kernels, one that fails to build (FXC on DirectX 12
@@ -58,10 +42,6 @@ const BASE_WGSL: [&str; 2] = [include_str!("shaders/common.wgsl"), include_str!(
 /// The family whose module also gets the adapter's median implementation
 /// ([`crate::fx_noise::MedianKernel::source`]), chosen when the context is created.
 const MEDIAN_FAMILY: &str = "fx_noise";
-
-thread_local! {
-    static RGBA8_UPLOAD_SCRATCH: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
-}
 
 /// Kernel families: each is compiled as a module of its own, `BASE_WGSL` plus its file and the
 /// files it borrows functions from, built the first time one of its kernels is. A pipeline then
@@ -148,17 +128,17 @@ const POOL_BUDGET: usize = 256 << 20;
 /// miss (a new allocation), never a wrong pixel.
 const STALE_FRAMES: u64 = 2;
 
+/// The pool owner of uploaded textures: never registered by an [`Enc`] (their ids start at 1),
+/// so an upload takes only from the shared free list ([`Pool::take`], textures no open encoder
+/// can read) and gives its texture back through the guarded [`Pool::release`].
+const UPLOAD_OWNER: u64 = 0;
+
 /// Readback staging buffers kept for reuse across sizes (bytes).
 const STAGING_BUDGET: u64 = 256 << 20;
 
-/// Per-frame cache for rasters of repeated static precomps.
-const STATIC_PRECOMP_CACHE_BYTES: usize = 256 << 20;
-const STATIC_PRECOMP_CACHE_SINGLE: usize = 32 << 20;
-/// Duplicate footage sources in one frame need only one GPU texture.
-const FRAME_SOURCE_CACHE_BYTES: usize = 256 << 20;
-
-/// A GPU image (cheap to clone; immutable once written). Working images use premultiplied RGBA
-/// f32; an exact 8-bit layer upload may use RGBA8Unorm.
+/// A GPU image: premultiplied RGBA f32 in a texture (cheap to clone; immutable once written).
+/// Working images come from the context's texture pool and go back to it when the last clone
+/// is dropped.
 #[derive(Clone, Debug)]
 pub struct GpuImage {
     pub texture: wgpu::Texture,
@@ -304,34 +284,6 @@ pub struct TransferStats {
     pub upload_bytes: u64,
     pub readbacks: u64,
     pub readback_bytes: u64,
-}
-
-/// Lazy shader and pipeline work since a GPU context was created.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct PipelineBuildStats {
-    pub requests: u64,
-    pub cache_hits: u64,
-    pub shader_modules: u64,
-    pub shader_module_ns: u64,
-    pub pipelines: u64,
-    pub pipeline_ns: u64,
-}
-
-/// Repeated static precomp rasters reused within GPU frames.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct StaticPrecompStats {
-    pub hits: u64,
-    pub misses: u64,
-}
-
-#[derive(Default)]
-struct PipelineBuildCounters {
-    requests: std::sync::atomic::AtomicU64,
-    cache_hits: std::sync::atomic::AtomicU64,
-    shader_modules: std::sync::atomic::AtomicU64,
-    shader_module_ns: std::sync::atomic::AtomicU64,
-    pipelines: std::sync::atomic::AtomicU64,
-    pipeline_ns: std::sync::atomic::AtomicU64,
 }
 
 /// `WGPU_ADAPTER_NAME` trimmed; empty or whitespace-only counts as unset (an empty
@@ -682,15 +634,28 @@ impl Pool {
 }
 
 /// Uniform parameter block shared by every kernel (see `shaders/common.wgsl`).
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default, bytemuck::Pod, bytemuck::Zeroable)]
+#[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct Params {
     pub u: [[u32; 4]; 4],
     pub f: [[f32; 4]; 12],
 }
 
-const PARAMS_SIZE: usize = std::mem::size_of::<Params>();
-const UNIFORM_DISPATCHES: usize = 256;
+impl Params {
+    fn bytes(&self) -> Vec<u8> {
+        let mut v = Vec::with_capacity(256);
+        for r in &self.u {
+            for x in r {
+                v.extend_from_slice(&x.to_le_bytes());
+            }
+        }
+        for r in &self.f {
+            for x in r {
+                v.extend_from_slice(&x.to_le_bytes());
+            }
+        }
+        v
+    }
+}
 
 struct Upload {
     buf: Weak<Buf>,
@@ -701,19 +666,10 @@ struct Upload {
 
 #[derive(Default)]
 struct Uploads {
-    map: HashMap<(usize, bool, bool), Upload>,
+    map: HashMap<usize, Upload>,
     bytes: usize,
     clock: u64,
 }
-
-struct StagedUpload {
-    buf: Arc<Buf>,
-    img: GpuImage,
-    offset: u64,
-    bytes_per_row: u32,
-}
-
-const STAGED_UPLOAD_LIMIT: usize = 64 * 1024 * 1024;
 
 /// The device and everything compiled for it.
 pub struct GpuContext {
@@ -742,14 +698,15 @@ pub struct GpuContext {
     dummy_tex: wgpu::TextureView,
     dummy_buf: wgpu::Buffer,
     uploads: Mutex<Uploads>,
+    /// Uploaded footage pictures, shared by the layers that show them (see [`crate::upload`]).
+    pictures: Mutex<crate::upload::Pictures>,
+    /// Reused staging buffers of large uploads (see [`crate::upload::Staging`]).
+    upload_staging: crate::upload::Staging,
     upload_budget: std::sync::atomic::AtomicUsize,
     upload_full_warned: std::sync::atomic::AtomicBool,
     pool: Arc<Mutex<Pool>>,
     /// CPU ↔ GPU traffic (diagnostics: `bench --gpu`).
     pub(crate) transfers: Transfers,
-    pipeline_builds: PipelineBuildCounters,
-    static_precomp_hits: std::sync::atomic::AtomicU64,
-    static_precomp_misses: std::sync::atomic::AtomicU64,
     /// Readback staging buffers by size.
     staging: Mutex<HashMap<u64, Vec<wgpu::Buffer>>>,
     /// Transparent read-only images by size (see [`Enc::zeros`]).
@@ -919,7 +876,7 @@ impl GpuContext {
                     wgpu::BindGroupLayoutEntry {
                         binding: 0,
                         visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: true, min_binding_size: None },
+                        ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
                         count: None,
                     },
                     tex_entry(1),
@@ -1069,14 +1026,13 @@ impl GpuContext {
             dummy,
             dummy_buf,
             uploads: Mutex::new(Uploads::default()),
+            pictures: Default::default(),
+            upload_staging: Default::default(),
             upload_budget: std::sync::atomic::AtomicUsize::new(UPLOAD_BUDGET),
             upload_full_warned: Default::default(),
             pool,
             staging: Default::default(),
             transfers: Default::default(),
-            pipeline_builds: Default::default(),
-            static_precomp_hits: Default::default(),
-            static_precomp_misses: Default::default(),
             zeros: Default::default(),
             adv3d: std::sync::OnceLock::new(),
             yuv: std::sync::OnceLock::new(),
@@ -1179,6 +1135,24 @@ impl GpuContext {
         }
     }
 
+    /// The memory budget (the memory cap: a conservative share of the device, see `memcap`),
+    /// the allocator's peak, one frame's share of it and what the upload cache may still add.
+    /// `None` where any is unknown: no allocator report (Metal, WebGPU, GL) or the cap is off.
+    pub fn frame_memory(&self) -> Option<effectcraft_render::FrameMemory> {
+        let budget = self.memcap.cap();
+        let now = self.allocated_bytes();
+        self.memcap.note(now);
+        // The allocator's peak (sampled while frames render) holds a frame's working textures
+        // at their most; what is gone again after the frame (and at least what the pool keeps
+        // for the next) is one frame's share. Frames that had to wait for memory: no room.
+        let peak = self.memcap.peak();
+        let frame = if self.memcap.pressed() { budget } else { peak.saturating_sub(now).max(self.pool_retained_bytes() as u64) };
+        // The upload cache may still fill up to its budget.
+        let uploads = self.uploads.lock().map(|u| u.bytes).unwrap_or(0);
+        let reserve = self.upload_budget().saturating_sub(uploads) as u64;
+        (budget > 0 && peak > 0 && frame > 0).then_some(effectcraft_render::FrameMemory { budget, peak, frame, reserve })
+    }
+
     /// Bytes held by wgpu's device allocator (`0` on backends that do not report).
     pub(crate) fn allocated_bytes(&self) -> u64 {
         self.device.generate_allocator_report().map_or(0, |r| r.total_allocated_bytes)
@@ -1187,11 +1161,11 @@ impl GpuContext {
     /// Bytes held in long-lived or still-referenced GPU caches/leases that submitting and waiting
     /// on `owner` (`closing_enc`) cannot free.
     fn kept_bytes(&self, owner: u64, closing_enc: Option<u64>) -> u64 {
-        let uploads = self.uploads.lock().map(|u| u.bytes as u64).unwrap_or(0);
+        // (uploaded layer and footage textures are pooled: the pool's leases count them)
         let pool = self.pool.lock().map(|p| p.kept_after_flush(owner, closing_enc) as u64).unwrap_or(0);
         let staging: u64 = self.staging.lock().map(|s| s.iter().map(|(k, v)| k * v.len() as u64).sum()).unwrap_or(0);
         let zeros: u64 = self.zeros.lock().map(|z| z.keys().map(|&(w, h)| w as u64 * h as u64 * 16).sum()).unwrap_or(0);
-        uploads + pool + staging + zeros
+        pool + staging + self.upload_staging.bytes() + zeros
     }
 
     #[cfg(test)]
@@ -1253,18 +1227,99 @@ impl GpuContext {
     /// never consumes the readback deadline or holds the mutex across the whole timeout.
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn read_buffer(&self, buffer: &wgpu::Buffer, row: usize, stride: usize, height: usize) -> Result<Vec<u8>, String> {
+        self.read_buffer_after(buffer, None, row, stride, height)
+    }
+
+    /// [`Self::read_buffer`] waiting only for `submission` (the one that wrote `buffer`), not
+    /// for every submission so far: another frame's GPU work submitted meanwhile doesn't hold
+    /// this readback up (#3335). `None`: wait for all submitted work.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn read_buffer_after(
+        &self,
+        buffer: &wgpu::Buffer,
+        submission: Option<wgpu::SubmissionIndex>,
+        row: usize,
+        stride: usize,
+        height: usize,
+    ) -> Result<Vec<u8>, String> {
+        self.read_mapped(buffer, submission, |view| crate::readback::packed(view, row, stride, height))
+    }
+
+    /// Map `buffer`, wait for the mapping (only for `submission` when given) and hand the
+    /// mapped bytes to `read`, on this thread, before unmapping: `read` copies the rows
+    /// straight into their destination, once (#3335). The copy happens outside `poll_lock`, so
+    /// it doesn't hold up other threads' readbacks the way copying inside the map callback
+    /// (which runs during a device poll) would.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn read_mapped<R>(
+        &self,
+        buffer: &wgpu::Buffer,
+        submission: Option<wgpu::SubmissionIndex>,
+        read: impl FnOnce(&[u8]) -> Result<R, String>,
+    ) -> Result<R, String> {
         let (tx, rx) = std::sync::mpsc::channel();
-        self.map_readback(buffer, row, stride, height, move |r| {
+        let ticket = self.readbacks.start(move |r| {
             let _ = tx.send(r);
+        })?;
+        if !ticket.active() {
+            return Err("GPU readback cancelled".into());
+        }
+        let b = buffer.clone();
+        buffer.map_async(wgpu::MapMode::Read, .., move |r| {
+            // Timed out or cancelled: nobody reads the mapping.
+            if !ticket.active() {
+                b.unmap();
+                return;
+            }
+            // Mapped: the waiting thread reads the rows and unmaps (an empty vector = mapped).
+            ticket.complete(r.map(|_| Vec::new()).map_err(|e| format!("GPU buffer mapping: {e}")));
         });
+        // On any failure, unmap (harmless when not mapped; cancels a pending map) so a mapped
+        // buffer can never be handed out again.
+        let fail = |e: String| {
+            buffer.unmap();
+            e
+        };
+        self.wait_mapped(&rx, submission).map_err(fail)?.map_err(fail)?;
+        let result = {
+            let view = buffer.get_mapped_range(..).map_err(|e| format!("GPU mapped range: {e}"));
+            view.and_then(|view| read(&view))
+        };
+        buffer.unmap();
+        result
+    }
+
+    /// Poll until `rx` reports the mapping (see [`Self::read_mapped`]): polling and receiving
+    /// share one deadline, started once `poll_lock` is first acquired and polled in
+    /// [`Self::POLL_SLICE`] slices so lock contention never consumes the readback deadline or
+    /// holds the mutex across the whole timeout. While another thread holds `poll_lock` it is
+    /// polling the device, which delivers this mapping too: wait for it instead of queueing.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn wait_mapped(
+        &self,
+        rx: &std::sync::mpsc::Receiver<Result<Vec<u8>, String>>,
+        submission: Option<wgpu::SubmissionIndex>,
+    ) -> Result<Result<Vec<u8>, String>, String> {
         let mut deadline = None;
         loop {
             self.readbacks.check()?;
             if let Ok(result) = rx.try_recv() {
-                return result;
+                return Ok(result);
             }
             let (remaining, slice, poll_res) = {
-                let _guard = self.poll_lock.lock().unwrap_or_else(|e| e.into_inner());
+                let _guard = match self.poll_lock.try_lock() {
+                    Ok(g) => g,
+                    Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+                    Err(std::sync::TryLockError::WouldBlock) => {
+                        match rx.recv_timeout(std::time::Duration::from_millis(1)) {
+                            Ok(result) => return Ok(result),
+                            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                            Err(e) => return Err(format!("GPU readback completion channel: {e}")),
+                        }
+                        // The ticket's own deadline still bounds a wait that never gets the lock.
+                        continue;
+                    }
+                };
                 self.readbacks.check()?;
                 let d = *deadline.get_or_insert_with(|| std::time::Instant::now() + crate::readback::TIMEOUT);
                 let remaining = d.saturating_duration_since(std::time::Instant::now());
@@ -1272,12 +1327,12 @@ impl GpuContext {
                     (remaining, std::time::Duration::ZERO, Ok(wgpu::PollStatus::Poll))
                 } else {
                     let slice = remaining.min(Self::POLL_SLICE);
-                    let res = self.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: Some(slice) });
+                    let res = self.device.poll(wgpu::PollType::Wait { submission_index: submission.clone(), timeout: Some(slice) });
                     (remaining, slice, res)
                 }
             };
             if let Ok(result) = rx.try_recv() {
-                return result;
+                return Ok(result);
             }
             if remaining.is_zero() {
                 let error = "GPU readback receive timed out; context retired".to_string();
@@ -1296,7 +1351,7 @@ impl GpuContext {
             }
             // The callback may be running on another thread that polled the same device.
             match rx.recv_timeout(remaining.min(std::time::Duration::from_millis(1))) {
-                Ok(result) => return result,
+                Ok(result) => return Ok(result),
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
                 Err(e) => return Err(format!("GPU readback completion channel: {e}")),
             }
@@ -1305,6 +1360,28 @@ impl GpuContext {
 
     #[cfg(target_arch = "wasm32")]
     pub(crate) fn read_buffer(&self, _buffer: &wgpu::Buffer, _row: usize, _stride: usize, _height: usize) -> Result<Vec<u8>, String> {
+        Err("synchronous GPU readback is unavailable in the browser".into())
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn read_buffer_after(
+        &self,
+        _buffer: &wgpu::Buffer,
+        _submission: Option<wgpu::SubmissionIndex>,
+        _row: usize,
+        _stride: usize,
+        _height: usize,
+    ) -> Result<Vec<u8>, String> {
+        Err("synchronous GPU readback is unavailable in the browser".into())
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn read_mapped<R>(
+        &self,
+        _buffer: &wgpu::Buffer,
+        _submission: Option<wgpu::SubmissionIndex>,
+        _read: impl FnOnce(&[u8]) -> Result<R, String>,
+    ) -> Result<R, String> {
         Err("synchronous GPU readback is unavailable in the browser".into())
     }
 
@@ -1400,10 +1477,7 @@ impl GpuContext {
     /// Kernel `entry`'s pipeline: one built up front, or an effect kernel, built the first time
     /// it is asked for. `None` when the device doesn't have it.
     fn pipeline(&self, entry: &str) -> Option<&wgpu::ComputePipeline> {
-        use std::sync::atomic::Ordering::Relaxed;
-        self.pipeline_builds.requests.fetch_add(1, Relaxed);
         if let Some(p) = self.pipelines.get(entry) {
-            self.pipeline_builds.cache_hits.fetch_add(1, Relaxed);
             return Some(p);
         }
         let Some((e, (family, cell))) = self.effect_pipelines.get_key_value(entry) else {
@@ -1412,17 +1486,8 @@ impl GpuContext {
             }
             return None;
         };
-        if cell.get().is_some() {
-            self.pipeline_builds.cache_hits.fetch_add(1, Relaxed);
-        }
         let built = cell.get_or_init(|| {
-            let built = self.family_module(*family).and_then(|module| {
-                let start = Instant::now();
-                let built = build_pipeline(&self.device, module, &self.layout, e);
-                self.pipeline_builds.pipelines.fetch_add(1, Relaxed);
-                self.pipeline_builds.pipeline_ns.fetch_add(start.elapsed().as_nanos() as u64, Relaxed);
-                built
-            });
+            let built = self.family_module(*family).and_then(|module| build_pipeline(&self.device, module, &self.layout, e));
             if let Err(why) = &built {
                 log::warn!("gpu {}: kernel {e} unavailable, its effects render on the CPU: {why}", self.name);
             }
@@ -1440,11 +1505,7 @@ impl GpuContext {
             let median = [self.median_kernel.source()];
             let extra: &[&str] = if *label == MEDIAN_FAMILY { &median } else { &[] };
             let files: Vec<&str> = files.iter().chain(extra).copied().collect();
-            let start = Instant::now();
-            let result = kernel_module(&self.device, label, &files);
-            self.pipeline_builds.shader_modules.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            self.pipeline_builds.shader_module_ns.fetch_add(start.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
-            result
+            kernel_module(&self.device, label, &files)
         })
         .as_ref()
         .map_err(Clone::clone)
@@ -1517,14 +1578,13 @@ impl GpuContext {
             dummy: self.dummy.clone(),
             dummy_buf: self.dummy_buf.clone(),
             uploads: Mutex::new(Uploads::default()),
+            pictures: Default::default(),
+            upload_staging: Default::default(),
             upload_budget: std::sync::atomic::AtomicUsize::new(UPLOAD_BUDGET),
             upload_full_warned: Default::default(),
             pool: self.pool.clone(),
             staging: Default::default(),
             transfers: Default::default(),
-            pipeline_builds: Default::default(),
-            static_precomp_hits: Default::default(),
-            static_precomp_misses: Default::default(),
             zeros: Default::default(),
             adv3d: std::sync::OnceLock::new(),
             adv3d_raster: self.adv3d_raster,
@@ -1557,11 +1617,6 @@ impl GpuContext {
 
     pub(crate) fn fits(&self, w: u32, h: u32) -> bool {
         w > 0 && h > 0 && w <= self.max_dim && h <= self.max_dim
-    }
-
-    /// A sampled binding for kernels whose source pixels are supplied as uniforms instead.
-    pub(crate) fn dummy_image(&self) -> GpuImage {
-        GpuImage::new(self.dummy.clone(), 1, 1)
     }
 
     /// A new (zeroed) texture of its own (not pooled).
@@ -1624,26 +1679,6 @@ impl GpuContext {
             readbacks: t.downs.load(Relaxed),
             readback_bytes: t.down_bytes.load(Relaxed),
         }
-    }
-
-    /// Lazy shader compilation, pipeline compilation, and pipeline-cache lookups.
-    pub fn pipeline_build_stats(&self) -> PipelineBuildStats {
-        use std::sync::atomic::Ordering::Relaxed;
-        let p = &self.pipeline_builds;
-        PipelineBuildStats {
-            requests: p.requests.load(Relaxed),
-            cache_hits: p.cache_hits.load(Relaxed),
-            shader_modules: p.shader_modules.load(Relaxed),
-            shader_module_ns: p.shader_module_ns.load(Relaxed),
-            pipelines: p.pipelines.load(Relaxed),
-            pipeline_ns: p.pipeline_ns.load(Relaxed),
-        }
-    }
-
-    /// Hit and miss counts for the static precomp cache.
-    pub fn static_precomp_stats(&self) -> StaticPrecompStats {
-        use std::sync::atomic::Ordering::Relaxed;
-        StaticPrecompStats { hits: self.static_precomp_hits.load(Relaxed), misses: self.static_precomp_misses.load(Relaxed) }
     }
 
     /// Bytes of working textures the pool keeps for reuse (see [`GpuContext::trim_pool`]).
@@ -1724,67 +1759,52 @@ impl GpuContext {
             return None;
         }
         self.transfers.count(true, img.data.len() * 16);
-        let g = self.image(img.width, img.height);
-        self.queue.write_texture(
-            wgpu::TexelCopyTextureInfo { texture: &g.texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
-            bytemuck::cast_slice(&img.data),
-            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(img.width * 16), rows_per_image: Some(img.height) },
-            wgpu::Extent3d { width: img.width, height: img.height, depth_or_array_layers: 1 },
-        );
+        // A texture from the pool's shared free list: no open encoder can still read it, and the
+        // copy below runs before anything recorded after this call.
+        let (g, _) = self.pooled(img.width, img.height, UPLOAD_OWNER);
+        if !self.upload_staging.write(&self.device, &self.queue, img, &g.texture) {
+            self.queue.write_texture(
+                wgpu::TexelCopyTextureInfo { texture: &g.texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+                bytemuck::cast_slice(&img.data),
+                wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(img.width * 16), rows_per_image: Some(img.height) },
+                wgpu::Extent3d { width: img.width, height: img.height, depth_or_array_layers: 1 },
+            );
+        }
         Some(g)
     }
 
-    /// Upload an 8-bit layer source as normalized bytes instead of four floats per pixel.
-    /// `quantize` is true when the renderer deliberately deferred its project-depth rounding.
-    fn upload_image_8bit(&self, img: &Image, quantize: bool) -> Option<GpuImage> {
-        if !self.fits(img.width, img.height) {
-            return None;
+    /// Upload a decoded footage picture once while the footage source keeps it: every layer
+    /// and effect input showing the same frame shares the texture (`Renderer::footage_picture`).
+    pub(crate) fn upload_picture(&self, img: &Arc<Image>) -> Option<GpuImage> {
+        if let Some(t) = self.pictures.lock().ok().and_then(|mut p| p.get(img)) {
+            return Some(t);
         }
-        let byte_len = img.data.len() * 4;
-        // write_texture copies this slice before returning; keep the high-water buffer for the next layer.
-        RGBA8_UPLOAD_SCRATCH.with(|scratch| {
-            let mut storage = scratch.borrow_mut();
-            if storage.len() < byte_len {
-                storage.resize(byte_len, 0);
-            }
-            let bytes = &mut storage[..byte_len];
-            if quantize {
-                bytes.par_chunks_exact_mut(4).zip(img.data.par_iter()).with_min_len(4096).for_each(|(dst, px)| {
-                    // Float-to-u8 casts saturate to [0, 255]. Rounding each color first and
-                    // capping it by the rounded alpha is equivalent to clamping to alpha/255.
-                    let alpha = (px[3] * 255.0 + 0.5) as u8;
-                    dst[0] = ((px[0] * 255.0 + 0.5) as u8).min(alpha);
-                    dst[1] = ((px[1] * 255.0 + 0.5) as u8).min(alpha);
-                    dst[2] = ((px[2] * 255.0 + 0.5) as u8).min(alpha);
-                    dst[3] = alpha;
-                });
-            } else {
-                bytes.par_chunks_exact_mut(4).zip(img.data.par_iter()).with_min_len(4096).for_each(|(dst, px)| {
-                    dst[0] = (px[0] * 255.0 + 0.5) as u8;
-                    dst[1] = (px[1] * 255.0 + 0.5) as u8;
-                    dst[2] = (px[2] * 255.0 + 0.5) as u8;
-                    dst[3] = (px[3] * 255.0 + 0.5) as u8;
-                });
-            }
-            let texture = self.device.create_texture(&wgpu::TextureDescriptor {
-                label: Some("8-bit layer source"),
-                size: wgpu::Extent3d { width: img.width.max(1), height: img.height.max(1), depth_or_array_layers: 1 },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::Rgba8Unorm,
-                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::COPY_DST,
-                view_formats: &[],
-            });
-            self.transfers.count(true, byte_len);
-            self.queue.write_texture(
-                wgpu::TexelCopyTextureInfo { texture: &texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
-                bytes,
-                wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(img.width * 4), rows_per_image: Some(img.height) },
-                wgpu::Extent3d { width: img.width, height: img.height, depth_or_array_layers: 1 },
-            );
-            Some(GpuImage::new(texture, img.width, img.height))
-        })
+        let tex = self.upload_image(img)?;
+        if let Ok(mut p) = self.pictures.lock() {
+            p.insert(img, tex.clone(), crate::upload::PICTURE_BUDGET.min(self.upload_budget() / 4));
+        }
+        Some(tex)
+    }
+
+    /// Entries in the footage picture cache.
+    #[cfg(test)]
+    pub(crate) fn picture_entries(&self) -> usize {
+        self.pictures.lock().map(|p| p.len()).unwrap_or_default()
+    }
+
+    /// The upload staging buffers (tests).
+    #[cfg(test)]
+    pub(crate) fn upload_staging(&self) -> &crate::upload::Staging {
+        &self.upload_staging
+    }
+
+    /// A render is done: drop the footage picture textures and the upload staging buffers
+    /// (the next render's pictures upload again; their textures come from the pool).
+    pub fn trim_uploads(&self) {
+        if let Ok(mut p) = self.pictures.lock() {
+            p.clear();
+        }
+        self.upload_staging.clear();
     }
 
     /// Entries in the layer upload cache.
@@ -1796,44 +1816,22 @@ impl GpuContext {
     /// Upload a (layer cache) buffer, reusing the texture while the same `Arc` is alive: static
     /// layers upload once, not every frame.
     pub(crate) fn upload_buf(&self, buf: &Arc<Buf>) -> Option<GpuImage> {
-        self.upload_buf_format(buf, false, false)
-    }
-
-    /// Upload a project-quantized 8-bit layer source with one byte per channel.
-    pub(crate) fn upload_buf_8bit(&self, buf: &Arc<Buf>, quantize: bool) -> Option<GpuImage> {
-        self.upload_buf_format(buf, true, quantize)
-    }
-
-    fn upload_buf_format(&self, buf: &Arc<Buf>, rgba8: bool, quantize: bool) -> Option<GpuImage> {
-        if let Some(img) = self.cached_upload_buf(buf, rgba8, quantize) {
-            return Some(img);
-        }
-        let img = if rgba8 { self.upload_image_8bit(&buf.img, quantize)? } else { self.upload_image(&buf.img)? };
-        self.cache_upload_buf(buf, rgba8, quantize, img.clone());
-        Some(img)
-    }
-
-    fn cached_upload_buf(&self, buf: &Arc<Buf>, rgba8: bool, quantize: bool) -> Option<GpuImage> {
-        let key = (Arc::as_ptr(buf) as usize, rgba8, quantize);
+        let key = Arc::as_ptr(buf) as usize;
         if let Ok(mut u) = self.uploads.lock() {
             u.clock += 1;
             let now = u.clock;
-            if let Some(entry) = u.map.get_mut(&key)
-                && entry.buf.upgrade().is_some_and(|b| Arc::ptr_eq(&b, buf))
+            if let Some(e) = u.map.get_mut(&key)
+                && e.buf.upgrade().is_some_and(|b| Arc::ptr_eq(&b, buf))
             {
-                entry.last_use = now;
-                return Some(entry.img.clone());
+                e.last_use = now;
+                return Some(e.img.clone());
             }
         }
-        None
-    }
-
-    fn cache_upload_buf(&self, buf: &Arc<Buf>, rgba8: bool, quantize: bool, img: GpuImage) {
-        let key = (Arc::as_ptr(buf) as usize, rgba8, quantize);
+        let img = self.upload_image(&buf.img)?;
         if let Ok(mut u) = self.uploads.lock() {
-            let bytes = buf.img.data.len() * if rgba8 { 4 } else { 16 };
+            let bytes = buf.img.data.len() * 16;
             let now = u.clock;
-            if let Some(old) = u.map.insert(key, Upload { buf: Arc::downgrade(buf), img, bytes, last_use: now }) {
+            if let Some(old) = u.map.insert(key, Upload { buf: Arc::downgrade(buf), img: img.clone(), bytes, last_use: now }) {
                 u.bytes -= old.bytes;
             }
             u.bytes += bytes;
@@ -1841,7 +1839,7 @@ impl GpuContext {
             // makes a new one each time, and nothing can hit the old one again), then the least
             // recently used over budget.
             let budget = self.upload_budget();
-            let dead: Vec<(usize, bool, bool)> = u.map.iter().filter(|(_, e)| e.buf.strong_count() == 0).map(|(k, _)| *k).collect();
+            let dead: Vec<usize> = u.map.iter().filter(|(_, e)| e.buf.strong_count() == 0).map(|(k, _)| *k).collect();
             for k in dead {
                 if let Some(e) = u.map.remove(&k) {
                     u.bytes -= e.bytes;
@@ -1861,6 +1859,7 @@ impl GpuContext {
                 }
             }
         }
+        Some(img)
     }
 
     /// Forget uploaded layer textures.
@@ -1869,6 +1868,10 @@ impl GpuContext {
             u.map.clear();
             u.bytes = 0;
         }
+        if let Ok(mut p) = self.pictures.lock() {
+            p.clear();
+        }
+        self.upload_staging.clear();
         if let Ok(mut p) = self.pool.lock() {
             p.clear();
         }
@@ -1904,26 +1907,8 @@ pub(crate) struct Enc<'g> {
     missing: bool,
     /// This `Enc`'s id in the texture pool (textures it may reuse at once).
     owner: u64,
-    /// Dynamic per-dispatch parameters, written once per submitted batch.
-    uniform_buffer: wgpu::Buffer,
-    uniform_stride: usize,
-    uniform_capacity: usize,
-    uniform_data: Vec<u8>,
-    /// Dynamic offset for the next dispatch in `uniform_data`.
-    uniform_offset: u32,
     /// `owner` is lent ([`Enc::lent`]) and outlives this `Enc`.
     lent: bool,
-    /// Bounded memo for repeated, contentful static precomps in this frame.
-    static_comps: HashMap<effectcraft_render::CompFrameKey, GpuImage>,
-    static_comp_bytes: usize,
-    /// Bounded memo for duplicate plain footage layers in this frame.
-    footage_sources: HashMap<(effectcraft_render::GpuFootageSourceKey, bool), GpuImage>,
-    footage_source_bytes: usize,
-    /// Source images whose initial texture upload is encoded through one mapped staging buffer.
-    staged_uploads: HashMap<usize, StagedUpload>,
-    staged_to_copy: Vec<usize>,
-    staged_bytes: usize,
-    encoded_staged_bytes: usize,
 }
 
 /// Images bound to a compute kernel's source, optional auxiliary and output slots.
@@ -1950,44 +1935,9 @@ impl Drop for Enc<'_> {
 }
 
 impl<'g> Enc<'g> {
-    fn uniform_ring(g: &GpuContext) -> (wgpu::Buffer, usize, usize, Vec<u8>) {
-        let align = g.device.limits().min_uniform_buffer_offset_alignment as usize;
-        let stride = PARAMS_SIZE.div_ceil(align.max(1)) * align.max(1);
-        let capacity = (stride * UNIFORM_DISPATCHES).min(g.device.limits().max_buffer_size as usize);
-        let buffer = g.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("effectcraft dispatch uniforms"),
-            size: capacity as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        (buffer, stride, capacity, Vec::with_capacity(capacity))
-    }
-
     pub fn new(g: &'g GpuContext) -> Enc<'g> {
         let owner = g.pool.lock().map(|mut p| p.register()).unwrap_or(0);
-        let (uniform_buffer, uniform_stride, uniform_capacity, uniform_data) = Self::uniform_ring(g);
-        Enc {
-            g,
-            enc: None,
-            last_submit: None,
-            pending: 0,
-            missing: false,
-            owner,
-            uniform_buffer,
-            uniform_stride,
-            uniform_capacity,
-            uniform_data,
-            uniform_offset: 0,
-            lent: false,
-            static_comps: HashMap::new(),
-            static_comp_bytes: 0,
-            footage_sources: HashMap::new(),
-            footage_source_bytes: 0,
-            staged_uploads: HashMap::new(),
-            staged_to_copy: Vec::new(),
-            staged_bytes: 0,
-            encoded_staged_bytes: 0,
-        }
+        Enc { g, enc: None, last_submit: None, pending: 0, missing: false, owner, lent: false }
     }
 
     /// An `Enc` for self-contained work (an effect chain): once it is dropped, its working
@@ -1999,196 +1949,7 @@ impl<'g> Enc<'g> {
     /// effect's intermediates stayed allocated until the frame ended.
     pub(crate) fn lent(g: &'g GpuContext) -> Enc<'g> {
         let owner = g.pool.lock().map(|mut p| p.lend()).unwrap_or(0);
-        let (uniform_buffer, uniform_stride, uniform_capacity, uniform_data) = Self::uniform_ring(g);
-        Enc {
-            g,
-            enc: None,
-            last_submit: None,
-            pending: 0,
-            missing: false,
-            owner,
-            uniform_buffer,
-            uniform_stride,
-            uniform_capacity,
-            uniform_data,
-            uniform_offset: 0,
-            lent: true,
-            static_comps: HashMap::new(),
-            static_comp_bytes: 0,
-            footage_sources: HashMap::new(),
-            footage_source_bytes: 0,
-            staged_uploads: HashMap::new(),
-            staged_to_copy: Vec::new(),
-            staged_bytes: 0,
-            encoded_staged_bytes: 0,
-        }
-    }
-
-    pub fn static_comp(&mut self, key: &effectcraft_render::CompFrameKey) -> Option<GpuImage> {
-        let image = self.static_comps.get(key).cloned();
-        let counter = if image.is_some() { &self.g.static_precomp_hits } else { &self.g.static_precomp_misses };
-        counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        image
-    }
-
-    pub fn cache_static_comp(&mut self, key: effectcraft_render::CompFrameKey, image: &GpuImage) {
-        let bytes = image.width as usize * image.height as usize * 16;
-        if bytes == 0 || bytes > STATIC_PRECOMP_CACHE_SINGLE || self.static_comps.contains_key(&key) {
-            return;
-        }
-        if self.static_comp_bytes.saturating_add(bytes) > STATIC_PRECOMP_CACHE_BYTES {
-            self.static_comps.clear();
-            self.static_comp_bytes = 0;
-        }
-        self.static_comps.insert(key, image.clone());
-        self.static_comp_bytes += bytes;
-    }
-
-    /// Upload a plain footage source once per stable item/frame key in this encoder.
-    pub fn upload_footage_source(&mut self, key: effectcraft_render::GpuFootageSourceKey, buf: &Arc<Buf>) -> Option<GpuImage> {
-        let cache_key = (key, false);
-        if let Some(image) = self.footage_sources.get(&cache_key).cloned() {
-            self.uses(&image);
-            return Some(image);
-        }
-        let image = self.g.upload_buf(buf)?;
-        self.uses(&image);
-        let bytes = image.width as usize * image.height as usize * 16;
-        if bytes <= FRAME_SOURCE_CACHE_BYTES && self.footage_source_bytes.saturating_add(bytes) <= FRAME_SOURCE_CACHE_BYTES {
-            self.footage_sources.insert(cache_key, image.clone());
-            self.footage_source_bytes += bytes;
-        }
-        Some(image)
-    }
-
-    /// Upload a quantized plain-footage source once in compact RGBA8 form for this frame.
-    pub fn upload_footage_source_8bit(&mut self, key: effectcraft_render::GpuFootageSourceKey, buf: &Arc<Buf>, quantize: bool) -> Option<GpuImage> {
-        let cache_key = (key, true);
-        if let Some(image) = self.footage_sources.get(&cache_key).cloned() {
-            self.uses(&image);
-            return Some(image);
-        }
-        let image = self.g.upload_buf_8bit(buf, quantize)?;
-        self.uses(&image);
-        let bytes = image.width as usize * image.height as usize * 4;
-        if bytes <= FRAME_SOURCE_CACHE_BYTES && self.footage_source_bytes.saturating_add(bytes) <= FRAME_SOURCE_CACHE_BYTES {
-            self.footage_sources.insert(cache_key, image.clone());
-            self.footage_source_bytes += bytes;
-        }
-        Some(image)
-    }
-
-    /// Like [`Self::upload_footage_source`], but queue a buffer-to-texture copy through the
-    /// frame's staging batch. The renderer calls this before issuing the ordered layer draws.
-    pub fn stage_footage_source(&mut self, key: effectcraft_render::GpuFootageSourceKey, buf: &Arc<Buf>) -> Option<GpuImage> {
-        let cache_key = (key, false);
-        if let Some(image) = self.footage_sources.get(&cache_key).cloned() {
-            self.uses(&image);
-            return Some(image);
-        }
-        let image = if key.is_static() { self.g.upload_buf(buf)? } else { self.stage_upload_buf(buf)? };
-        self.uses(&image);
-        let bytes = image.width as usize * image.height as usize * 16;
-        if bytes <= FRAME_SOURCE_CACHE_BYTES && self.footage_source_bytes.saturating_add(bytes) <= FRAME_SOURCE_CACHE_BYTES {
-            self.footage_sources.insert(cache_key, image.clone());
-            self.footage_source_bytes += bytes;
-        }
-        Some(image)
-    }
-
-    /// Prepare an RGBA32Float source texture and defer its transfer until [`Self::flush_staged_uploads`].
-    pub fn stage_upload_buf(&mut self, buf: &Arc<Buf>) -> Option<GpuImage> {
-        if !self.g.fits(buf.img.width, buf.img.height) {
-            return None;
-        }
-        if let Some(image) = self.g.cached_upload_buf(buf, false, false) {
-            return Some(image);
-        }
-        let key = Arc::as_ptr(buf) as usize;
-        if let Some(upload) = self.staged_uploads.get(&key)
-            && Arc::ptr_eq(&upload.buf, buf)
-        {
-            return Some(upload.img.clone());
-        }
-        let row_bytes = buf.img.width as usize * 16;
-        let bytes_per_row = row_bytes.div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT as usize) * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT as usize;
-        let bytes = bytes_per_row.saturating_mul(buf.img.height as usize);
-        if self.encoded_staged_bytes.saturating_add(self.staged_bytes).saturating_add(bytes) > STAGED_UPLOAD_LIMIT
-            && (!self.staged_to_copy.is_empty() || self.encoded_staged_bytes > 0)
-        {
-            self.flush_staged_uploads();
-            self.submit();
-        }
-        let image = self.g.image(buf.img.width, buf.img.height);
-        self.g.transfers.count(true, buf.img.data.len() * 16);
-        self.staged_uploads.insert(key, StagedUpload { buf: buf.clone(), img: image.clone(), offset: 0, bytes_per_row: bytes_per_row as u32 });
-        self.staged_to_copy.push(key);
-        self.staged_bytes = self.staged_bytes.saturating_add(bytes);
-        if self.staged_bytes >= STAGED_UPLOAD_LIMIT {
-            self.flush_staged_uploads();
-        }
-        if self.encoded_staged_bytes >= STAGED_UPLOAD_LIMIT {
-            self.submit();
-        }
-        Some(image)
-    }
-
-    /// Record the pending source copies as one padded, mapped staging buffer.
-    pub fn flush_staged_uploads(&mut self) {
-        if self.staged_to_copy.is_empty() {
-            return;
-        }
-        let mut cursor = 0usize;
-        for key in &self.staged_to_copy {
-            let upload = self.staged_uploads.get_mut(key).expect("staged upload");
-            cursor = cursor.div_ceil(wgpu::COPY_BUFFER_ALIGNMENT as usize) * wgpu::COPY_BUFFER_ALIGNMENT as usize;
-            upload.offset = cursor as u64;
-            let rows = upload.bytes_per_row as usize * upload.img.height as usize;
-            cursor = cursor.saturating_add(rows);
-        }
-        let buffer = self.g.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("effectcraft batched source uploads"),
-            size: cursor.max(4) as u64,
-            usage: wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: true,
-        });
-        self.encoded_staged_bytes = self.encoded_staged_bytes.saturating_add(cursor);
-        {
-            let mut mapped = buffer.slice(..).get_mapped_range_mut().expect("mapped staging buffer");
-            for key in &self.staged_to_copy {
-                let upload = &self.staged_uploads[key];
-                let row_bytes = upload.img.width as usize * 16;
-                let stride = upload.bytes_per_row as usize;
-                let base = upload.offset as usize;
-                let source = bytemuck::cast_slice::<[f32; 4], u8>(&upload.buf.img.data);
-                for row in 0..upload.img.height as usize {
-                    let src = &source[row * row_bytes..(row + 1) * row_bytes];
-                    mapped.slice(base + row * stride..base + row * stride + row_bytes).copy_from_slice(src);
-                }
-            }
-        }
-        buffer.unmap();
-        let copies: Vec<_> = self
-            .staged_to_copy
-            .iter()
-            .map(|key| {
-                let upload = &self.staged_uploads[key];
-                (upload.img.texture.clone(), upload.offset, upload.bytes_per_row, upload.img.width, upload.img.height)
-            })
-            .collect();
-        let enc = self.encoder();
-        for (texture, offset, bytes_per_row, width, height) in copies {
-            enc.copy_buffer_to_texture(
-                wgpu::TexelCopyBufferInfo {
-                    buffer: &buffer,
-                    layout: wgpu::TexelCopyBufferLayout { offset, bytes_per_row: Some(bytes_per_row), rows_per_image: Some(height) },
-                },
-                wgpu::TexelCopyTextureInfo { texture: &texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
-                wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
-            );
-        }
-        self.staged_to_copy.clear();
-        self.staged_bytes = 0;
+        Enc { g, enc: None, last_submit: None, pending: 0, missing: false, owner, lent: true }
     }
 
     /// `img` is used by this `Enc`: if another `Enc` made it, that one must not reuse it at once
@@ -2282,20 +2043,13 @@ impl<'g> Enc<'g> {
         groups: (u32, u32),
         ext: Option<[&wgpu::Buffer; 4]>,
     ) {
-        if self.uniform_offset as usize + self.uniform_stride > self.uniform_capacity {
-            self.submit();
-        }
         let KernelImages { src, aux, out } = images;
         let g = self.g;
         let Some(pipe) = g.pipeline(entry) else {
             self.missing = true;
             return;
         };
-        let uniform_offset = self.uniform_offset;
-        self.uniform_data.extend_from_slice(bytemuck::bytes_of(p));
-        let padded = uniform_offset as usize + self.uniform_stride;
-        self.uniform_data.resize(padded, 0);
-        self.uniform_offset += self.uniform_stride as u32;
+        let ub = g.buffer_init(None, &p.bytes(), wgpu::BufferUsages::UNIFORM);
         let sv = src.texture.create_view(&Default::default());
         let av = aux.map(|a| a.texture.create_view(&Default::default()));
         let ov = out.texture.create_view(&Default::default());
@@ -2303,14 +2057,7 @@ impl<'g> Enc<'g> {
             label: None,
             layout: &g.bgl,
             entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                        buffer: &self.uniform_buffer,
-                        offset: 0,
-                        size: std::num::NonZeroU64::new(PARAMS_SIZE as u64),
-                    }),
-                },
+                wgpu::BindGroupEntry { binding: 0, resource: ub.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&sv) },
                 wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(av.as_ref().unwrap_or(&g.dummy_tex)) },
                 wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&ov) },
@@ -2334,7 +2081,7 @@ impl<'g> Enc<'g> {
         {
             let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some(entry), timestamp_writes: None });
             pass.set_pipeline(pipe);
-            pass.set_bind_group(0, &bg, &[uniform_offset]);
+            pass.set_bind_group(0, &bg, &[]);
             if let Some(b) = &bg_ext {
                 pass.set_bind_group(1, b, &[]);
             }
@@ -2342,7 +2089,7 @@ impl<'g> Enc<'g> {
         }
         self.pending += 1;
         // Keep command buffers (and the transient textures they hold) bounded.
-        if self.pending >= UNIFORM_DISPATCHES || self.uniform_offset as usize >= self.uniform_capacity {
+        if self.pending >= 256 {
             self.submit();
         }
     }
@@ -2351,51 +2098,6 @@ impl<'g> Enc<'g> {
     pub fn pixels(&mut self, entry: &str, p: &Params, src: &GpuImage, aux: Option<&GpuImage>, out: &GpuImage, data: Option<&wgpu::Buffer>) {
         let groups = (out.width.div_ceil(16), out.height.div_ceil(16));
         self.dispatch(entry, p, KernelImages { src, aux, out }, data, groups);
-    }
-
-    /// Copy a full-size canvas before a kernel updates one region.
-    pub fn copy_image(&mut self, src: &GpuImage, dst: &GpuImage) {
-        if src.width != dst.width || src.height != dst.height {
-            return;
-        }
-        self.copy_region(src, dst, (0, 0, src.width, src.height));
-    }
-
-    /// Copy a rectangle from one same-size canvas to another.
-    pub fn copy_region(&mut self, src: &GpuImage, dst: &GpuImage, region: (u32, u32, u32, u32)) {
-        if src.width != dst.width || src.height != dst.height {
-            return;
-        }
-        let (x0, y0, x1, y1) = region;
-        if x0 >= x1 || y0 >= y1 || x1 > src.width || y1 > src.height {
-            return;
-        }
-        self.record(&[src, dst]).copy_texture_to_texture(
-            wgpu::TexelCopyTextureInfo { texture: &src.texture, mip_level: 0, origin: wgpu::Origin3d { x: x0, y: y0, z: 0 }, aspect: wgpu::TextureAspect::All },
-            wgpu::TexelCopyTextureInfo { texture: &dst.texture, mip_level: 0, origin: wgpu::Origin3d { x: x0, y: y0, z: 0 }, aspect: wgpu::TextureAspect::All },
-            wgpu::Extent3d { width: x1 - x0, height: y1 - y0, depth_or_array_layers: 1 },
-        );
-    }
-
-    /// Dispatch a warp over its bounds, aligned to the 16×16 workgroup grid.
-    pub fn pixels_region(
-        &mut self,
-        entry: &str,
-        p: &Params,
-        src: &GpuImage,
-        aux: Option<&GpuImage>,
-        out: &GpuImage,
-        region: (u32, u32, u32, u32),
-        data: Option<&wgpu::Buffer>,
-    ) {
-        let (x0, y0, x1, y1) = region;
-        let gx0 = x0 / 16;
-        let gy0 = y0 / 16;
-        let gx1 = x1.div_ceil(16);
-        let gy1 = y1.div_ceil(16);
-        let mut params = *p;
-        params.u[3] = [gx0 * 16, gy0 * 16, 0, 0];
-        self.dispatch(entry, &params, KernelImages { src, aux, out }, data, (gx1.saturating_sub(gx0), gy1.saturating_sub(gy0)));
     }
 
     /// Copy `src` into a larger zeroed image at (`x`, `y`) (Buf::pad).
@@ -2426,24 +2128,19 @@ impl<'g> Enc<'g> {
         dst
     }
 
+    /// The last submission of this encoder's work (what a readback after it waits for).
+    pub(crate) fn last_submission(&self) -> Option<wgpu::SubmissionIndex> {
+        self.last_submit.clone()
+    }
+
     /// Submit recorded work.
     pub fn submit(&mut self) {
-        self.flush_staged_uploads();
         if let Some((enc, id)) = self.enc.take() {
-            if !self.uniform_data.is_empty() {
-                self.g.queue.write_buffer(&self.uniform_buffer, 0, &self.uniform_data);
-            }
             self.last_submit = Some(self.g.queue.submit([enc.finish()]));
-            self.uniform_data.clear();
-            self.uniform_offset = 0;
             if let Ok(mut p) = self.g.pool.lock() {
                 p.close(id);
             }
         }
-        for (_, upload) in std::mem::take(&mut self.staged_uploads) {
-            self.g.cache_upload_buf(&upload.buf, false, false, upload.img);
-        }
-        self.encoded_staged_bytes = 0;
         self.pending = 0;
     }
 
@@ -2454,6 +2151,7 @@ impl<'g> Enc<'g> {
             return;
         }
         let allocated = self.g.allocated_bytes();
+        self.g.memcap.note(allocated);
         if allocated <= self.g.memcap.cap() {
             let _ = self.g.memcap.should_wait(allocated, 0);
             return;
@@ -2478,13 +2176,13 @@ impl<'g> Enc<'g> {
         let layout = crate::readback::Layout::new(img.width, img.height, 16, self.g.device.limits().max_buffer_size)
             .map_err(|e| log::error!("gpu image readback: {e}"))
             .ok()?;
-        let mut data = Vec::new();
-        data.try_reserve_exact(layout.len / 16).map_err(|e| log::error!("gpu image allocation: {e}")).ok()?;
-        data.resize(layout.len / 16, [0.0; 4]);
-        let mut out = Image { width: img.width, height: img.height, data };
-        let dst: &mut [u8] = bytemuck::cast_slice_mut(&mut out.data);
-        self.read_texture_into(&img.texture, [0, 0, img.width, img.height], 16, dst)?;
-        Some(out)
+        // The mapped rows go straight into the image's pixels: one copy (#3335).
+        let data: Vec<[f32; 4]> = self.read_texture_with(&img.texture, [0, 0, img.width, img.height], 16, crate::readback::rows::<[f32; 4]>)?;
+        if data.len() != layout.len / 16 {
+            log::error!("gpu image readback size mismatch");
+            return None;
+        }
+        Some(Image { width: img.width, height: img.height, data })
     }
 
     /// Tightly packed texel bytes of a texture (`bpp` bytes per pixel).
@@ -2497,27 +2195,32 @@ impl<'g> Enc<'g> {
     pub fn read_rect(&mut self, texture: &wgpu::Texture, x: u32, y: u32, w: u32, h: u32, bpp: u32) -> Option<Vec<u8>> {
         let layout =
             crate::readback::Layout::new(w, h, bpp, self.g.device.limits().max_buffer_size).map_err(|e| log::error!("gpu texture readback: {e}")).ok()?;
-        let mut out = Vec::new();
-        out.try_reserve_exact(layout.len).map_err(|e| log::error!("gpu readback allocation: {e}")).ok()?;
-        out.resize(layout.len, 0);
-        self.read_texture_into(texture, [x, y, w, h], bpp, &mut out)?;
+        let out: Vec<u8> = self.read_texture_with(texture, [x, y, w, h], bpp, crate::readback::rows::<u8>)?;
+        if out.len() != layout.len {
+            log::error!("gpu texture readback size mismatch");
+            return None;
+        }
         Some(out)
     }
 
-    /// [`Enc::read_rect`] into `out` (`w × bpp × h` bytes), through a reused staging buffer.
-    /// `rect` is `[x, y, w, h]`.
-    fn read_texture_into(&mut self, texture: &wgpu::Texture, rect: [u32; 4], bpp: u32, out: &mut [u8]) -> Option<()> {
+    /// Read `rect` (`[x, y, w, h]`) of `texture` back through a reused staging buffer: `read`
+    /// gets the mapped bytes, the row length, the padded row stride and the row count, and
+    /// copies the rows into their destination itself (one copy, #3335). Waits only for this
+    /// encoder's own submission, so frames rendering on other threads don't delay it.
+    fn read_texture_with<R>(
+        &mut self,
+        texture: &wgpu::Texture,
+        rect: [u32; 4],
+        bpp: u32,
+        read: impl FnOnce(&[u8], usize, usize, usize) -> Result<R, String>,
+    ) -> Option<R> {
         let [x, y, w, h] = rect;
         if !self.g.can_wait() {
             return None;
         }
-        self.g.transfers.count(false, out.len());
         let layout =
             crate::readback::Layout::new(w, h, bpp, self.g.device.limits().max_buffer_size).map_err(|e| log::error!("gpu texture readback: {e}")).ok()?;
-        if out.len() != layout.len {
-            log::error!("gpu readback destination size mismatch");
-            return None;
-        }
+        self.g.transfers.count(false, layout.len);
         let row = layout.row as usize;
         let padded = layout.stride;
         let size = layout.size;
@@ -2535,12 +2238,11 @@ impl<'g> Enc<'g> {
             wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
         );
         self.submit();
-        let bytes = self.g.read_buffer(&buf, row, padded as usize, h as usize).map_err(|e| log::error!("gpu texture readback: {e}")).ok()?;
-        if bytes.len() != out.len() {
-            log::error!("gpu texture readback size mismatch");
-            return None;
-        }
-        out.copy_from_slice(&bytes);
+        let out = self
+            .g
+            .read_mapped(&buf, self.last_submit.clone(), |view| read(view, row, padded as usize, h as usize))
+            .map_err(|e| log::error!("gpu texture readback: {e}"))
+            .ok()?;
         // Keep a few staging buffers per size (frames read back at the same size every time).
         // Layers whose bounds change every frame read back at a new size each time: drop the
         // other sizes once over budget, or mapped host memory grows for the whole render (#2081).
@@ -2554,7 +2256,7 @@ impl<'g> Enc<'g> {
                 v.push(buf);
             }
         }
-        Some(())
+        Some(out)
     }
 
     /// [`Enc::read_texture`] without waiting for the GPU (the browser's main thread can't): `done`
