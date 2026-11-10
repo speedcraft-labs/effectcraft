@@ -210,3 +210,46 @@ fn relative_sequence_paths_still_resolve_and_validate_on_open() {
     assert_eq!(footage.path, "/tmp/media/shot_0001.exr");
     assert_eq!(&*footage.sequence, &["/tmp/media/shot_0001.exr", "/tmp/media/shot_0002.exr"]);
 }
+
+#[test]
+fn reveal_deleted_file_in_existing_folder_offers_relink_guidance() {
+    let dir = std::env::temp_dir().join(format!("ec-reveal-offline-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut s = Session::default();
+    let file = dir.join("deleted.png");
+    let id = std::sync::Arc::make_mut(&mut s.project).add_item(
+        "Deleted",
+        Default::default(),
+        None,
+        ItemKind::Footage(Footage { path: file.to_string_lossy().into_owned(), ..Default::default() }),
+    );
+    let err = s.execute("file.revealInFinder", json!({"item": id.0})).unwrap_err().to_string();
+    assert!(err.contains("deleted.png") && err.contains("Relink Missing Footage"), "{err}");
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn relative_proxy_is_resolved_and_checked_next_to_the_project() {
+    let dir = std::env::temp_dir().join(format!("ec-proxy-path-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("proxy.png"), b"x").unwrap();
+    let mut s = Session::default();
+    let id = Arc::make_mut(&mut s.project).add_item(
+        "Plate",
+        Default::default(),
+        None,
+        ItemKind::Footage(Footage { path: dir.join("proxy.png").to_string_lossy().into_owned(), width: 64, height: 32, ..Default::default() }),
+    );
+    Arc::make_mut(&mut s.project).item_mut(id).unwrap().proxy = Some(Box::new(effectcraft_project::Proxy {
+        footage: Footage { path: "proxy.png".into(), width: 32, height: 16, ..Default::default() },
+        enabled: true,
+    }));
+    let project = dir.join("project.ecproj");
+    s.execute("file.saveAs", json!({"path": project})).unwrap();
+    let mut reopened = Session::default();
+    reopened.execute("file.open", json!({"path": project})).unwrap();
+    let result = reopened.execute("footage.check", json!({"wait": true})).unwrap();
+    assert_eq!(result, json!({"checked": 2, "missing": 0, "probed": 0}));
+    assert_eq!(std::path::Path::new(&reopened.project.item(id).unwrap().proxy.as_ref().unwrap().footage.path), dir.join("proxy.png"));
+    std::fs::remove_dir_all(dir).unwrap();
+}

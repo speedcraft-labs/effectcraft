@@ -68,8 +68,13 @@ mod footage_buffer_cache_tests {
     fn processed_footage_buffers_are_shared_by_source_identity() {
         let cache = FootageBufferCache::default();
         let first = Arc::new(Buf { img: Image::filled(2, 2, [0.2, 0.4, 0.6, 1.0]), offset: [0.0; 2], scale: 1.0 });
-        assert!(Arc::ptr_eq(&cache.insert(key(7), first.clone()), &first));
-        assert!(Arc::ptr_eq(&cache.get(key(7)).unwrap(), &first));
+        let files = Arc::default();
+        let (inserted, inserted_files) = cache.insert(key(7), first.clone(), files.clone());
+        assert!(Arc::ptr_eq(&inserted, &first));
+        assert!(Arc::ptr_eq(&inserted_files, &files));
+        let (cached, cached_files) = cache.get(key(7)).unwrap();
+        assert!(Arc::ptr_eq(&cached, &first));
+        assert!(Arc::ptr_eq(&cached_files, &files));
         assert!(cache.get(key(8)).is_none());
     }
 
@@ -77,7 +82,9 @@ mod footage_buffer_cache_tests {
     fn oversized_footage_frames_are_not_retained() {
         let cache = FootageBufferCache::default();
         let buf = Arc::new(Buf { img: Image::filled(2049, 2049, [0.0; 4]), offset: [0.0; 2], scale: 1.0 });
-        assert!(Arc::ptr_eq(&cache.insert(key(7), buf.clone()), &buf));
+        let files = Arc::default();
+        let (inserted, _) = cache.insert(key(7), buf.clone(), files);
+        assert!(Arc::ptr_eq(&inserted, &buf));
         assert!(cache.get(key(7)).is_none());
     }
 }
@@ -102,6 +109,17 @@ impl Shutter {
         let f = if n > 1 { i as f64 / (n - 1) as f64 } else { 0.0 };
         (self.phase + self.angle * f) * self.frame
     }
+}
+
+/// `files` (a content's) with the files of the buffers made of it that the layer cache kept:
+/// `files` itself when they are all its own.
+fn with_kept_files(files: Arc<crate::reads::ReadFiles>, kept: &[Arc<crate::reads::ReadFiles>]) -> Arc<crate::reads::ReadFiles> {
+    if kept.iter().all(|f| Arc::ptr_eq(f, &files)) {
+        return files;
+    }
+    let mut all = (*files).clone();
+    kept.iter().for_each(|f| all.extend(f));
+    Arc::new(all)
 }
 
 impl<'a> Renderer<'a> {
@@ -141,7 +159,7 @@ impl<'a> Renderer<'a> {
 
     /// The layer with its styles: exterior passes and body (cached per pass).
     pub(crate) fn styled(&self, ctx: &EvalCtx, layer: &Layer, mut timing: Option<&mut LayerTiming>) -> Option<StyledLayer> {
-        let (content, ckey) = self.content_buf_timed(ctx, layer, timing.as_deref_mut())?;
+        let (content, ckey, files) = self.content_buf_timed(ctx, layer, timing.as_deref_mut())?;
         if !styles::active(ctx, layer) {
             return Some(StyledLayer {
                 passes: vec![],
@@ -153,16 +171,37 @@ impl<'a> Renderer<'a> {
                 quantize_source: false,
                 solid_color: None,
                 solid_size: None,
+                files,
             });
         }
         let modes = styles::pass_modes(ctx, layer);
         let key = ckey.map(|k| cache::styles_key(ctx, layer, k));
-        if let (Some(c), Some(k)) = (self.cache, key)
-            && let Some(body) = c.get(k)
-        {
-            let passes: Option<Vec<_>> = modes.iter().enumerate().map(|(i, m)| c.get(cache::derive(k, i as u64 + 1)).map(|b| (b, *m))).collect();
+        if let Some((body, body_files)) = self.cached(key) {
+            let mut kept_files = vec![body_files];
+            let passes: Option<Vec<_>> = modes
+                .iter()
+                .enumerate()
+                .map(|(i, m)| {
+                    self.cached(key.map(|k| cache::derive(k, i as u64 + 1))).map(|(b, f)| {
+                        kept_files.push(f);
+                        (b, *m)
+                    })
+                })
+                .collect();
             if let Some(passes) = passes {
-                return Some(StyledLayer { passes, body, content, key, ckey, plain: false, quantize_source: false, solid_color: None, solid_size: None });
+                let files = with_kept_files(files, &kept_files);
+                return Some(StyledLayer {
+                    passes,
+                    body,
+                    content,
+                    key,
+                    ckey,
+                    plain: false,
+                    quantize_source: false,
+                    solid_color: None,
+                    solid_size: None,
+                    files,
+                });
             }
         }
         let t0 = web_time::Instant::now();
@@ -173,16 +212,21 @@ impl<'a> Renderer<'a> {
             t.cached = false;
             t.effects.push(("layerStyles".into(), t0.elapsed().as_secs_f64() * 1e3));
         }
-        let mut body = Arc::new(st.body);
-        let mut passes: Vec<_> = st.passes.into_iter().map(|(b, m)| (Arc::new(b), m)).collect();
-        // The buffers the cache keeps (another worker's, if it kept them first).
-        if let (Some(c), Some(k)) = (self.cache_to_keep(), key) {
-            body = c.insert(k, body);
-            for (i, (b, _)) in passes.iter_mut().enumerate() {
-                *b = c.insert(cache::derive(k, i as u64 + 1), b.clone());
-            }
-        }
-        Some(StyledLayer { passes, body, content, key, ckey, plain: false, quantize_source: false, solid_color: None, solid_size: None })
+        let mut kept_files = vec![];
+        let (body, f) = self.keep(key, Arc::new(st.body), &files);
+        kept_files.push(f);
+        let passes: Vec<_> = st
+            .passes
+            .into_iter()
+            .enumerate()
+            .map(|(i, (b, m))| {
+                let (b, f) = self.keep(key.map(|k| cache::derive(k, i as u64 + 1)), Arc::new(b), &files);
+                kept_files.push(f);
+                (b, m)
+            })
+            .collect();
+        let files = with_kept_files(files, &kept_files);
+        Some(StyledLayer { passes, body, content, key, ckey, plain: false, quantize_source: false, solid_color: None, solid_size: None, files })
     }
 
     /// The styled layer's buffers in the blending space.
@@ -190,9 +234,10 @@ impl<'a> Renderer<'a> {
         if self.pipe.to_blend().is_none() {
             return st;
         }
-        let body = self.to_blend(st.body, st.key);
-        let content = if st.plain { body.clone() } else { self.to_blend(st.content, st.ckey) };
-        let passes = st.passes.into_iter().enumerate().map(|(i, (b, m))| (self.to_blend(b, st.key.map(|k| cache::derive(k, i as u64 + 1))), m)).collect();
+        let body = self.to_blend(st.body, st.key, &st.files);
+        let content = if st.plain { body.clone() } else { self.to_blend(st.content, st.ckey, &st.files) };
+        let passes =
+            st.passes.into_iter().enumerate().map(|(i, (b, m))| (self.to_blend(b, st.key.map(|k| cache::derive(k, i as u64 + 1)), &st.files), m)).collect();
         StyledLayer { passes, body, content, ..st }
     }
 
@@ -373,7 +418,11 @@ impl<'a> Renderer<'a> {
     /// A processed-layer cache key that also covers content motion blur (the averaged source
     /// depends on the content at every sub-sample).
     pub(crate) fn content_key(&self, ctx: &EvalCtx, layer: &Layer, key: Option<u64>) -> Option<u64> {
-        let k = key?;
+        let k = self.mask_gate_key(ctx, layer, key)?;
+        // A layer that reads other layers through its effects' layer parameters gets them drawn
+        // by this renderer: the switches it passes down (Switches Affect Nested Comps, the
+        // precomp layers above, motion blur on) change those pixels, not just the layers' own.
+        let k = if cache::reads_layers(ctx, layer) { cache::derive(k, self.nested_look()) } else { k };
         let Some(times) = self.content_times(ctx, layer) else { return Some(k) };
         times.iter().try_fold(cache::derive(k, 0x6d62_6c72), |d, t| Some(cache::derive(d, cache::layer_key(&ctx.at(*t), layer, 1.0, false, false)?)))
     }
@@ -392,6 +441,23 @@ impl<'a> Renderer<'a> {
             layer: self.layer_motion_blur(layer),
             samples: if self.opts.draft { 4 } else { ctx.comp.motion_blur_samples as usize },
         }
+    }
+
+    /// A cache key of a masked layer's buffer, told apart when mask motion blur can't run at all
+    /// in this render ([`Self::mask_blur`]'s gate: the render options, the precomp layers above).
+    /// The key has the layer's own motion blur state, but a mask set to On blurs without it.
+    pub(crate) fn mask_gate_key(&self, ctx: &EvalCtx, layer: &Layer, key: Option<u64>) -> Option<u64> {
+        // Queue jobs share this cache but may override Proxy Use differently. The item's
+        // proxy switch alone does not describe the source a renderer actually reads.
+        let k = key?;
+        let k = match self.opts.proxy {
+            effectcraft_project::render_queue::ProxyUse::CurrentSettings => k,
+            effectcraft_project::render_queue::ProxyUse::UseAll => cache::derive(k, 0x7072_6f78_7901),
+            effectcraft_project::render_queue::ProxyUse::UseCompOnly => cache::derive(k, 0x7072_6f78_7902),
+            effectcraft_project::render_queue::ProxyUse::UseNone => cache::derive(k, 0x7072_6f78_7903),
+        };
+        let masked = layer.masks().is_some_and(|m| !m.children.is_empty());
+        Some(if masked && !self.mask_blur(ctx, layer).allowed { cache::derive(k, 0x6d62_6f66) } else { k })
     }
 
     /// Motion-blur sub-samples for a layer buffer (1 = no motion blur). As in After Effects, a 2D
@@ -579,6 +645,7 @@ impl<'a> Renderer<'a> {
                 quantize_source: false,
                 solid_color: None,
                 solid_size: None,
+                files: Arc::default(),
             });
         }
         self.styled(ctx, layer, timing)
@@ -601,6 +668,7 @@ impl<'a> Renderer<'a> {
                 quantize_source: false,
                 solid_color: Some(color),
                 solid_size: Some(size),
+                files: Arc::default(),
             });
         }
         self.styled_for_draw(ctx, layer, None)
@@ -945,17 +1013,19 @@ pub struct StyledLayer {
     /// Pre-style pixels (knockout shape).
     pub content: Arc<Buf>,
     /// Styled cache key (the content key when plain).
-    pub(crate) key: Option<u64>,
+    pub key: Option<u64>,
     /// Content cache key.
-    ckey: Option<u64>,
+    pub ckey: Option<u64>,
     /// No layer styles: composite `body` the usual way.
     pub plain: bool,
-    /// The GPU will quantize these unquantized source pixels before sampling.
+    /// The GPU will quantize these unquantized source pixels.
     pub(crate) quantize_source: bool,
     /// A uniform opaque source that the GPU samples without a full source texture.
     pub solid_color: Option<[f32; 4]>,
     /// The logical dimensions of `solid_color` in its final mip.
     pub solid_size: Option<(u32, u32)>,
+    /// The source files the layer's buffers were made of (see [`crate::reads`]).
+    pub(crate) files: Arc<crate::reads::ReadFiles>,
 }
 
 impl StyledLayer {
