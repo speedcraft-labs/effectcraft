@@ -713,6 +713,12 @@ struct StagedUpload {
     bytes_per_row: u32,
 }
 
+struct FootageSourceEntry {
+    image: GpuImage,
+    bytes: usize,
+    last_use: u64,
+}
+
 const STAGED_UPLOAD_LIMIT: usize = 64 * 1024 * 1024;
 
 /// The device and everything compiled for it.
@@ -1917,8 +1923,9 @@ pub(crate) struct Enc<'g> {
     static_comps: HashMap<effectcraft_render::CompFrameKey, GpuImage>,
     static_comp_bytes: usize,
     /// Bounded memo for duplicate plain footage layers in this frame.
-    footage_sources: HashMap<(effectcraft_render::GpuFootageSourceKey, bool), GpuImage>,
+    footage_sources: HashMap<(effectcraft_render::GpuFootageSourceKey, bool), FootageSourceEntry>,
     footage_source_bytes: usize,
+    footage_source_clock: u64,
     /// Source images whose initial texture upload is encoded through one mapped staging buffer.
     staged_uploads: HashMap<usize, StagedUpload>,
     staged_to_copy: Vec<usize>,
@@ -1983,6 +1990,7 @@ impl<'g> Enc<'g> {
             static_comp_bytes: 0,
             footage_sources: HashMap::new(),
             footage_source_bytes: 0,
+            footage_source_clock: 0,
             staged_uploads: HashMap::new(),
             staged_to_copy: Vec::new(),
             staged_bytes: 0,
@@ -2017,6 +2025,7 @@ impl<'g> Enc<'g> {
             static_comp_bytes: 0,
             footage_sources: HashMap::new(),
             footage_source_bytes: 0,
+            footage_source_clock: 0,
             staged_uploads: HashMap::new(),
             staged_to_copy: Vec::new(),
             staged_bytes: 0,
@@ -2044,37 +2053,55 @@ impl<'g> Enc<'g> {
         self.static_comp_bytes += bytes;
     }
 
+    fn cached_footage_source(&mut self, key: (effectcraft_render::GpuFootageSourceKey, bool)) -> Option<GpuImage> {
+        self.footage_source_clock = self.footage_source_clock.saturating_add(1);
+        let now = self.footage_source_clock;
+        let entry = self.footage_sources.get_mut(&key)?;
+        entry.last_use = now;
+        let image = entry.image.clone();
+        self.uses(&image);
+        Some(image)
+    }
+
+    fn cache_footage_source(&mut self, key: (effectcraft_render::GpuFootageSourceKey, bool), image: &GpuImage, bytes: usize) {
+        if bytes == 0 || bytes > FRAME_SOURCE_CACHE_BYTES {
+            return;
+        }
+        self.footage_source_clock = self.footage_source_clock.saturating_add(1);
+        let now = self.footage_source_clock;
+        while self.footage_source_bytes.saturating_add(bytes) > FRAME_SOURCE_CACHE_BYTES {
+            let Some(oldest) = self.footage_sources.iter().min_by_key(|(_, entry)| entry.last_use).map(|(key, _)| *key) else { break };
+            if let Some(entry) = self.footage_sources.remove(&oldest) {
+                self.footage_source_bytes = self.footage_source_bytes.saturating_sub(entry.bytes);
+            }
+        }
+        self.footage_source_bytes = self.footage_source_bytes.saturating_add(bytes);
+        self.footage_sources.insert(key, FootageSourceEntry { image: image.clone(), bytes, last_use: now });
+    }
+
     /// Upload a plain footage source once per stable item/frame key in this encoder.
     pub fn upload_footage_source(&mut self, key: effectcraft_render::GpuFootageSourceKey, buf: &Arc<Buf>) -> Option<GpuImage> {
         let cache_key = (key, false);
-        if let Some(image) = self.footage_sources.get(&cache_key).cloned() {
-            self.uses(&image);
+        if let Some(image) = self.cached_footage_source(cache_key) {
             return Some(image);
         }
         let image = self.g.upload_buf(buf)?;
         self.uses(&image);
         let bytes = image.width as usize * image.height as usize * 16;
-        if bytes <= FRAME_SOURCE_CACHE_BYTES && self.footage_source_bytes.saturating_add(bytes) <= FRAME_SOURCE_CACHE_BYTES {
-            self.footage_sources.insert(cache_key, image.clone());
-            self.footage_source_bytes += bytes;
-        }
+        self.cache_footage_source(cache_key, &image, bytes);
         Some(image)
     }
 
     /// Upload a quantized plain-footage source once in compact RGBA8 form for this frame.
     pub fn upload_footage_source_8bit(&mut self, key: effectcraft_render::GpuFootageSourceKey, buf: &Arc<Buf>, quantize: bool) -> Option<GpuImage> {
         let cache_key = (key, true);
-        if let Some(image) = self.footage_sources.get(&cache_key).cloned() {
-            self.uses(&image);
+        if let Some(image) = self.cached_footage_source(cache_key) {
             return Some(image);
         }
         let image = self.g.upload_buf_8bit(buf, quantize)?;
         self.uses(&image);
         let bytes = image.width as usize * image.height as usize * 4;
-        if bytes <= FRAME_SOURCE_CACHE_BYTES && self.footage_source_bytes.saturating_add(bytes) <= FRAME_SOURCE_CACHE_BYTES {
-            self.footage_sources.insert(cache_key, image.clone());
-            self.footage_source_bytes += bytes;
-        }
+        self.cache_footage_source(cache_key, &image, bytes);
         Some(image)
     }
 
@@ -2082,17 +2109,13 @@ impl<'g> Enc<'g> {
     /// frame's staging batch. The renderer calls this before issuing the ordered layer draws.
     pub fn stage_footage_source(&mut self, key: effectcraft_render::GpuFootageSourceKey, buf: &Arc<Buf>) -> Option<GpuImage> {
         let cache_key = (key, false);
-        if let Some(image) = self.footage_sources.get(&cache_key).cloned() {
-            self.uses(&image);
+        if let Some(image) = self.cached_footage_source(cache_key) {
             return Some(image);
         }
         let image = if key.is_static() { self.g.upload_buf(buf)? } else { self.stage_upload_buf(buf)? };
         self.uses(&image);
         let bytes = image.width as usize * image.height as usize * 16;
-        if bytes <= FRAME_SOURCE_CACHE_BYTES && self.footage_source_bytes.saturating_add(bytes) <= FRAME_SOURCE_CACHE_BYTES {
-            self.footage_sources.insert(cache_key, image.clone());
-            self.footage_source_bytes += bytes;
-        }
+        self.cache_footage_source(cache_key, &image, bytes);
         Some(image)
     }
 
