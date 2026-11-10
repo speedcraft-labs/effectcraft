@@ -1,85 +1,15 @@
-use super::frames::{adaptive_samples, frame_blend_mode};
+use super::frames::adaptive_samples;
 use super::opts::{LayerTiming, Through};
 use super::{
     Arc, BlendMode, Buf, Comp, EvalCtx, Image, IndexedParallelIterator, IntoParallelRefIterator, IntoParallelRefMutIterator, Layer, LayerSource, Mat3,
     MatteKind, ParallelIterator, Quality, Region, Renderer, Sampling, Tick, WarpOpts, cache, color, composite_warp_changed, masks, styles, vec2,
 };
-use effectcraft_geom::Rect;
-use effectcraft_project::{ItemId, ItemKind};
-
-const OCCLUSION_TILE: usize = 4;
-
-#[derive(Clone, Copy)]
-struct OpaqueBounds {
-    /// Draw bounds, conservatively expanded for bilinear sampling and clipped to the output.
-    draw: [usize; 4],
-    /// Interior that remains opaque with bilinear sampling.
-    opaque: [f64; 4],
-}
 
 /// Blend policy for placing a layer, including optional output-depth quantization.
 struct PlacementBlend {
     mode: BlendMode,
     opacity: f32,
     quantize: Option<f32>,
-}
-
-/// A stable source identity that the GPU may reuse within one encoder.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct GpuFootageSourceKey {
-    project: usize,
-    item: ItemId,
-    time: Tick,
-    scale: u64,
-    proxy: bool,
-    static_source: bool,
-    quantize_source: bool,
-}
-
-impl GpuFootageSourceKey {
-    /// Whether the source is a still image whose upload can be reused across frames.
-    pub fn is_static(&self) -> bool {
-        self.static_source
-    }
-}
-
-#[cfg(test)]
-mod footage_buffer_cache_tests {
-    use super::GpuFootageSourceKey;
-    use crate::pipeline::FootageBufferCache;
-    use crate::{Buf, Image};
-    use effectcraft_project::ItemId;
-    use effectcraft_time::Tick;
-    use std::sync::Arc;
-
-    fn key(item: u64) -> GpuFootageSourceKey {
-        GpuFootageSourceKey {
-            project: 1,
-            item: ItemId(item),
-            time: Tick::ZERO,
-            scale: 1.0f64.to_bits(),
-            proxy: false,
-            static_source: true,
-            quantize_source: false,
-        }
-    }
-
-    #[test]
-    fn processed_footage_buffers_are_shared_by_source_identity() {
-        let cache = FootageBufferCache::default();
-        let first = Arc::new(Buf { img: Image::filled(2, 2, [0.2, 0.4, 0.6, 1.0]), offset: [0.0; 2], scale: 1.0 });
-        assert!(Arc::ptr_eq(&cache.insert(key(7), first.clone()), &first));
-        assert!(Arc::ptr_eq(&cache.get(key(7)).unwrap(), &first));
-        assert!(cache.get(key(8)).is_none());
-    }
-
-    #[test]
-    fn oversized_footage_frames_are_not_retained() {
-        let cache = FootageBufferCache::default();
-        let buf = Arc::new(Buf { img: Image::filled(2049, 2049, [0.0; 4]), offset: [0.0; 2], scale: 1.0 });
-        assert!(Arc::ptr_eq(&cache.insert(key(7), buf.clone()), &buf));
-        assert!(cache.get(key(7)).is_none());
-    }
 }
 
 /// A motion-blur shutter: the comp's, or for a collapsed precomp's layers the outermost
@@ -104,65 +34,43 @@ impl Shutter {
     }
 }
 
-impl<'a> Renderer<'a> {
-    /// Identity for a decoded footage texture that can be shared by duplicate plain layers in
-    /// this frame. The GPU cache is encoder-local, so project edits cannot stale the entry.
-    pub fn gpu_footage_source_key(&self, ctx: &EvalCtx, layer: &Layer, quantize_source: bool) -> Option<GpuFootageSourceKey> {
-        if !self.cache_static_comps
-            || self.profile.is_some()
-            || layer.switches.collapse
-            || self.blurred(ctx, layer)
-            || frame_blend_mode(ctx, layer) != super::FrameBlend::Off
-            || layer.masks().is_some_and(|m| !m.children.is_empty())
-            || layer.switches.effects && layer.effects().is_some_and(|fx| !fx.children.is_empty())
-            || styles::active(ctx, layer)
-        {
-            return None;
-        }
-        let LayerSource::Footage { item } = &layer.source else { return None };
-        let item = ctx.media_item(layer, *item);
-        let ItemKind::Footage(f) = &self.project.item(item)?.kind else { return None };
-        if !f.has_video || f.missing {
-            return None;
-        }
-        let proxy = self.proxy_for(item);
-        let source = proxy.unwrap_or(f);
-        let time = if source.kind == super::FootageKind::Still { Tick::ZERO } else { ctx.source_time(layer) };
-        Some(GpuFootageSourceKey {
-            project: self.project as *const _ as usize,
-            item,
-            time,
-            scale: self.opts.scale.to_bits(),
-            proxy: proxy.is_some(),
-            static_source: source.kind == super::FootageKind::Still,
-            quantize_source,
-        })
+/// `files` (a content's) with the files of the buffers made of it that the layer cache kept:
+/// `files` itself when they are all its own.
+fn with_kept_files(files: Arc<crate::reads::ReadFiles>, kept: &[Arc<crate::reads::ReadFiles>]) -> Arc<crate::reads::ReadFiles> {
+    if kept.iter().all(|f| Arc::ptr_eq(f, &files)) {
+        return files;
     }
+    let mut all = (*files).clone();
+    kept.iter().for_each(|f| all.extend(f));
+    Arc::new(all)
+}
 
+impl<'a> Renderer<'a> {
     /// The layer with its styles: exterior passes and body (cached per pass).
     pub(crate) fn styled(&self, ctx: &EvalCtx, layer: &Layer, mut timing: Option<&mut LayerTiming>) -> Option<StyledLayer> {
-        let (content, ckey) = self.content_buf_timed(ctx, layer, timing.as_deref_mut())?;
+        let (content, ckey, files) = self.content_buf_timed(ctx, layer, timing.as_deref_mut())?;
         if !styles::active(ctx, layer) {
-            return Some(StyledLayer {
-                passes: vec![],
-                body: content.clone(),
-                content,
-                key: ckey,
-                ckey,
-                plain: true,
-                quantize_source: false,
-                solid_color: None,
-                solid_size: None,
-            });
+            return Some(StyledLayer { passes: vec![], body: content.clone(), content, key: ckey, ckey, plain: true, files });
         }
         let modes = styles::pass_modes(ctx, layer);
         let key = ckey.map(|k| cache::styles_key(ctx, layer, k));
-        if let (Some(c), Some(k)) = (self.cache, key)
-            && let Some(body) = c.get(k)
-        {
-            let passes: Option<Vec<_>> = modes.iter().enumerate().map(|(i, m)| c.get(cache::derive(k, i as u64 + 1)).map(|b| (b, *m))).collect();
+        // (a cached body or pass may have been made of other files than the content: another
+        // worker's, or one from disk; the styled layer lists the files of every buffer it holds)
+        if let Some((body, body_files)) = self.cached(key) {
+            let mut kept_files = vec![body_files];
+            let passes: Option<Vec<_>> = modes
+                .iter()
+                .enumerate()
+                .map(|(i, m)| {
+                    self.cached(key.map(|k| cache::derive(k, i as u64 + 1))).map(|(b, f)| {
+                        kept_files.push(f);
+                        (b, *m)
+                    })
+                })
+                .collect();
             if let Some(passes) = passes {
-                return Some(StyledLayer { passes, body, content, key, ckey, plain: false, quantize_source: false, solid_color: None, solid_size: None });
+                let files = with_kept_files(files, &kept_files);
+                return Some(StyledLayer { passes, body, content, key, ckey, plain: false, files });
             }
         }
         let t0 = web_time::Instant::now();
@@ -173,16 +81,23 @@ impl<'a> Renderer<'a> {
             t.cached = false;
             t.effects.push(("layerStyles".into(), t0.elapsed().as_secs_f64() * 1e3));
         }
-        let mut body = Arc::new(st.body);
-        let mut passes: Vec<_> = st.passes.into_iter().map(|(b, m)| (Arc::new(b), m)).collect();
-        // The buffers the cache keeps (another worker's, if it kept them first).
-        if let (Some(c), Some(k)) = (self.cache_to_keep(), key) {
-            body = c.insert(k, body);
-            for (i, (b, _)) in passes.iter_mut().enumerate() {
-                *b = c.insert(cache::derive(k, i as u64 + 1), b.clone());
-            }
-        }
-        Some(StyledLayer { passes, body, content, key, ckey, plain: false, quantize_source: false, solid_color: None, solid_size: None })
+        // The buffers the cache keeps (another worker's, if it kept them first), made of the
+        // content's files; the styled layer then lists the files of every buffer it holds.
+        let mut kept_files = vec![];
+        let (body, f) = self.keep(key, Arc::new(st.body), &files);
+        kept_files.push(f);
+        let passes: Vec<_> = st
+            .passes
+            .into_iter()
+            .enumerate()
+            .map(|(i, (b, m))| {
+                let (b, f) = self.keep(key.map(|k| cache::derive(k, i as u64 + 1)), Arc::new(b), &files);
+                kept_files.push(f);
+                (b, m)
+            })
+            .collect();
+        let files = with_kept_files(files, &kept_files);
+        Some(StyledLayer { passes, body, content, key, ckey, plain: false, files })
     }
 
     /// The styled layer's buffers in the blending space.
@@ -190,9 +105,10 @@ impl<'a> Renderer<'a> {
         if self.pipe.to_blend().is_none() {
             return st;
         }
-        let body = self.to_blend(st.body, st.key);
-        let content = if st.plain { body.clone() } else { self.to_blend(st.content, st.ckey) };
-        let passes = st.passes.into_iter().enumerate().map(|(i, (b, m))| (self.to_blend(b, st.key.map(|k| cache::derive(k, i as u64 + 1))), m)).collect();
+        let body = self.to_blend(st.body, st.key, &st.files);
+        let content = if st.plain { body.clone() } else { self.to_blend(st.content, st.ckey, &st.files) };
+        let passes =
+            st.passes.into_iter().enumerate().map(|(i, (b, m))| (self.to_blend(b, st.key.map(|k| cache::derive(k, i as u64 + 1)), &st.files), m)).collect();
         StyledLayer { passes, body, content, ..st }
     }
 
@@ -239,29 +155,6 @@ impl<'a> Renderer<'a> {
         self.place_matrix(self.outer.map_or(l2c, |o| o * l2c), buf)
     }
 
-    /// The raster mip dimensions a plain solid would use for its current transform. Solid pixels
-    /// are uniform, so a caller can construct the final mip directly instead of filling and then
-    /// halving the full-resolution source image. The transform depends on the source scale and
-    /// offset, not its pixels or dimensions, so use a 1×1 placeholder here.
-    pub(crate) fn solid_mip(&self, ctx: &EvalCtx, layer: &Layer, width: u32, height: u32, source_scale: f64) -> Option<(f64, u32, u32)> {
-        let buf = Buf { img: Image::new(1, 1), offset: [0.0; 2], scale: source_scale };
-        let m = self.buf_matrix(ctx, layer, &buf);
-        let mut scale = m.mean_scale();
-        if !m.is_affine() || scale >= 0.5 {
-            return None;
-        }
-        let (mut w, mut h) = (width.div_ceil(2).max(1), height.div_ceil(2).max(1));
-        let mut factor = 0.5;
-        scale *= 2.0;
-        while scale < 0.5 && w > 1 && h > 1 {
-            w = w.div_ceil(2).max(1);
-            h = h.div_ceil(2).max(1);
-            factor *= 0.5;
-            scale *= 2.0;
-        }
-        Some((factor, w, h))
-    }
-
     /// Buffer pixel → output pixel matrix for a layer → (top-level) comp matrix.
     fn place_matrix(&self, l2c: Mat3, buf: &Buf) -> Mat3 {
         let s = self.opts.scale;
@@ -295,7 +188,7 @@ impl<'a> Renderer<'a> {
 
     /// Whether a layer moves within the shutter: its own motion blur, or that of a collapsed
     /// precomp layer it is drawn through.
-    pub(crate) fn blurred(&self, ctx: &EvalCtx, layer: &Layer) -> bool {
+    fn blurred(&self, ctx: &EvalCtx, layer: &Layer) -> bool {
         self.mb_on(ctx, layer) || (!self.through_lost && self.links().any(|l| l.blur))
     }
 
@@ -373,7 +266,11 @@ impl<'a> Renderer<'a> {
     /// A processed-layer cache key that also covers content motion blur (the averaged source
     /// depends on the content at every sub-sample).
     pub(crate) fn content_key(&self, ctx: &EvalCtx, layer: &Layer, key: Option<u64>) -> Option<u64> {
-        let k = key?;
+        let k = self.mask_gate_key(ctx, layer, key)?;
+        // A layer that reads other layers through its effects' layer parameters gets them drawn
+        // by this renderer: the switches it passes down (Switches Affect Nested Comps, the
+        // precomp layers above, motion blur on) change those pixels, not just the layers' own.
+        let k = if cache::reads_layers(ctx, layer) { cache::derive(k, self.nested_look()) } else { k };
         let Some(times) = self.content_times(ctx, layer) else { return Some(k) };
         times.iter().try_fold(cache::derive(k, 0x6d62_6c72), |d, t| Some(cache::derive(d, cache::layer_key(&ctx.at(*t), layer, 1.0, false, false)?)))
     }
@@ -392,6 +289,23 @@ impl<'a> Renderer<'a> {
             layer: self.layer_motion_blur(layer),
             samples: if self.opts.draft { 4 } else { ctx.comp.motion_blur_samples as usize },
         }
+    }
+
+    /// A cache key of a masked layer's buffer, told apart when mask motion blur can't run at all
+    /// in this render ([`Self::mask_blur`]'s gate: the render options, the precomp layers above).
+    /// The key has the layer's own motion blur state, but a mask set to On blurs without it.
+    pub(crate) fn mask_gate_key(&self, ctx: &EvalCtx, layer: &Layer, key: Option<u64>) -> Option<u64> {
+        // Queue jobs share this cache but may override Proxy Use differently. The item's
+        // proxy switch alone does not describe the source a renderer actually reads.
+        let k = key?;
+        let k = match self.opts.proxy {
+            effectcraft_project::render_queue::ProxyUse::CurrentSettings => k,
+            effectcraft_project::render_queue::ProxyUse::UseAll => cache::derive(k, 0x7072_6f78_7901),
+            effectcraft_project::render_queue::ProxyUse::UseCompOnly => cache::derive(k, 0x7072_6f78_7902),
+            effectcraft_project::render_queue::ProxyUse::UseNone => cache::derive(k, 0x7072_6f78_7903),
+        };
+        let masked = layer.masks().is_some_and(|m| !m.children.is_empty());
+        Some(if masked && !self.mask_blur(ctx, layer).allowed { cache::derive(k, 0x6d62_6f66) } else { k })
     }
 
     /// Motion-blur sub-samples for a layer buffer (1 = no motion blur). As in After Effects, a 2D
@@ -441,7 +355,7 @@ impl<'a> Renderer<'a> {
     ///
     /// A quantised buffer placed pixel-exactly (integer translation, Normal, 100%) over a blank
     /// canvas leaves exactly its own (quantised) pixels: nothing to re-quantise.
-    pub(crate) fn footprint(&self, ctx: &EvalCtx, layer: &Layer, buf: &Buf, opacity: f32, blank: bool) -> Region {
+    fn footprint(&self, ctx: &EvalCtx, layer: &Layer, buf: &Buf, opacity: f32, blank: bool) -> Region {
         if layer.blend_mode.is_stencil() || self.mb_samples(ctx, layer, buf) > 1 {
             return Region::Full;
         }
@@ -499,13 +413,7 @@ impl<'a> Renderer<'a> {
         let pl = self.placement(ctx, layer, buf);
         let opts = WarpOpts { sampling: pl.sampling, opacity, mode, seed: pl.seed, clip: None };
         if let [m] = pl.matrices.as_slice() {
-            let source_opaque = self.source_is_known_opaque(ctx, layer);
-            return match quantize {
-                Some(levels) if source_opaque => effectcraft_raster::composite_warp_quantized_opaque(target, &buf.img, m, &opts, levels).then_some([0; 4]),
-                Some(levels) => effectcraft_raster::composite_warp_quantized(target, &buf.img, m, &opts, levels).then_some([0; 4]),
-                None if source_opaque => effectcraft_raster::composite_warp_changed_opaque(target, &buf.img, m, &opts, None),
-                None => composite_warp_changed(target, &buf.img, m, &opts, None),
-            };
+            return composite_warp_changed(target, &buf.img, m, &opts, quantize);
         }
         // Sub-samples sum straight into one buffer (each warp is row-parallel).
         let mut acc = Image::new(target.width, target.height);
@@ -515,110 +423,6 @@ impl<'a> Renderer<'a> {
         }
         target.blend_from(&acc, mode, opacity, pl.seed);
         None
-    }
-
-    /// Solid and alpha-ignored still sources are fully opaque before transform. Their warped
-    /// bilinear path can skip the per-layer transparency-tile scan; masks, effects and styles
-    /// may introduce transparent pixels, so those sources keep the general path.
-    pub(crate) fn source_is_known_opaque(&self, ctx: &EvalCtx, layer: &Layer) -> bool {
-        let (item, solid) = match layer.source {
-            LayerSource::Solid { item } => (item, true),
-            LayerSource::Footage { item } => (item, false),
-            _ => return false,
-        };
-        if layer.masks().is_some_and(|m| !m.children.is_empty())
-            || layer.switches.effects && layer.effects().is_some_and(|fx| fx.groups().any(|group| group.enabled))
-            || styles::active(ctx, layer)
-        {
-            return false;
-        }
-        if solid {
-            self.project.item(item).is_some_and(|it| it.proxy.is_none() && matches!(&it.kind, ItemKind::Solid(_)))
-        } else {
-            self.project.item(ctx.media_item(layer, item)).is_some_and(|it| {
-                it.proxy.is_none()
-                    && matches!(&it.kind, ItemKind::Footage(f) if f.kind == effectcraft_project::FootageKind::Still && f.alpha == effectcraft_project::AlphaMode::Ignore && !f.invert_alpha)
-            })
-        }
-    }
-
-    /// Whether a plain precomp layer has nothing to draw at its nested time. Rendering an empty
-    /// comp would allocate and warp a full-frame transparent image, so skip that work when it
-    /// cannot change the result.
-    pub(crate) fn empty_precomp(&self, ctx: &EvalCtx, layer: &Layer) -> bool {
-        if !matches!(layer.source, LayerSource::Comp { .. })
-            || layer.switches.adjustment
-            || layer.blend_mode != BlendMode::Normal
-            || layer.track_matte.is_some()
-            || layer.preserve_transparency
-            || (layer.switches.effects && layer.effects().is_some_and(|fx| fx.groups().any(|g| g.enabled)))
-            || styles::active(ctx, layer)
-        {
-            return false;
-        }
-        let Some((sub, comp_id, time, _)) = self.precomp_source(ctx, layer) else { return false };
-        let Some(nested_ctx) = sub.eval_ctx(comp_id, time) else { return false };
-        if nested_ctx.comp.layers.iter().any(|l| l.environment && l.switches.video && l.is_active_at(time)) {
-            return false;
-        }
-        sub.visible_layers(&nested_ctx).is_empty()
-    }
-
-    /// The source and style buffers a 2D layer will place. Plain solids can go straight to their
-    /// final mip; other layers use the regular source → masks → effects → styles path.
-    pub(crate) fn styled_for_draw(&self, ctx: &EvalCtx, layer: &Layer, timing: Option<&mut LayerTiming>) -> Option<StyledLayer> {
-        if let Some(buf) = self.plain_solid_mip(ctx, layer) {
-            let body = Arc::new(buf);
-            return Some(StyledLayer {
-                passes: vec![],
-                body: body.clone(),
-                content: body,
-                key: None,
-                ckey: None,
-                plain: true,
-                quantize_source: false,
-                solid_color: None,
-                solid_size: None,
-            });
-        }
-        self.styled(ctx, layer, timing)
-    }
-
-    /// Prepare a plain solid for the GPU without allocating its full uniform raster. The shader
-    /// evaluates the solid's rectangular sample directly, including the normal filter edge.
-    pub(crate) fn styled_for_gpu_draw(&self, ctx: &EvalCtx, layer: &Layer) -> Option<StyledLayer> {
-        if self.pipe.to_blend().is_none()
-            && let Some((buf, color, size)) = self.plain_solid_gpu_mip(ctx, layer)
-        {
-            let body = Arc::new(buf);
-            return Some(StyledLayer {
-                passes: vec![],
-                body: body.clone(),
-                content: body,
-                key: None,
-                ckey: None,
-                plain: true,
-                quantize_source: false,
-                solid_color: Some(color),
-                solid_size: Some(size),
-            });
-        }
-        self.styled_for_draw(ctx, layer, None)
-    }
-
-    /// Composite precomputed buffers for a plain 2D layer in the original stack order.
-    pub(crate) fn draw_prepared_layer(&self, ctx: &EvalCtx, layer: &Layer, st: StyledLayer, canvas: &mut Image, opacity: f32, blank: bool) -> Region {
-        if st.plain {
-            let footprint = self.footprint(ctx, layer, &st.body, opacity, blank);
-            let quantize = if footprint == Region::Empty { None } else { self.pipe.levels };
-            match self.composite_layer(ctx, layer, &st.body, canvas, opacity, quantize) {
-                Some(_) if quantize.is_some() => Region::Empty,
-                drawn => narrow(footprint, drawn),
-            }
-        } else {
-            self.composite_styled(ctx, layer, &st, canvas, opacity);
-            Region::Full
-        }
     }
 
     /// Draw a 2D layer into `canvas`; returns the region it may have changed.
@@ -631,19 +435,28 @@ impl<'a> Renderer<'a> {
         if opacity <= 0.0 && !layer.switches.adjustment {
             return Region::Empty;
         }
-        if self.empty_precomp(ctx, layer) {
-            return Region::Empty;
-        }
         if layer.switches.adjustment {
             self.draw_adjustment(ctx, layer, canvas, opacity);
             return Region::Full;
         }
         let mut timing = self.profile.map(|_| LayerTiming { depth: self.depth, layer: layer.name.clone(), ..Default::default() });
         let t0 = web_time::Instant::now();
-        let Some(st) = self.styled_for_draw(ctx, layer, timing.as_mut()) else { return Region::Empty };
+        let Some(st) = self.styled(ctx, layer, timing.as_mut()) else { return Region::Empty };
         let st = self.styled_to_blend(st);
         let t1 = web_time::Instant::now();
-        let changed = self.draw_prepared_layer(ctx, layer, st, canvas, opacity, blank);
+        let changed = if st.plain {
+            // Pixels the warp tracks are quantised as it blends them (nothing left to do); the
+            // footprint is still needed when it doesn't, or when no pixel needs quantising.
+            let footprint = self.footprint(ctx, layer, &st.body, opacity, blank);
+            let quantize = if footprint == Region::Empty { None } else { self.pipe.levels };
+            match self.composite_layer(ctx, layer, &st.body, canvas, opacity, quantize) {
+                Some(_) if quantize.is_some() => Region::Empty,
+                drawn => narrow(footprint, drawn),
+            }
+        } else {
+            self.composite_styled(ctx, layer, &st, canvas, opacity);
+            Region::Full
+        };
         if let (Some(prof), Some(mut timing)) = (self.profile, timing) {
             timing.process_ms = (t1 - t0).as_secs_f64() * 1e3;
             timing.composite_ms = t1.elapsed().as_secs_f64() * 1e3;
@@ -652,136 +465,6 @@ impl<'a> Renderer<'a> {
             }
         }
         changed
-    }
-
-    /// Skip bounded 2D layers whose complete draw footprint is covered by later opaque solids.
-    /// The input is in bottom-to-top order; coverage is accumulated from top to bottom.
-    pub fn occluded_bounded_layers(&self, ctx: &EvalCtx, layers: &[&Layer], width: u32, height: u32) -> Vec<bool> {
-        let mut culled = vec![false; layers.len()];
-        if layers.len() < 64 || width == 0 || height == 0 {
-            return culled;
-        }
-        let cols = (width as usize).div_ceil(OCCLUSION_TILE);
-        let rows = (height as usize).div_ceil(OCCLUSION_TILE);
-        let Some(cells) = cols.checked_mul(rows).filter(|&n| n <= 1 << 20) else { return culled };
-        let mut covered = vec![false; cells];
-        let mut uncovered = cells;
-
-        for (index, layer) in layers.iter().enumerate().rev() {
-            // Later opaque layers cover every output tile. No earlier 2D layer can then change
-            // the final frame, regardless of its source type, effects, matte or blend mode.
-            if uncovered == 0 {
-                if !layer.is_3d() {
-                    culled[index] = true;
-                }
-                continue;
-            }
-            let Some(bounds) = self.simple_layer_bounds(ctx, layer, width, height) else { continue };
-            if bounds.draw[0] >= bounds.draw[2] || bounds.draw[1] >= bounds.draw[3] {
-                culled[index] = true;
-                continue;
-            }
-            let tx0 = bounds.draw[0] / OCCLUSION_TILE;
-            let tx1 = bounds.draw[2].div_ceil(OCCLUSION_TILE).min(cols);
-            let ty0 = bounds.draw[1] / OCCLUSION_TILE;
-            let ty1 = bounds.draw[3].div_ceil(OCCLUSION_TILE).min(rows);
-            if (ty0..ty1).all(|y| (tx0..tx1).all(|x| covered[y * cols + x])) {
-                culled[index] = true;
-                continue;
-            }
-
-            if Self::can_occlude_layer(ctx, layer, self) {
-                let tile = OCCLUSION_TILE as f64;
-                let ox0 = ((bounds.opaque[0].max(0.0) / tile).ceil() as usize).min(cols);
-                let ox1 = ((bounds.opaque[2].min(width as f64) / tile).floor() as usize).min(cols);
-                let oy0 = ((bounds.opaque[1].max(0.0) / tile).ceil() as usize).min(rows);
-                let oy1 = ((bounds.opaque[3].min(height as f64) / tile).floor() as usize).min(rows);
-                for y in oy0..oy1 {
-                    for x in ox0..ox1 {
-                        let cell = y * cols + x;
-                        if !covered[cell] {
-                            covered[cell] = true;
-                            uncovered -= 1;
-                        }
-                    }
-                }
-            }
-        }
-        culled
-    }
-
-    /// Conservative output-space bounds for a bounded source with no feature that can extend its
-    /// pixels. Masks can only reduce the footprint; effects, styles and collapse can grow it.
-    fn simple_layer_bounds(&self, ctx: &EvalCtx, layer: &Layer, width: u32, height: u32) -> Option<OpaqueBounds> {
-        if !matches!(layer.source, LayerSource::Solid { .. } | LayerSource::Footage { .. } | LayerSource::Comp { .. })
-            || layer.is_3d()
-            || layer.switches.collapse
-            || layer.switches.adjustment
-            || self.quality(layer) == Quality::Wireframe
-            || self.blurred(ctx, layer)
-            || layer.effects().is_some_and(|g| g.groups().any(|e| e.enabled))
-            || styles::active(ctx, layer)
-        {
-            return None;
-        }
-
-        let (source_width, source_height) = ctx.source_size(layer);
-        if source_width == 0 || source_height == 0 {
-            return None;
-        }
-        // Transparent pixels still matter to masks and blending, so use the complete source
-        // rectangle rather than inspecting pixel alpha.
-        let source_bounds = Rect::from_size(source_width as f64, source_height as f64);
-        let (layer_to_comp, _) = ctx.layer_to_comp(layer);
-        let layer_to_output = self.outer.map_or(layer_to_comp, |outer| outer * layer_to_comp);
-        let matrix = self.out_matrix() * Mat3::scale(vec2(self.opts.scale, self.opts.scale)) * layer_to_output;
-        if !matrix.is_affine() || ((matrix.0[0][1] != 0.0 || matrix.0[1][0] != 0.0) && Self::can_occlude_layer(ctx, layer, self)) {
-            return None;
-        }
-        let bounds = matrix.map_rect(&source_bounds);
-        let [x0, y0, x1, y1] = [bounds.x0, bounds.y0, bounds.x1, bounds.y1];
-        if ![x0, y0, x1, y1].into_iter().all(f64::is_finite) {
-            return None;
-        }
-        let to_px = |v: f64, max: u32| (v as i64).clamp(0, max as i64) as usize;
-        let draw = [to_px((x0 - 1.0).floor(), width), to_px((y0 - 1.0).floor(), height), to_px((x1 + 1.0).ceil(), width), to_px((y1 + 1.0).ceil(), height)];
-        Some(OpaqueBounds { draw, opaque: [x0 + 1.0, y0 + 1.0, x1 - 1.0, y1 - 1.0] })
-    }
-
-    /// Whether a bounded, non-expanding 2D layer cannot touch this output canvas.
-    pub(crate) fn layer_outside_canvas(&self, ctx: &EvalCtx, layer: &Layer, width: u32, height: u32) -> bool {
-        self.simple_layer_bounds(ctx, layer, width, height).is_some_and(|bounds| bounds.draw[0] >= bounds.draw[2] || bounds.draw[1] >= bounds.draw[3])
-    }
-
-    /// Simple normal solids and footage explicitly interpreted without alpha can add covered
-    /// tiles for later culling. This only uses source metadata, so the culling pass doesn't decode
-    /// media it would otherwise never need.
-    fn can_occlude_layer(ctx: &EvalCtx, layer: &Layer, r: &Renderer<'_>) -> bool {
-        let opaque_source = match &layer.source {
-            LayerSource::Solid { item } => r.proxy_for(*item).is_none() && matches!(r.project.item(*item).map(|i| &i.kind), Some(ItemKind::Solid(_))),
-            LayerSource::Footage { item } => {
-                let item = ctx.media_item(layer, *item);
-                r.proxy_for(item).is_none()
-                    && r.project.item(item).is_some_and(
-                        |i| matches!(&i.kind, ItemKind::Footage(f) if f.has_video && !f.missing && f.alpha == effectcraft_project::AlphaMode::Ignore && !f.invert_alpha),
-                    )
-            }
-            _ => false,
-        };
-        opaque_source
-            && !layer.is_3d()
-            && !layer.switches.adjustment
-            && !layer.switches.collapse
-            && layer.parent.is_none()
-            && layer.blend_mode == BlendMode::Normal
-            && layer.track_matte.is_none()
-            && !layer.preserve_transparency
-            && !r.blurred(ctx, layer)
-            && ctx.opacity(layer) as f32 * r.opacity_mul == 1.0
-            && r.quality(layer) != Quality::Wireframe
-            && !layer.masks().is_some_and(|m| !m.children.is_empty())
-            && !layer.effects().is_some_and(|g| g.groups().any(|e| e.enabled))
-            && !styles::active(ctx, layer)
     }
 
     /// Composite a styled layer: exterior passes with their own modes, then the body with the
@@ -950,19 +633,8 @@ pub struct StyledLayer {
     ckey: Option<u64>,
     /// No layer styles: composite `body` the usual way.
     pub plain: bool,
-    /// The GPU will quantize these unquantized source pixels before sampling.
-    pub(crate) quantize_source: bool,
-    /// A uniform opaque source that the GPU samples without a full source texture.
-    pub solid_color: Option<[f32; 4]>,
-    /// The logical dimensions of `solid_color` in its final mip.
-    pub solid_size: Option<(u32, u32)>,
-}
-
-impl StyledLayer {
-    /// Whether the accelerator should quantize body texels before filtering and blending them.
-    pub fn quantize_source(&self) -> bool {
-        self.quantize_source
-    }
+    /// The source files the layer's buffers were made of (see [`crate::reads`]).
+    pub(crate) files: Arc<crate::reads::ReadFiles>,
 }
 
 /// Where a layer buffer lands (see [`Renderer::placement`]).

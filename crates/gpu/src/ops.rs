@@ -32,30 +32,12 @@ pub fn half(e: &mut Enc, src: &GpuImage) -> GpuImage {
     out
 }
 
-fn half_quantized(e: &mut Enc, src: &GpuImage, levels: f32) -> GpuImage {
-    let out = e.scratch(src.width.div_ceil(2).max(1), src.height.div_ceil(2).max(1));
-    let mut p = Params::default();
-    p.f[0] = [levels, 1.0 / levels, 0.0, 0.0];
-    e.pixels("half", &p, src, None, &out, None);
-    out
-}
-
 /// Sampling and blending policy for a transformed GPU image.
 pub struct WarpOptions {
     pub sampling: Sampling,
     pub mode: BlendMode,
     pub opacity: f32,
     pub seed: u32,
-}
-
-/// Result of applying one bounded warp into the next of two ping-pong canvases.
-pub enum PingPongWarp {
-    /// This warp needs the regular full-copy path (for example stencil blending).
-    Unsupported,
-    /// The warp did not touch the canvas.
-    Unchanged,
-    /// The updated canvas and its dispatch footprint, including workgroup-edge quantization.
-    Drawn((u32, u32, u32, u32)),
 }
 
 /// Draw `src` transformed by `m` onto `dst`, or accumulate it with a sample weight.
@@ -66,167 +48,36 @@ pub fn warp(e: &mut Enc, dst: &GpuImage, src: &GpuImage, m: &Mat3, opts: WarpOpt
 /// [`warp`], clamping and quantising the result to `levels` (8/16 bpc: the comp after a layer,
 /// in the same pass).
 pub fn warp_q(e: &mut Enc, dst: &GpuImage, src: &GpuImage, m: &Mat3, opts: WarpOptions, accumulate: Option<f32>, levels: Option<f32>) -> GpuImage {
-    warp_q_with_source_quantization(e, dst, src, m, opts, accumulate, levels, None)
-}
-
-/// [`warp_q`] for a source whose bit-depth quantization is deferred until GPU sampling.
-pub fn warp_q_source_quantized(e: &mut Enc, dst: &GpuImage, src: &GpuImage, m: &Mat3, opts: WarpOptions, levels: Option<f32>) -> GpuImage {
-    warp_q_with_source_quantization(e, dst, src, m, opts, None, levels, levels)
-}
-
-fn warp_q_with_source_quantization(
-    e: &mut Enc,
-    dst: &GpuImage,
-    src: &GpuImage,
-    m: &Mat3,
-    opts: WarpOptions,
-    accumulate: Option<f32>,
-    levels: Option<f32>,
-    source_levels: Option<f32>,
-) -> GpuImage {
-    let Some((img, p, region, clear)) = warp_params(e, dst, src, m, opts, accumulate, levels, source_levels, None) else { return dst.clone() };
-    let mut out = e.scratch(dst.width, dst.height);
-    if clear {
-        // Stencil modes clear pixels outside the source footprint too.
-        e.pixels("warp_blend", &p, &img, Some(dst), &out, None);
-    } else {
-        // Other blend modes leave the canvas outside this layer's transformed bounds unchanged.
-        // Copy it with the GPU's texture-copy path, then run the shader only over the layer area.
-        e.copy_image(dst, &out);
-        e.pixels_region("warp_blend", &p, &img, Some(dst), &out, region, None);
-    }
-    out.levels = levels;
-    out
-}
-
-/// Apply an ordinary bounded warp while alternating between two full-size canvases. `next`
-/// must already match `current` outside `previous`; this copies only that prior dirty region
-/// before writing the new layer. The returned region includes workgroup-edge quantization.
-pub fn warp_q_pingpong(
-    e: &mut Enc,
-    current: &GpuImage,
-    next: &mut GpuImage,
-    src: &GpuImage,
-    m: &Mat3,
-    opts: WarpOptions,
-    levels: Option<f32>,
-    previous: Option<(u32, u32, u32, u32)>,
-    quantize_source: bool,
-) -> PingPongWarp {
-    warp_q_pingpong_inner(e, current, next, src, m, opts, levels, previous, quantize_source, None)
-}
-
-/// [`warp_q_pingpong`] for an opaque rectangle whose uniform pixels are passed as parameters.
-pub fn warp_q_solid_pingpong(
-    e: &mut Enc,
-    current: &GpuImage,
-    next: &mut GpuImage,
-    color: [f32; 4],
-    size: (u32, u32),
-    m: &Mat3,
-    opts: WarpOptions,
-    levels: Option<f32>,
-    previous: Option<(u32, u32, u32, u32)>,
-    quantize_source: bool,
-) -> PingPongWarp {
-    let src = e.g.dummy_image();
-    warp_q_pingpong_inner(e, current, next, &src, m, opts, levels, previous, quantize_source, Some((color, size)))
-}
-
-fn warp_q_pingpong_inner(
-    e: &mut Enc,
-    current: &GpuImage,
-    next: &mut GpuImage,
-    src: &GpuImage,
-    m: &Mat3,
-    opts: WarpOptions,
-    levels: Option<f32>,
-    previous: Option<(u32, u32, u32, u32)>,
-    quantize_source: bool,
-    solid: Option<([f32; 4], (u32, u32))>,
-) -> PingPongWarp {
-    if current.width != next.width || current.height != next.height {
-        return PingPongWarp::Unsupported;
-    }
-    let source_levels = quantize_source.then_some(levels).flatten();
-    let Some((img, p, region, clear)) = warp_params(e, current, src, m, opts, None, levels, source_levels, solid) else { return PingPongWarp::Unchanged };
-    if clear {
-        return PingPongWarp::Unsupported;
-    }
-    let draw_region = dispatch_region(region, current.width, current.height);
-    let mut work_region = draw_region;
-    if let Some(previous) = previous {
-        let union = (previous.0.min(draw_region.0), previous.1.min(draw_region.1), previous.2.max(draw_region.2), previous.3.max(draw_region.3));
-        let area = |(x0, y0, x1, y1): (u32, u32, u32, u32)| u64::from(x1 - x0) * u64::from(y1 - y0);
-        // `warp_blend` copies `current` to `next` outside the layer bounds. When the two
-        // dispatch footprints overlap or are close, it can also copy the previous dirty region,
-        // replacing a separate texture-copy command with the same shader dispatch. Bound the
-        // extra work to four times the two footprints; for distant layers, keep the direct copy.
-        if area(union) <= (area(previous) + area(draw_region)).saturating_mul(4) {
-            work_region = union;
-        } else {
-            e.copy_region(current, next, previous);
-        }
-    }
-    e.pixels_region("warp_blend", &p, &img, Some(current), next, work_region, None);
-    next.levels = levels;
-    PingPongWarp::Drawn(draw_region)
-}
-
-fn warp_params(
-    e: &mut Enc,
-    dst: &GpuImage,
-    src: &GpuImage,
-    m: &Mat3,
-    opts: WarpOptions,
-    accumulate: Option<f32>,
-    levels: Option<f32>,
-    source_levels: Option<f32>,
-    solid: Option<([f32; 4], (u32, u32))>,
-) -> Option<(GpuImage, Params, (u32, u32, u32, u32), bool)> {
     let WarpOptions { sampling, mode, opacity, seed } = opts;
     if src.width == 0 || src.height == 0 || opacity <= 0.0 {
-        return None;
+        return dst.clone();
     }
-    let Some(inv0) = m.inverse() else { return None };
+    let Some(inv0) = m.inverse() else { return dst.clone() };
     // Minification: pick a pre-filtered level so sampling doesn't alias.
     let scale = m.mean_scale();
     let mut img = src.clone();
     let mut inv = inv0;
-    let (mut source_width, mut source_height) = solid.map_or((src.width, src.height), |(_, size)| size);
-    let (bounds_width, bounds_height) = (source_width, source_height);
     if scale < 0.5 && m.is_affine() {
         let mut s = scale * 2.0;
         let mut f = 0.5;
-        if solid.is_some() {
-            (source_width, source_height) = (source_width.div_ceil(2).max(1), source_height.div_ceil(2).max(1));
-            while s < 0.5 && source_width > 1 && source_height > 1 {
-                (source_width, source_height) = (source_width.div_ceil(2).max(1), source_height.div_ceil(2).max(1));
-                f *= 0.5;
-                s *= 2.0;
-            }
-        } else {
-            img = if let Some(source_levels) = source_levels { half_quantized(e, src, source_levels) } else { half(e, src) };
-            while s < 0.5 && img.width > 1 && img.height > 1 {
-                img = half(e, &img);
-                f *= 0.5;
-                s *= 2.0;
-            }
-            source_width = img.width;
-            source_height = img.height;
+        img = half(e, src);
+        while s < 0.5 && img.width > 1 && img.height > 1 {
+            img = half(e, &img);
+            f *= 0.5;
+            s *= 2.0;
         }
         inv = Mat3::scale(vec2(f, f)) * inv;
     }
-    let bounds = m.map_rect(&Rect::from_size(bounds_width as f64, bounds_height as f64)).inflate(1.0).round_out();
+    let bounds = m.map_rect(&Rect::from_size(src.width as f64, src.height as f64)).inflate(1.0).round_out();
     let area = bounds.intersect(&Rect::from_size(dst.width as f64, dst.height as f64));
     if area.is_empty() {
-        return None;
+        return dst.clone();
     }
     let (x0, x1) = (area.x0.max(0.0) as u32, area.x1.min(dst.width as f64) as u32);
     let (y0, y1) = (area.y0.max(0.0) as u32, area.y1.min(dst.height as f64) as u32);
     let mut p = Params::default();
     let clear = matches!(mode, BlendMode::StencilAlpha | BlendMode::StencilLuma);
-    let flags = u32::from(accumulate.is_some()) | if clear && accumulate.is_none() { 2 } else { 0 } | if solid.is_some() { 4 } else { 0 };
+    let flags = u32::from(accumulate.is_some()) | if clear && accumulate.is_none() { 2 } else { 0 };
     p.u[0] = [mode_id(mode), sampling_id(sampling), seed, flags];
     let r = rows(&inv);
     p.f[0] = r[0];
@@ -234,17 +85,10 @@ fn warp_params(
     p.f[2] = r[2];
     p.f[3] = [opacity, accumulate.unwrap_or(1.0), levels.unwrap_or(0.0), levels.map_or(0.0, |v| 1.0 / v)];
     p.f[4] = [x0 as f32, y0 as f32, x1 as f32, y1 as f32];
-    p.f[5] = [source_levels.unwrap_or(0.0), source_levels.map_or(0.0, |v| 1.0 / v), 0.0, 0.0];
-    if let Some((color, _)) = solid {
-        p.f[6] = color;
-        p.f[7] = [source_width as f32, source_height as f32, 0.0, 0.0];
-    }
-    Some((img, p, (x0, y0, x1, y1), clear))
-}
-
-fn dispatch_region(region: (u32, u32, u32, u32), width: u32, height: u32) -> (u32, u32, u32, u32) {
-    let (x0, y0, x1, y1) = region;
-    (x0 / 16 * 16, y0 / 16 * 16, x1.div_ceil(16).saturating_mul(16).min(width), y1.div_ceil(16).saturating_mul(16).min(height))
+    let mut out = e.scratch(dst.width, dst.height);
+    e.pixels("warp_blend", &p, &img, Some(dst), &out, None);
+    out.levels = levels;
+    out
 }
 
 /// `Image::blend_from`: blend `src` (same size) onto `dst`, clamping and quantising the result

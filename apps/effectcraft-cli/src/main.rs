@@ -17,6 +17,7 @@
 //!     [--jpeg-quality N] [--bitrate KBPS] [--prores proxy|lt|standard|hq|4444|4444xq] [--audio auto|on|off]
 //!     [--profile main|main10] [--level auto|4.1] [--rate-control bitrate|quality] [--video-quality 1-100]
 //!     [--keyint FRAMES] [--webm-codec vp9|av1] [--audio-bitrate KBPS] [--opus-app audio|voice]
+//!     [--exr-compression none|rle|zips|zip|piz|pxr24|b44|b44a|dwaa|dwab] [--exr-depth half|float]
 //!     (a relative --out is relative to the working directory; --queue outputs follow the project's own settings)
 //!     [--progress]  report progress on stderr when it is not a terminal, up to four lines a second:
 //!     `progress <frames done> <frames total> <seconds elapsed> <seconds left, or - when unknown>`
@@ -31,12 +32,13 @@
 //! effectcraft-cli bench --roto [--frames N] [--sam2 model.safetensors] [--mobilesam mobile_sam.pt] [--fixes] [--clip FRAMES --truth MASKS] [--json]   Roto Brush trackers on synthetic clips with known mattes
 //!     (classical engine, MobileSAM and SAM 2.1 (any installed size) when installed; IoU, flicker, re-appearance, seconds per frame)
 //! effectcraft-cli script FILE.jsx [F.ecproj] | --eval CODE    run an After Effects-style script
+//! effectcraft-cli replay SCRIPT.jsonl [--keep-going]        replay a repro script (docs/agents.md)
 //! effectcraft-cli mcp [--autosave | --bridge PORT]            MCP server on stdio
 //!
 //! Project:  --project F.ecproj (or a positional *.ecproj) | --demo | --empty   (default: demo; mcp: empty)
 //! Saving:   --save (back to --project) | --save-as F.ecproj
-//! GPU:      --gpu renders on the GPU compositor (Mercury GPU Acceleration) when an adapter exists;
-//!           the default is the CPU (Mercury Software Only)
+//! GPU:      --gpu renders on the GPU compositor (GPU Acceleration) when an adapter exists;
+//!           the default is the CPU (Software Rendering)
 //! Bridge:   --bridge PORT drives a running `effectcraft --control PORT` instead of a headless session
 //! Output:   --json for one compact JSON document on stdout (errors: {"error": …}, exit 1)
 //! ```
@@ -97,7 +99,7 @@ fn stdout_broken() -> bool {
     STDOUT_FAILED.get().is_some_and(|k| *k != std::io::ErrorKind::BrokenPipe)
 }
 
-const USAGE: &str = "usage: effectcraft-cli <info|commands|exec|run|props|get|set|render-frame|render|script|mcp> [args] [--json]
+const USAGE: &str = "usage: effectcraft-cli <info|commands|exec|run|props|get|set|render-frame|render|script|replay|mcp> [args] [--json]
   info                                     project + engine summary
   commands [--filter TEXT] [--enabled]     list engine commands
   exec <command-id> [--params JSON]        run one engine command (exec --list: list them, as `commands`)
@@ -115,9 +117,13 @@ const USAGE: &str = "usage: effectcraft-cli <info|commands|exec|run|props|get|se
          [--resolution full|half|third|quarter|K] [--quality best|draft] [--channels rgb|rgba]
          [--jpeg-quality N] [--bitrate KBPS] [--prores PROFILE] [--audio auto|on|off]
          [--profile main|main10] [--level auto|4.1] [--rate-control bitrate|quality] [--video-quality N]
-         [--keyint FRAMES] [--webm-codec vp9|av1] [--audio-bitrate KBPS] [--opus-app audio|voice] | --queue
+         [--keyint FRAMES] [--webm-codec vp9|av1] [--audio-bitrate KBPS] [--opus-app audio|voice]
+         [--exr-compression C] [--exr-depth half|float] | --queue
                                            (formats h264|hevc|av1|prores|webm|png|jpeg|tiff|exr|tga|gif|wav|aiff;
-                                           --profile..--keyint: HEVC / AV1, --audio-bitrate/--opus-app: WebM Opus)
+                                           --profile..--keyint: HEVC / AV1, --audio-bitrate/--opus-app: WebM Opus;
+                                           --exr-compression none|rle|zips|zip|piz|pxr24|b44|b44a|dwaa|dwab
+                                           (default zip; pxr24 on float, b44/b44a on half and dwaa/dwab are lossy),
+                                           --exr-depth (default float): OpenEXR)
                                            a relative --out is relative to the working directory
                                            --progress: progress lines on stderr when it is not a terminal
                                            (progress <frames done> <total> <seconds elapsed> <seconds left|->)
@@ -135,6 +141,9 @@ const USAGE: &str = "usage: effectcraft-cli <info|commands|exec|run|props|get|se
   script FILE.jsx [F.ecproj] | --eval CODE run JavaScript with the After Effects-style object model
                                            (app.project, comps, layers, properties…); prints writeLn
                                            output and the result; errors exit 1 with file:line:col
+  replay SCRIPT.jsonl [--keep-going]       replay a repro script headless (journal.export, crash repros):
+                                           per-step ok/error and the first failure; exits 1 when a step
+                                           fails, an expectation is not met or a command panics
   mcp [--autosave | --bridge PORT]         MCP server (JSON-RPC over stdio); --autosave preserves unsaved headless work
       [--automation-read-root DIR] [--automation-write-root DIR]
                                            confine the agent's file access: reads under a read or write root,
@@ -192,6 +201,8 @@ const VALUED: &[&str] = &[
     "--webm-codec",
     "--audio-bitrate",
     "--opus-app",
+    "--exr-compression",
+    "--exr-depth",
     // mcp
     "--automation-read-root",
     "--automation-write-root",
@@ -220,6 +231,7 @@ const FLAGS: &[&str] = &[
     "--small",
     "--adv3d",
     "--autosave",
+    "--keep-going",
     "--progress",
 ];
 
@@ -303,7 +315,6 @@ fn utf8_args(raw: impl IntoIterator<Item = std::ffi::OsString>) -> Result<Vec<St
 }
 
 fn main() {
-    effectcraft_render::configure_parallelism();
     // Warnings and errors to standard error (`RUST_LOG` overrides), so a GPU that declines
     // frames or runs out of memory says so instead of silently rendering on the CPU.
     effectcraft_engine::logging::install_with("warn");
@@ -465,7 +476,7 @@ fn backend(args: &Args, default_demo: bool) -> Result<Backend, Failure> {
 }
 
 /// A wired session; `--gpu` attaches the GPU compositor (renders then follow the project's
-/// renderer setting, Mercury GPU Acceleration by default).
+/// renderer setting, GPU Acceleration by default).
 fn session(args: &Args) -> Result<effectcraft_engine::Session, Failure> {
     let mut s = effectcraft_host::session();
     if args.flag("--autosave") {
@@ -551,6 +562,59 @@ fn script_cmd(args: &Args, json_out: bool) -> Result<(), Failure> {
     Ok(())
 }
 
+/// `replay SCRIPT.jsonl`: run a repro script against a headless session (its start line picks
+/// the project) and report every step. Exits 1 when the replay fails.
+fn replay_cmd(args: &Args, json_out: bool) -> Result<(), Failure> {
+    use effectcraft_engine::replay;
+    let Some(file) = args.pos.first() else { return usage_err("replay needs a .jsonl script") };
+    if args.opt("--bridge").is_some() || args.project.is_some() || args.flag("--demo") || args.flag("--empty") {
+        return usage_err("replay runs headless from the script's start line ({\"start\": \"new\" | \"demo\" | {\"project\": path}})");
+    }
+    use std::io::Read;
+    let path = std::path::Path::new(file);
+    let input = std::fs::File::open(path).map_err(|e| Failure::Error(format!("cannot read {file}: {e}")))?;
+    // Bound the read itself: metadata can be stale or describe a pipe rather than its contents.
+    let mut script = String::new();
+    input.take(replay::MAX_SCRIPT_BYTES as u64 + 1).read_to_string(&mut script).map_err(|e| Failure::Error(format!("cannot read {file}: {e}")))?;
+    if script.len() > replay::MAX_SCRIPT_BYTES {
+        return Err(Failure::Error(format!("{file} is larger than {} MB", replay::MAX_SCRIPT_BYTES >> 20)));
+    }
+    let mut s = session(args)?;
+    let opts = replay::Options { keep_going: args.flag("--keep-going"), base_dir: path.parent().map(std::path::Path::to_path_buf) };
+    let report = replay::run(&mut s, &script, &opts);
+    if json_out {
+        emit(&serde_json::to_value(&report).unwrap_or_else(|e| json!({"error": e.to_string()})), true);
+    } else {
+        for st in &report.steps {
+            let what = st.command.as_deref().unwrap_or(st.kind);
+            match (&st.error, st.ok) {
+                (None, _) => say!("line {:>4}  ok    {what}", st.line),
+                (Some(e), true) => say!("line {:>4}  ok    {what} (tolerated error: {e})", st.line),
+                (Some(e), false) => say!("line {:>4}  FAIL  {what}: {e}", st.line),
+            }
+        }
+    }
+    let Some(first) = &report.first_failure else {
+        if !json_out {
+            say!("replay ok: {} steps", report.steps.len());
+        }
+        return Ok(());
+    };
+    let msg = format!(
+        "failed at line {} ({}){}: {}{}",
+        first.line,
+        first.command.as_deref().unwrap_or(first.kind),
+        if report.panicked { ", a command panicked" } else { "" },
+        first.error.as_deref().unwrap_or(""),
+        if report.skipped > 0 { format!(" ({} later steps not run)", report.skipped) } else { String::new() }
+    );
+    if json_out {
+        note!("effectcraft-cli replay: {msg}");
+        std::process::exit(1);
+    }
+    Err(Failure::Error(msg))
+}
+
 /// Print a result: compact JSON with `--json`, else pretty JSON.
 fn emit(v: &Value, json_out: bool) {
     if json_out {
@@ -613,6 +677,7 @@ fn run(cmd: &str, args: &Args, json_out: bool) -> Result<(), Failure> {
         "commands" => list_commands_cmd(args, json_out)?,
         "exec" if args.flag("--list") => list_commands_cmd(args, json_out)?,
         "script" => script_cmd(args, json_out)?,
+        "replay" => replay_cmd(args, json_out)?,
         "exec" => {
             let Some(id) = args.pos.first().cloned() else { return usage_err("exec needs a command id") };
             let params = match (args.opt("--params"), args.pos.get(1).map(String::as_str)) {
@@ -887,6 +952,8 @@ fn render(args: &Args, json_out: bool) -> Result<(), Failure> {
             ("--rate-control", "rateControl"),
             ("--webm-codec", "webmCodec"),
             ("--opus-app", "opusApplication"),
+            ("--exr-compression", "exrCompression"),
+            ("--exr-depth", "exrBitDepth"),
         ] {
             if let Some(v) = args.opt(flag) {
                 p[key] = json!(v);
@@ -1469,7 +1536,7 @@ fn adv3d_bench_comp(p: &mut effectcraft_engine::project::Project) -> Option<Item
 /// `bench --gpu`: CPU vs GPU ms/frame for every comp (or `--comp`) at Full and Half. "cold"
 /// renders everything (no layer cache); "warm" reuses the layer cache (playback / scrubbing of
 /// unchanged layers: compositing cost); "viewer" is the GPU display path without readback;
-/// "auto" is Backend::Auto (Mercury GPU Acceleration) choosing per comp from measured times,
+/// "auto" is Backend::Auto (GPU Acceleration) choosing per comp from measured times,
 /// warm; "up/dn MB" are the GPU's uploads / readbacks per warm GPU frame.
 fn bench_gpu(s: &Session, args: &Args) -> Result<(), Failure> {
     use effectcraft_render::Backend;
@@ -1504,8 +1571,6 @@ fn bench_gpu(s: &Session, args: &Args) -> Result<(), Failure> {
         r.expr = s.expr.as_deref();
         r.accel = Some(&gpu);
         let transfers = gpu.context().transfer_stats();
-        let pipelines = gpu.context().pipeline_build_stats();
-        let precomps = gpu.context().static_precomp_stats();
         let pool = gpu.context().pool_stats();
         let start = std::time::Instant::now();
         let frame = r.comp_frame(cid, t);
@@ -1518,20 +1583,10 @@ fn bench_gpu(s: &Session, args: &Args) -> Result<(), Failure> {
             .flat_map(|channel| channel.to_bits().to_le_bytes())
             .fold(0xcbf29ce484222325, |hash, byte| (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3));
         let transfers_after = gpu.context().transfer_stats();
-        let pipelines_after = gpu.context().pipeline_build_stats();
-        let precomps_after = gpu.context().static_precomp_stats();
         let pool_after = gpu.context().pool_stats();
         note!("GPU-only first frame: {}x{} {first_frame_ms:.2} ms, hash {pixel_hash:016x}", frame.width, frame.height);
         note!(
-            "  shader modules {} ({:.2} ms), lazy pipelines {} ({:.2} ms), pipeline cache {}/{} hits; static precomps {}/{} hits/misses; uploads {} ({:.1} MB), readbacks {} ({:.1} MB), texture pool {}/{} hits/misses",
-            pipelines_after.shader_modules - pipelines.shader_modules,
-            (pipelines_after.shader_module_ns - pipelines.shader_module_ns) as f64 / 1.0e6,
-            pipelines_after.pipelines - pipelines.pipelines,
-            (pipelines_after.pipeline_ns - pipelines.pipeline_ns) as f64 / 1.0e6,
-            pipelines_after.cache_hits - pipelines.cache_hits,
-            pipelines_after.requests - pipelines.requests,
-            precomps_after.hits - precomps.hits,
-            precomps_after.misses - precomps.misses,
+            "  uploads {} ({:.1} MB), readbacks {} ({:.1} MB), texture pool {}/{} hits/misses",
             transfers_after.uploads - transfers.uploads,
             (transfers_after.upload_bytes - transfers.upload_bytes) as f64 / (1u64 << 20) as f64,
             transfers_after.readbacks - transfers.readbacks,
@@ -1572,15 +1627,11 @@ fn bench_gpu(s: &Session, args: &Args) -> Result<(), Failure> {
                 std::hint::black_box(mk(Backend::Cpu, None));
             });
             let cold_transfers_before = gpu.context().transfer_stats();
-            let cold_pipelines_before = gpu.context().pipeline_build_stats();
-            let cold_precomps_before = gpu.context().static_precomp_stats();
             let cold_pool_before = gpu.context().pool_stats();
             let gpu_cold = time_ms(n, || {
                 std::hint::black_box(mk(Backend::Gpu, None));
             });
             let cold_transfers = gpu.context().transfer_stats();
-            let cold_pipelines = gpu.context().pipeline_build_stats();
-            let cold_precomps = gpu.context().static_precomp_stats();
             let cold_pool = gpu.context().pool_stats();
             let cache = LayerCache::default();
             let cpu_warm = time_ms(n, || {
@@ -1639,15 +1690,7 @@ fn bench_gpu(s: &Session, args: &Args) -> Result<(), Failure> {
                 "{name:<28} {label:>5} {size:>10} {cpu_cold:>9.2} {gpu_cold:>9.2} {cpu_warm:>9.2} {gpu_warm:>9.2} {view:>9.2} {speedup:>7.2}x {auto:>9.2} {pct:>8.3}% {traffic:>11}"
             );
             note!(
-                "  cold profile: shader modules {} ({:.2} ms), lazy pipelines {} ({:.2} ms), pipeline cache {}/{} hits; static precomps {}/{} hits/misses; uploads {} ({:.1} MB), readbacks {} ({:.1} MB), texture pool {}/{} hits/misses",
-                cold_pipelines.shader_modules - cold_pipelines_before.shader_modules,
-                (cold_pipelines.shader_module_ns - cold_pipelines_before.shader_module_ns) as f64 / 1.0e6,
-                cold_pipelines.pipelines - cold_pipelines_before.pipelines,
-                (cold_pipelines.pipeline_ns - cold_pipelines_before.pipeline_ns) as f64 / 1.0e6,
-                cold_pipelines.cache_hits - cold_pipelines_before.cache_hits,
-                cold_pipelines.requests - cold_pipelines_before.requests,
-                cold_precomps.hits - cold_precomps_before.hits,
-                cold_precomps.misses - cold_precomps_before.misses,
+                "  cold profile: uploads {} ({:.1} MB), readbacks {} ({:.1} MB), texture pool {}/{} hits/misses",
                 cold_transfers.uploads - cold_transfers_before.uploads,
                 (cold_transfers.upload_bytes - cold_transfers_before.upload_bytes) as f64 / (1u64 << 20) as f64,
                 cold_transfers.readbacks - cold_transfers_before.readbacks,

@@ -14,7 +14,6 @@
 
 use std::sync::{Arc, OnceLock};
 
-use craft_resample::downsample2_floor_rgba;
 use effectcraft_color::{BlendMode, ColorSpace, Label};
 use effectcraft_keyframe::{Keyframe, ShapePath, Value};
 use effectcraft_project::build::{self, Ids};
@@ -29,8 +28,10 @@ use crate::Gpu;
 
 mod adjust;
 mod adv3d;
+mod bench_share;
 mod deferred;
 mod deferred_jobs;
+mod footage_share;
 mod fx_color;
 mod fx_depth;
 mod fx_distort;
@@ -650,12 +651,13 @@ fn layer_styles_collapsed_precomps_and_cpu_fallbacks() {
 /// The effect alone on a buffer: GPU kernels vs the CPU effect (32-bit float), including the
 /// buffer geometry (padding, offset).
 pub(crate) fn effect_direct(id: &str, vals: &[(&str, Value)], adjustment: bool) {
-    let Some(g) = gpu() else { return };
-    let spec = effectcraft_effects::find(id).unwrap();
-    if !spec.gpu {
-        // The frame tests in effect_case exercise the exact CPU fallback and GPU compositor.
+    // Some kernels remain in the codebase after their GPU badge was removed for parity gaps.
+    // Exercise direct GPU parity only for effects advertised as GPU-supported.
+    if !effectcraft_effects::GPU_EFFECTS.contains(&id) {
         return;
     }
+    let Some(g) = gpu() else { return };
+    let spec = effectcraft_effects::find(id).unwrap();
     let size = [70.0, 44.0];
     let mut params =
         effectcraft_effects::Params { values: spec.params.iter().map(|ps| (ps.id.to_string(), effectcraft_effects::default_value(ps, size))).collect() };
@@ -721,8 +723,8 @@ pub(crate) fn c(r: f64, g: f64, b: f64) -> Value {
 }
 
 #[test]
-fn small_gaussian_matches_the_cpu_and_fractional_box_blur_falls_back() {
-    // #1939: keep the exact sampled Gaussian on the GPU; fractional box radii still use CPU.
+fn small_blurs_fall_back_to_the_cpu() {
+    // #1939: small Gaussian sigmas and fractional box radii render on the CPU kernel.
     for (id, vals) in [("ec.blur.gaussian", [("blurriness", n(0.9))]), ("ec.blur.fastbox", [("radius", n(1.5))])] {
         let mut s = Scene::new(BitDepth::Bpc32);
         let bg = s.solid([0.15, 0.1, 0.2], 97, 61);
@@ -890,8 +892,8 @@ fn backend_selection_and_display_frames() {
     }
 }
 
-/// The display texture carries a full mip chain matching the shared floor-sized RGBA reducer, so
-/// the viewer minifies a frame without aliasing (#417).
+/// The display texture carries a full mip chain, each level the 2 × 2 mean of the one above, so the
+/// viewer minifies a frame without aliasing (#417).
 #[test]
 fn display_frames_are_mipmapped() {
     let Some(g) = gpu() else { return };
@@ -902,43 +904,36 @@ fn display_frames_are_mipmapped() {
     assert_eq!(f.texture.mip_level_count(), crate::context::mip_levels(f.width, f.height));
     assert_eq!(f.texture.mip_level_count(), u32::BITS - f.width.max(f.height).leading_zeros());
     let base = g.read_display(&f).expect("readback");
-    let mut current_pixels = base.as_chunks::<4>().0.iter().map(|px| px.map(f32::from)).collect::<Vec<_>>();
-    let (mut current_width, mut current_height) = (f.width, f.height);
+    // Level 1, copied out to read it back.
+    let (w1, h1) = (f.width / 2, f.height / 2);
+    let tex = g.device().create_texture(&wgpu::TextureDescriptor {
+        label: None,
+        size: wgpu::Extent3d { width: w1, height: h1, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8Unorm,
+        usage: wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    let mut e = crate::context::Enc::new(&g.ctx);
+    e.record(&[]).copy_texture_to_texture(
+        wgpu::TexelCopyTextureInfo { texture: &f.texture, mip_level: 1, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+        wgpu::TexelCopyTextureInfo { texture: &tex, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+        wgpu::Extent3d { width: w1, height: h1, depth_or_array_layers: 1 },
+    );
+    let level1 = e.read_texture(&tex, w1, h1, 4).expect("level 1");
+    let at = |x: u32, y: u32, c: usize| base[((y * f.width + x) * 4) as usize + c] as f32;
     let mut varied = false;
-    for mip_level in 1..f.texture.mip_level_count() {
-        let (expected_w, expected_h, expected) =
-            downsample2_floor_rgba(&current_pixels, current_width as usize, current_height as usize).expect("non-empty source mip");
-        let (width, height) = ((f.width >> mip_level).max(1), (f.height >> mip_level).max(1));
-        assert_eq!((width as usize, height as usize), (expected_w, expected_h));
-        let tex = g.device().create_texture(&wgpu::TextureDescriptor {
-            label: None,
-            size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8Unorm,
-            usage: wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
-        let mut e = crate::context::Enc::new(&g.ctx);
-        e.record(&[]).copy_texture_to_texture(
-            wgpu::TexelCopyTextureInfo { texture: &f.texture, mip_level, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
-            wgpu::TexelCopyTextureInfo { texture: &tex, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
-            wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
-        );
-        let actual = e.read_texture(&tex, width, height, 4).expect("read mip level");
-        for y in 0..height {
-            for x in 0..width {
-                for c in 0..4 {
-                    let want = expected[(y as usize) * expected_w + x as usize][c];
-                    let got = actual[((y * width + x) * 4) as usize + c];
-                    assert!((want.round() as i32 - got as i32).abs() <= 1, "({x}, {y}) channel {c}: {got} against the shared mean {want}");
-                    varied |= want != current_pixels[((2 * y).min(current_height - 1) * current_width + (2 * x).min(current_width - 1)) as usize][c];
-                }
+    for y in 0..h1 {
+        for x in 0..w1 {
+            for c in 0..4 {
+                let want = (at(2 * x, 2 * y, c) + at(2 * x + 1, 2 * y, c) + at(2 * x, 2 * y + 1, c) + at(2 * x + 1, 2 * y + 1, c)) / 4.0;
+                let got = level1[((y * w1 + x) * 4) as usize + c] as f32;
+                assert!((want - got).abs() <= 1.0, "({x}, {y}) channel {c}: {got} against the mean {want}");
+                varied |= want != at(2 * x, 2 * y, c);
             }
         }
-        current_pixels = actual.as_chunks::<4>().0.iter().map(|px| px.map(f32::from)).collect();
-        (current_width, current_height) = (width, height);
     }
     assert!(varied, "the scene has edges to average");
 }
@@ -1006,6 +1001,49 @@ fn within_memory_returns_the_work_when_there_is_room() {
     let Some(g) = gpu() else { return };
     let img = g.within_memory(|| g.ctx.image(64, 32)).expect("room for a 64×32 texture");
     assert_eq!((img.width, img.height), (64, 32));
+}
+
+/// A timeout can retire a context without any device error scope reporting a failure.
+/// Queued jobs keep that context alive, so CPU fallback must not wait for its last owner
+/// to drop before releasing cached uploads and working textures (#3357).
+fn retired_attempt_releases_kept_resources(retire_before: bool) {
+    hold_gpu_lock();
+    let made = Gpu::try_headless();
+    let Some(g) = require_gpu("retired memory attempt", made.as_ref()) else { return };
+    let buf = Arc::new(effectcraft_effects::Buf { img: Image::new(16, 16), offset: [0.0; 2], scale: 1.0 });
+    drop(g.ctx.upload_buf(&buf).expect("a small cached upload"));
+    drop(crate::context::Enc::new(&g.ctx).image(32, 16));
+    assert_eq!(g.ctx.upload_entries(), 1);
+    assert!(g.ctx.pool_retained_bytes() > 0);
+    // An earlier frame can return a lease after retirement; it must not refill the pool.
+    let earlier = crate::context::Enc::new(&g.ctx).image(48, 16);
+    let retire = g.ctx.device_failure_notifier();
+    if retire_before {
+        retire("synthetic readback retirement".into());
+    }
+    let called = std::cell::Cell::new(false);
+    let result = g.within_memory(|| {
+        called.set(true);
+        let out = crate::context::Enc::new(&g.ctx).image(64, 16);
+        retire("synthetic readback retirement".into());
+        out
+    });
+    assert!(matches!(result, Err(crate::FrameError::Retired(_))));
+    assert_eq!(called.get(), !retire_before);
+    assert_eq!(g.ctx.upload_entries(), 0, "CPU fallback must not retain uploaded layers");
+    assert_eq!(g.ctx.pool_retained_bytes(), 0, "CPU fallback must not retain working textures");
+    drop(earlier);
+    assert_eq!(g.ctx.pool_retained_bytes(), 0, "late leases cannot refill a retired pool");
+}
+
+#[test]
+fn within_memory_releases_caches_when_already_retired() {
+    retired_attempt_releases_kept_resources(true);
+}
+
+#[test]
+fn within_memory_releases_caches_when_retired_during_work() {
+    retired_attempt_releases_kept_resources(false);
 }
 
 /// A texture the device rejected (deliberately too wide), made outside any frame under a scope
@@ -1135,35 +1173,6 @@ fn nested_precomps_render_resident() {
     }
 }
 
-#[test]
-fn repeated_static_precomps_reuse_gpu_rasters() {
-    let mut s = Scene::new(BitDepth::Bpc32);
-    let inner = Comp::new(40, 30, FrameRate::FPS_30, Tick::from_seconds_f64(2.0));
-    let inner_id = s.p.add_item("Static inner", Label::Sandstone, None, ItemKind::Comp(inner.clone().into()));
-    {
-        let mut sub = Scene { p: std::mem::take(&mut s.p), cid: inner_id, comp: inner };
-        let still = sub.footage(32, 24);
-        sub.push(still);
-        let mut solid = sub.solid([0.8, 0.25, 0.4], 20, 18);
-        set(&mut solid, "transform/rotation", Value::Scalar(11.0));
-        sub.push(solid);
-        s.p = sub.p;
-    }
-    for i in 0..12 {
-        let mut layer = build::layer(&mut s.p, &s.comp, "Static instance", LayerSource::Comp { item: inner_id }, (40, 30), None);
-        set(&mut layer, "transform/position", v3(8.0 + f64::from(i * 6), 10.0 + f64::from(i * 3)));
-        set(&mut layer, "transform/scale", Value::Vec3([70.0 + f64::from(i % 3) * 10.0, 70.0, 100.0]));
-        s.push(layer);
-    }
-
-    let Some(g) = gpu() else { return };
-    let before = g.ctx.static_precomp_stats();
-    check("repeated static precomps", compare_at(&s, RenderOpts { motion_blur: false, ..opts() }, Tick::ZERO), 0.0);
-    let after = g.ctx.static_precomp_stats();
-    assert!(after.misses - before.misses >= 1, "the first static raster is rendered once");
-    assert!(after.hits - before.hits >= 11, "later instances should reuse the first raster");
-}
-
 /// #613: an effect kernel the device's shader compiler rejects (FXC on DirectX 12 aborting on
 /// `pointwise`) no longer turns the whole GPU compositor off: the context is built without it,
 /// lists it, and the effects that need it render on the CPU, matching the CPU render.
@@ -1286,6 +1295,49 @@ fn readback_staging_stays_bounded_across_sizes() {
     }
     let held = g.ctx.staging_bytes();
     assert!(held <= (256 << 20) + 2 * 1024 * 16 * 376, "staging buffers hold {held} bytes");
+}
+
+/// #3335: a readback copies the mapped rows straight into the image (no zero-filled buffer,
+/// no intermediate byte vector), skipping each row's padding: odd widths, sub-rectangles and
+/// readbacks from several threads at once (each waiting for its own submission) return the
+/// uploaded pixels exactly.
+#[test]
+fn single_copy_readback_returns_the_exact_pixels() {
+    let Some(g) = gpu() else { return };
+    if !g.ctx.can_wait() {
+        return;
+    }
+    let image = |w: u32, h: u32, seed: f32| {
+        let mut img = Image::new(w, h);
+        for (i, p) in img.data.iter_mut().enumerate() {
+            let v = i as f32 * 0.37 + seed;
+            *p = [v, -v, v * 1e-3, 1.0 / (1.0 + v)];
+        }
+        img
+    };
+    // 37 × 16 bytes = 592 per row: padded to 768 in the staging buffer.
+    let src = image(37, 5, 0.5);
+    let up = g.ctx.upload_image(&src).expect("upload");
+    let mut e = crate::context::Enc::new(&g.ctx);
+    let back = e.download(&up).expect("download");
+    assert_eq!((back.width, back.height), (37, 5));
+    assert_eq!(back.data, src.data);
+    let rect = e.read_rect(&up.texture, 3, 1, 5, 2, 16).expect("read_rect");
+    let want: Vec<[f32; 4]> = (1..3).flat_map(|y| (3..8).map(move |x| (x, y))).map(|(x, y)| src.data[src.idx(x, y)]).collect();
+    assert_eq!(rect, bytemuck::cast_slice::<[f32; 4], u8>(&want));
+    // Frames on several threads, each with its own encoder and submission.
+    std::thread::scope(|s| {
+        for t in 0..4 {
+            s.spawn(move || {
+                for k in 0..3 {
+                    let src = image(61 + t, 7 + k, (t * 10 + k) as f32);
+                    let up = g.ctx.upload_image(&src).expect("upload");
+                    let back = crate::context::Enc::new(&g.ctx).download(&up).expect("download");
+                    assert_eq!(back.data, src.data, "thread {t} frame {k}");
+                }
+            });
+        }
+    });
 }
 
 /// A static adjustment layer with a time-dependent effect (Noise) keeps its footprint key
@@ -1475,26 +1527,6 @@ fn static_effect_layers_draw_from_the_cache() {
     check("static effect layer vs CPU", compare_at(&s, opts(), t(2)), 0.0);
 }
 
-#[test]
-fn first_cpu_effect_uses_the_layer_source_without_gpu_readback() {
-    let Some(g) = gpu() else { return };
-    let mut img = Image::new(8, 8);
-    img.data.fill([0.2, 0.4, 0.6, 1.0]);
-    let source = Arc::new(effectcraft_effects::Buf { img, offset: [0.0; 2], scale: 1.0 });
-    let mut e = crate::context::Enc::new(&g.ctx);
-    let uploaded = e.g.upload_buf(&source).expect("source fits the GPU");
-    let before = g.ctx.transfer_stats();
-    let mut fx = crate::effects::GpuFx::with_cpu_shadow(&mut e, uploaded, source, None);
-    effectcraft_render::FxTarget::cpu(&mut fx, &mut |mut buf| {
-        buf.img.data[0] = [0.1, 0.3, 0.5, 1.0];
-        buf
-    });
-    let after = g.ctx.transfer_stats();
-    assert_eq!(after.readbacks, before.readbacks, "the clean GPU upload was read back");
-    let (result, _, _) = fx.finish().expect("CPU result is uploaded");
-    assert_eq!(e.download(&result).expect("read result").data[0], [0.1, 0.3, 0.5, 1.0]);
-}
-
 /// The layer upload cache drops the textures of freed buffers when it inserts, not only once
 /// it is over budget (an animated layer makes a new buffer every frame).
 #[test]
@@ -1511,24 +1543,6 @@ fn upload_cache_drops_textures_of_freed_buffers() {
     assert!(kept <= before + 1, "the upload cache kept {kept} textures of freed buffers (had {before})");
 }
 
-#[test]
-fn rgba8_upload_cache_distinguishes_quantized_sources() {
-    let Some(g) = gpu() else { return };
-    let mut img = Image::new(1, 1);
-    img.data[0] = [0.8, 0.2, 0.1, 0.5];
-    let buf = Arc::new(effectcraft_effects::Buf { img, offset: [0.0; 2], scale: 1.0 });
-    let before = g.ctx.transfer_stats();
-    let _quantized = g.ctx.upload_buf_8bit(&buf, true).expect("quantized source fits the GPU");
-    let once = g.ctx.transfer_stats();
-    let _unquantized = g.ctx.upload_buf_8bit(&buf, false).expect("unquantized source fits the GPU");
-    let twice = g.ctx.transfer_stats();
-    let _cached = g.ctx.upload_buf_8bit(&buf, true).expect("quantized source cache hit");
-    let cached = g.ctx.transfer_stats();
-    assert_eq!(once.uploads - before.uploads, 1, "first quantized upload");
-    assert_eq!(twice.uploads - once.uploads, 1, "unquantized upload must not reuse quantized bytes");
-    assert_eq!(cached.uploads, twice.uploads, "repeated quantized upload should hit its cache entry");
-}
-
 /// The device the compositor owns asks for `MemoryUsage` so freed textures give
 /// their allocator blocks back, while its label and limits stay as they were.
 #[test]
@@ -1537,6 +1551,38 @@ fn owned_devices_favour_memory_usage() {
     assert!(matches!(d.memory_hints, wgpu::MemoryHints::MemoryUsage));
     assert_eq!(d.label, Some("effectcraft gpu"));
     assert_eq!(d.required_limits.max_texture_dimension_2d, wgpu::Limits::default().max_texture_dimension_2d);
+}
+
+/// `RenderOpts::skip_hdr_step` (float outputs) skips Project Settings ▸ HDR on the GPU as on the
+/// CPU: both compositors agree, and the frame is the Clip frame with its over-range values.
+#[test]
+fn skipping_the_hdr_step_on_the_gpu_matches_clip() {
+    use effectcraft_project::HdrMode;
+    let Some(g) = gpu() else {
+        // Visible skip (EFFECTCRAFT_REQUIRE_GPU=1 makes a missing adapter fail instead).
+        eprintln!("skipping_the_hdr_step_on_the_gpu_matches_clip: skipped: no GPU adapter");
+        return;
+    };
+    for mode in [HdrMode::Compand, HdrMode::ToneMap] {
+        let mut s = blend_scene(BitDepth::Bpc32, BlendMode::Normal);
+        let mut bright = s.solid([3.0, 1.5, 0.5], 30, 20);
+        bright.blend_mode = BlendMode::Add;
+        s.push(bright);
+        s.p.settings.working_space = Some(ColorSpace::Srgb);
+        s.p.settings.linearize = true;
+        s.p.settings.hdr = mode;
+        let scene = RenderOpts { skip_hdr_step: true, ..opts() };
+        check(&format!("no HDR step {mode:?}"), compare_at(&s, scene, Tick::ZERO), 0.0);
+        let mut r = Renderer::new(&s.p, &Pattern, RenderOpts { backend: Backend::Gpu, ..scene });
+        r.accel = Some(g);
+        let img = g.render(&r, s.cid, Tick::ZERO).expect("the GPU renders the frame");
+        let mut clip = s.p.clone();
+        clip.settings.hdr = HdrMode::Clip;
+        let want = Renderer::new(&clip, &Pattern, RenderOpts { backend: Backend::Cpu, ..opts() }).comp_frame_cpu(s.cid, Tick::ZERO);
+        let d = diff(&want, &img, tolerance(BitDepth::Bpc32));
+        assert_eq!(d.over, 0, "{mode:?}: max {} at {:?}", d.max, d.worst);
+        assert!(img.data.iter().any(|p| p[3] > 0.0 && p[0] / p[3] > 1.0), "{mode:?}: over-range values survive");
+    }
 }
 
 /// A GPU context of its own with a small pool budget, so other tests (sharing [`gpu`]) neither

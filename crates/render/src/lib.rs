@@ -17,6 +17,7 @@ use color::Region;
 pub mod eval;
 pub mod masks;
 pub mod passes;
+pub mod reads;
 pub mod shapes;
 pub mod styles;
 pub mod text;
@@ -45,8 +46,8 @@ mod layers;
 mod opts;
 mod pipeline;
 
-pub use accel::{Accelerator, Backend, FxStep, FxTarget};
-pub use footage::{CancellableFootage, FloatCurve, FootageSource, NoFootage, is_vector_footage};
+pub use accel::{Accelerator, Backend, FrameMemory, FxStep, FxTarget};
+pub use footage::{CancellableFootage, FloatCurve, FootageSource, NoFootage, is_vector_footage, missing_item_problem, vector_fit};
 pub use frames::{
     adaptive_samples, blend_frames, cineon_frame, content_bounds, extended_region, field_frame, frame_position, frame_size, interpret_pixels, kurbo_path,
     render_frame, roi_inside,
@@ -56,26 +57,12 @@ use fx_host::FxHost;
 use fx_host::MAX_FX_DEPTH;
 pub(crate) use fx_host::comp_scene;
 pub use fx_host::essential_overrides;
-pub use layers::{GpuFootageSourceKey, Placement, StyledLayer};
+pub use layers::{Placement, StyledLayer};
 pub(crate) use opts::Collapse3d;
 pub use opts::{LayerTiming, RenderOpts};
 use opts::{MAX_THROUGH, Through};
-pub use pipeline::{Collapsed, CompFrameKey, MediaOverride, PropertyOverride};
+pub use pipeline::{Collapsed, FootagePicture, MediaOverride, PropertyOverride};
 
-/// Configure Rayon once for an EffectCraft process. The compositor uses the global pool across
-/// layer rendering, pixel operations and project parsing, so cap it at a moderate size on
-/// machines with many logical CPUs. `RAYON_NUM_THREADS` remains the explicit user override.
-pub fn configure_parallelism() {
-    static CONFIGURED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
-    CONFIGURED.get_or_init(|| {
-        if std::env::var_os("RAYON_NUM_THREADS").is_none() {
-            let threads = std::thread::available_parallelism().map_or(1, |n| n.get().min(8));
-            let _ = rayon::ThreadPoolBuilder::new().num_threads(threads).build_global();
-        }
-    });
-}
-
-#[derive(Clone)]
 pub struct Renderer<'a> {
     pub project: &'a Project,
     pub footage: &'a dyn FootageSource,
@@ -83,16 +70,12 @@ pub struct Renderer<'a> {
     pub opts: RenderOpts,
     /// Processed-layer cache shared across frames (see [`cache`]). `None` renders everything.
     pub cache: Option<&'a LayerCache>,
+    /// Where the source files this render reads are noted (see [`reads`]): the frame's own,
+    /// from the footage source and from the buffers the layer cache serves. `None` records
+    /// nothing for the frame (buffers kept in the layer cache still record theirs).
+    pub reads: Option<&'a reads::ReadLog>,
     /// Optional per-layer timing sink (`frame --bench` / perf readouts).
     pub profile: Option<&'a std::sync::Mutex<Vec<LayerTiming>>>,
-    /// Per-top-level-frame cache for repeated static precomps.
-    pub(crate) comp_frames: Arc<crate::pipeline::CompFrameCache>,
-    /// Bounded cache for identical static shape rasters shared by layers in this render.
-    pub(crate) shape_sources: Arc<crate::pipeline::ShapeSourceCache>,
-    /// Bounded cache for processed frames of repeated plain footage layers.
-    pub(crate) footage_buffers: Arc<crate::pipeline::FootageBufferCache>,
-    /// Disabled by profile renders so every nested layer remains visible in layer timings.
-    pub(crate) cache_static_comps: bool,
     /// GPU backend used when [`RenderOpts::backend`] asks for it.
     pub accel: Option<&'a dyn Accelerator>,
     /// Current nesting depth (precomp recursion guard).
@@ -119,6 +102,8 @@ pub struct Renderer<'a> {
     through: [Option<Through<'a>>; MAX_THROUGH],
     /// More collapsed levels than [`MAX_THROUGH`]: their motion is not blurred.
     through_lost: bool,
+    /// Layer-space consumers must not use the viewport raster optimization.
+    pub(crate) whole_raster: bool,
 }
 
 #[cfg(test)]

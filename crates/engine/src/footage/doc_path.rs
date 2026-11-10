@@ -3,10 +3,9 @@
 //! document's folder, and only local files, or files on the network share the document itself is
 //! on, are followed (see `craft_docpath`).
 //!
-//! Loading a document resolves paths that need it once (`resolve_footage`): followed paths are
+//! Loading a document resolves its footage paths once (`resolve_footage`): followed paths are
 //! replaced by the resolved path, and an item with a refused path is marked missing, so the media
-//! layer never reads it. Plain absolute sequence paths remain deferred because they are already
-//! resolved. The session then remembers which paths came from which document
+//! layer never reads it. The session then remembers which paths came from which document
 //! ([`StoredPaths`]); the footage check, the changed-on-disk scan, Reload Footage, Relink, Edit
 //! Original and Reveal in Finder follow a path only through it. Paths the user imports or relinks
 //! in this session are followed as given.
@@ -65,18 +64,16 @@ fn is_windows_rooted(p: &Path) -> bool {
     (b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':') || s.starts_with(r"\\") || s.starts_with("//")
 }
 
-/// The paths of `f` (its file and, when needed, each frame of an image sequence) resolved against
-/// the document saved at `document`, or why one of them is not followed.
-fn footage_paths(f: &Footage, document: Option<&str>) -> Result<(String, Option<Vec<String>>), (String, NotFollowed)> {
+/// The paths of `f` (its file and every frame of an image sequence) resolved against the document
+/// saved at `document`, or why one of them is not followed.
+fn footage_paths(f: &Footage, document: Option<&str>) -> Result<(String, Vec<String>), (String, NotFollowed)> {
     let one = |q: &String| -> Result<String, (String, NotFollowed)> {
         if q.is_empty() {
             return Ok(String::new());
         }
         resolve(q, document).map(|p| p.to_string_lossy().into_owned()).map_err(|why| (q.clone(), why))
     };
-    let path = one(&f.path)?;
-    let sequence = if f.sequence.has_plain_absolute_local_paths() { None } else { Some(f.sequence.iter().map(one).collect::<Result<_, _>>()?) };
-    Ok((path, sequence))
+    Ok((one(&f.path)?, f.sequence.iter().map(one).collect::<Result<_, _>>()?))
 }
 
 fn paths_of(f: &Footage) -> impl Iterator<Item = &String> {
@@ -85,7 +82,7 @@ fn paths_of(f: &Footage) -> impl Iterator<Item = &String> {
 
 /// Footage paths that came from a document, with the path of that document (`None`: one without
 /// a file). Any other path was chosen in this session and is followed as given.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct StoredPaths(Arc<HashMap<String, Option<String>>>);
 
 impl StoredPaths {
@@ -100,16 +97,13 @@ impl StoredPaths {
     pub(crate) fn add_items(&mut self, p: &Project, pick: impl Fn(ItemId) -> bool, document: Option<&str>) {
         let map = Arc::make_mut(&mut self.0);
         for item in p.items.values().filter(|i| pick(i.id)) {
-            if let ItemKind::Footage(f) = &item.kind {
-                if !f.path.is_empty() {
-                    map.entry(f.path.clone()).or_insert_with(|| document.map(str::to_string));
-                }
-                if !f.sequence.has_plain_absolute_local_paths() {
-                    for q in &f.sequence {
-                        if !q.is_empty() {
-                            map.entry(q.clone()).or_insert_with(|| document.map(str::to_string));
-                        }
-                    }
+            let original = match &item.kind {
+                ItemKind::Footage(f) => Some(f),
+                _ => None,
+            };
+            for f in original.into_iter().chain(item.proxy.as_ref().map(|p| &p.footage)) {
+                for q in paths_of(f) {
+                    map.entry(q.clone()).or_insert_with(|| document.map(str::to_string));
                 }
             }
         }
@@ -146,9 +140,9 @@ impl StoredPaths {
     }
 }
 
-/// Resolve the footage paths stored in `p`, the project saved at `project`: paths that need
-/// resolution are replaced by the file they resolve to, and an item with a path that is not
-/// followed is marked missing. Returns those items with the refused path and why.
+/// Resolve the footage paths stored in `p`, the project saved at `project`: followed paths are
+/// replaced by the file they resolve to, and an item with a path that is not followed is marked
+/// missing. Returns those items with the refused path and why.
 pub(crate) fn resolve_footage(p: &mut Project, project: Option<&str>) -> Vec<(ItemId, String, NotFollowed)> {
     resolve_footage_of(p, |_| true, project)
 }
@@ -157,17 +151,20 @@ pub(crate) fn resolve_footage(p: &mut Project, project: Option<&str>) -> Vec<(It
 pub(crate) fn resolve_footage_of(p: &mut Project, pick: impl Fn(ItemId) -> bool, project: Option<&str>) -> Vec<(ItemId, String, NotFollowed)> {
     let mut refused = vec![];
     for item in p.items.values_mut().filter(|i| pick(i.id)) {
-        let ItemKind::Footage(f) = &mut item.kind else { continue };
-        match footage_paths(f, project) {
-            Ok((path, sequence)) => {
-                f.path = path;
-                if let Some(sequence) = sequence {
+        let original = match &mut item.kind {
+            ItemKind::Footage(f) => Some(f),
+            _ => None,
+        };
+        for f in original.into_iter().chain(item.proxy.as_mut().map(|p| &mut p.footage)) {
+            match footage_paths(f, project) {
+                Ok((path, sequence)) => {
+                    f.path = path;
                     f.sequence = sequence.into();
                 }
-            }
-            Err((path, why)) => {
-                f.missing = true;
-                refused.push((item.id, path, why));
+                Err((path, why)) => {
+                    f.missing = true;
+                    refused.push((item.id, path, why));
+                }
             }
         }
     }
