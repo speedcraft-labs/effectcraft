@@ -139,13 +139,11 @@ pub(crate) struct GpuFx<'e, 'g> {
     e: &'e mut Enc<'g>,
     b: Option<GBuf>,
     levels: Option<f32>,
-    cpu_shadow: Option<std::sync::Arc<Buf>>,
-    gpu_dirty: bool,
 }
 
 impl<'e, 'g> GpuFx<'e, 'g> {
     pub fn new(e: &'e mut Enc<'g>, img: GpuImage, offset: [f64; 2], scale: f64, levels: Option<f32>) -> Self {
-        GpuFx { e, b: Some(GBuf { img, offset, scale }), levels, cpu_shadow: None, gpu_dirty: false }
+        GpuFx { e, b: Some(GBuf { img, offset, scale }), levels }
     }
 
     /// The result: (image, offset, scale); `None` when a step failed.
@@ -172,30 +170,14 @@ impl effectcraft_render::FxTarget for GpuFx<'_, '_> {
             }
         }
         self.b = Some(cur);
-        self.gpu_dirty = true;
         true
     }
 
     fn cpu(&mut self, f: &mut dyn FnMut(Buf) -> Buf) {
         let Some(b) = self.b.take() else { return };
-        let input = if !self.gpu_dirty {
-            match self.cpu_shadow.take() {
-                Some(shadow) => match std::sync::Arc::try_unwrap(shadow) {
-                    Ok(buf) => Some(buf),
-                    Err(shadow) => Some((*shadow).clone()),
-                },
-                None => self.e.download(&b.img).map(|img| Buf { img, offset: b.offset, scale: b.scale }),
-            }
-        } else {
-            self.cpu_shadow = None;
-            self.e.download(&b.img).map(|img| Buf { img, offset: b.offset, scale: b.scale })
-        };
-        let Some(input) = input else { return };
-        let out = f(input);
-        let uploaded = self.e.g.upload_image(&out.img);
-        self.b = uploaded.map(|img| GBuf { img, offset: out.offset, scale: out.scale });
-        self.cpu_shadow = self.b.as_ref().map(|_| std::sync::Arc::new(out));
-        self.gpu_dirty = false;
+        let Some(img) = self.e.download(&b.img) else { return };
+        let out = f(Buf { img, offset: b.offset, scale: b.scale });
+        self.b = self.e.g.upload_image(&out.img).map(|img| GBuf { img, offset: out.offset, scale: out.scale });
     }
 
     /// GBuf::cover, like `pad`: a bigger texture with the old one copied into place, no
@@ -205,15 +187,6 @@ impl effectcraft_render::FxTarget for GpuFx<'_, '_> {
         let keep = (b.img.clone(), b.offset);
         if b.cover(self.e, size).is_none() {
             (b.img, b.offset) = keep;
-        } else if !self.gpu_dirty
-            && let Some(shadow) = self.cpu_shadow.take()
-        {
-            let mut shadow = match std::sync::Arc::try_unwrap(shadow) {
-                Ok(buf) => buf,
-                Err(shadow) => (*shadow).clone(),
-            };
-            shadow.cover(size);
-            self.cpu_shadow = Some(std::sync::Arc::new(shadow));
         }
         self.b = Some(b);
     }
@@ -222,25 +195,14 @@ impl effectcraft_render::FxTarget for GpuFx<'_, '_> {
     /// copied in. A size the device can't allocate leaves the buffer as it is.
     fn align(&mut self, size: [f64; 2]) {
         let Some(b) = self.b.take() else { return };
-        let (out, aligned) = match effectcraft_effects::align_plan(b.offset, b.scale, size, b.img.width, b.img.height) {
+        let out = match effectcraft_effects::align_plan(b.offset, b.scale, size, b.img.width, b.img.height) {
             Some((l, t)) if self.e.g.fits(b.img.width + l, b.img.height + t) => {
                 let img = self.e.image(b.img.width + l, b.img.height + t);
                 self.e.copy_into(&b.img, &img, l, t);
-                (GBuf { img, offset: [b.offset[0] + l as f64, b.offset[1] + t as f64], scale: b.scale }, true)
+                GBuf { img, offset: [b.offset[0] + l as f64, b.offset[1] + t as f64], scale: b.scale }
             }
-            _ => (b, false),
+            _ => b,
         };
-        if aligned
-            && !self.gpu_dirty
-            && let Some(shadow) = self.cpu_shadow.take()
-        {
-            let mut shadow = match std::sync::Arc::try_unwrap(shadow) {
-                Ok(buf) => buf,
-                Err(shadow) => (*shadow).clone(),
-            };
-            shadow.align(size);
-            self.cpu_shadow = Some(std::sync::Arc::new(shadow));
-        }
         self.b = Some(out);
     }
 }
@@ -291,7 +253,7 @@ fn apply(e: &mut Enc, id: &str, ctx: &EffectCtx, b: GBuf) -> Option<GBuf> {
 
 // ---------------------------------------------------------------- blurs
 
-/// Kovesi radii for three box passes (raster::blur compatibility).
+/// raster::blur::box_radii.
 pub(crate) fn box_radii(sigma: f64, n: usize) -> Vec<usize> {
     if sigma <= 0.0 {
         return vec![0; n];
@@ -352,9 +314,8 @@ fn gaussian(e: &mut Enc, ctx: &EffectCtx, mut b: GBuf) -> Option<GBuf> {
         return Some(b);
     }
     let (kx, ky) = dims_xy(ctx.params.e("dimensions"));
-    let (sx, sy) = (s * kx, s * ky);
     // Small sigmas use the CPU's sampled kernel (#1939).
-    if effectcraft_raster::gaussian_is_exact(sx, sy) {
+    if effectcraft_raster::gaussian_is_exact(s * kx, s * ky) {
         return None;
     }
     let repeat = ctx.params.b("repeatEdge");
@@ -364,7 +325,7 @@ fn gaussian(e: &mut Enc, ctx: &EffectCtx, mut b: GBuf) -> Option<GBuf> {
         // The edge it repeats is the layer's, not the painted content's (#1205).
         b.cover(e, ctx.layer_size)?;
     }
-    b.img = gaussian_blur(e, &b.img, sx, sy, repeat || ctx.adjustment);
+    b.img = gaussian_blur(e, &b.img, s * kx, s * ky, repeat || ctx.adjustment);
     Some(b)
 }
 
