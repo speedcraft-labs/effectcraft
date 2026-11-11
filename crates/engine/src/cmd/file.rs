@@ -42,16 +42,7 @@ fn demo(s: &mut Session, _: &Value) -> Result<Value> {
 
 pub(crate) fn open(s: &mut Session, p: &Value) -> Result<Value> {
     let path = str_p(p, "path").ok_or_else(|| bad("file.open", "missing `path`"))?;
-    #[cfg(not(target_arch = "wasm32"))]
-    let profile_open = std::env::var_os("EFFECTCRAFT_PROFILE_OPEN").is_some();
-    #[cfg(target_arch = "wasm32")]
-    let profile_open = false;
-    let started = web_time::Instant::now();
-    let mut stage = started;
     let mut bytes = s.services.read_file(path).map_err(|e| EngineError::Other(format!("cannot read {path}: {e}")))?;
-    let bytes_len = bytes.len();
-    let read_ms = stage.elapsed().as_secs_f64() * 1e3;
-    stage = web_time::Instant::now();
     // XML copies (File ▸ Save a Copy As XML…) open like the JSON project. Keep JSON as bytes so
     // serde parses it directly without first allocating and validating a second full-size String.
     let (mut proj, repaired, view, saved_by) = if is_xml_bytes(&bytes) {
@@ -62,17 +53,11 @@ pub(crate) fn open(s: &mut Session, p: &Value) -> Result<Value> {
         Project::from_file_json_repaired_in_place(&mut bytes)
     }
     .map_err(|e| EngineError::Other(format!("{path} is not a project EffectCraft can open: {e}")))?;
-    let parse_ms = stage.elapsed().as_secs_f64() * 1e3;
-    stage = web_time::Instant::now();
     // Footage saved with a relative path (imported by the CLI or an agent as `clip.mp4`, or
     // written by hand) is found next to the project file, as After Effects looks for footage
     // relative to the project (#652).
     let refused = crate::doc_path::resolve_footage(&mut proj, Some(path));
-    let resolve_ms = stage.elapsed().as_secs_f64() * 1e3;
-    stage = web_time::Instant::now();
-    s.replace_repaired_project(proj, Some(path.to_string()));
-    let replace_ms = stage.elapsed().as_secs_f64() * 1e3;
-    stage = web_time::Instant::now();
+    s.replace_project(proj, Some(path.to_string()));
     s.stored_paths.add(&s.project, Some(path));
     s.restore_view(&view);
     s.note_project_path(path);
@@ -98,14 +83,6 @@ pub(crate) fn open(s: &mut Session, p: &Value) -> Result<Value> {
     // project shows.
     if s.check_footage_on_open {
         crate::footage_check::start(s, None, false)?;
-    }
-    if profile_open {
-        let tail_ms = stage.elapsed().as_secs_f64() * 1e3;
-        eprintln!(
-            "open-profile bytes={} read={read_ms:.3}ms parse={parse_ms:.3}ms resolve={resolve_ms:.3}ms replace={replace_ms:.3}ms restore+tail={tail_ms:.3}ms total={:.3}ms",
-            bytes_len,
-            started.elapsed().as_secs_f64() * 1e3
-        );
     }
     Ok(json!({"path": path, "savedBy": saved_by, "repaired": repaired}))
 }
@@ -359,7 +336,7 @@ impl Prober {
             && self.report_missing_frames
             && let Some(gaps) = crate::sequence::missing_report(&f.sequence)
         {
-            warning = Some(format!("{name}: {gaps} (shown as placeholders)"));
+            warning = Some(format!("{name}: {gaps} (the previous frame is held)"));
         }
         // Settings ▸ Import ▸ Interpret Unlabeled Alpha As: images only (a 3D model renders its
         // own alpha, and audio and data have none).
@@ -436,12 +413,26 @@ fn prepare_import(s: &mut Session, p: &Value) -> Result<PendingImport> {
     let mut comps = vec![];
     let mut items = vec![];
     let mut errors = vec![];
-    // EffectCraft projects import as projects, as After Effects imports an .aep.
-    let (project_paths, mut paths): (Vec<String>, Vec<String>) = paths.into_iter().partition(|x| super::import_project::is_project_path(x));
+    // EffectCraft projects import as projects, as After Effects imports an .aep; so do After
+    // Effects projects, refused when parts of them cannot come over. The app asks about those
+    // before it gets here (`panels::aep_losses`); a script or agent gets the refusal.
+    let (project_paths, paths): (Vec<String>, Vec<String>) = paths.into_iter().partition(|x| super::import_project::is_project_path(x));
+    let (aep_paths, mut paths): (Vec<String>, Vec<String>) = paths.into_iter().partition(|x| super::is_aep_path(x));
     let mut projects = vec![];
     for path in project_paths {
         match s.execute("file.importProject", json!({"path": path})) {
             Ok(r) => projects.push(r),
+            Err(e) => errors.push(format!("{path}: {e}")),
+        }
+    }
+    for path in aep_paths {
+        match s.execute("file.importAep", json!({"path": path})) {
+            Ok(r) => projects.push(r),
+            // `file.import` has no `allowLosses`: point at the entry that lists the losses, and at
+            // the command that takes the consent.
+            Err(EngineError::Refused { losses, .. }) => errors.push(format!(
+                "{path}: {losses}; File ▸ Import ▸ Adobe After Effects Project… lists them and can import the rest (`file.importAep` with `allowLosses`)"
+            )),
             Err(e) => errors.push(format!("{path}: {e}")),
         }
     }
@@ -751,8 +742,8 @@ fn project_settings(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(serde_json::to_value(&s.project.settings).unwrap_or_default())
 }
 
-/// Video Rendering and Effects: report or set the renderer (Mercury GPU Acceleration when a GPU
-/// adapter exists, else Mercury Software Only).
+/// Video Rendering and Effects: report or set the renderer (GPU Acceleration when a GPU
+/// adapter exists, else Software Rendering).
 fn render_backend(s: &mut Session, p: &Value) -> Result<Value> {
     if let Some(b) = p.get("backend").or_else(|| p.get("renderer")) {
         let gpu = match b {
@@ -780,14 +771,14 @@ pub fn backend_status(s: &Session) -> Value {
     let gpu = s.project.settings.gpu_acceleration;
     // Why it renders on the CPU (#262).
     let why = if !gpu {
-        Some("the project's renderer is Mercury Software Only".to_string())
+        Some("the project's renderer is Software Rendering".to_string())
     } else if adapter.is_none() {
         Some(s.accel_note.clone().unwrap_or_else(|| "no GPU compositor is attached".into()))
     } else {
         None
     };
     json!({
-        "renderer": if gpu { "Mercury GPU Acceleration" } else { "Mercury Software Only" },
+        "renderer": if gpu { "GPU Acceleration" } else { "Software Rendering" },
         "gpuAcceleration": gpu,
         "adapter": adapter,
         "active": if gpu && adapter.is_some() { "gpu" } else { "cpu" },
