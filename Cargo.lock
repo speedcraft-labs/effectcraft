@@ -1090,23 +1090,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "craft-bench"
-version = "0.1.0"
-source = "git+https://github.com/speedcraft-labs/craft-libs?branch=algo%2Fintegration#1043d147881d2d75f4417a27e703e3000a380eaa"
-dependencies = [
- "chrono",
- "cpu-time",
- "serde",
- "serde_json",
- "thiserror 2.0.21",
-]
-
-[[package]]
-name = "craft-blur"
-version = "0.1.0"
-source = "git+https://github.com/speedcraft-labs/craft-libs?rev=f0507f3d4512dfc880388a4b9687e411a27e0b35#f0507f3d4512dfc880388a4b9687e411a27e0b35"
-
-[[package]]
 name = "craft-docpath"
 version = "0.1.0"
 source = "git+https://github.com/storytold/craft-libs?rev=e11f9d9aebea5f6b8e74643c1ea1ed172ba5f545#e11f9d9aebea5f6b8e74643c1ea1ed172ba5f545"
@@ -1876,7 +1859,6 @@ dependencies = [
 name = "effectcraft-raster"
 version = "0.23.1"
 dependencies = [
- "craft-blur",
  "effectcraft-color",
  "effectcraft-geom",
  "rayon",
