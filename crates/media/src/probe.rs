@@ -72,7 +72,7 @@ pub fn probe_model(path: &str, bytes: &[u8], resolve: &dyn Fn(&str) -> Option<Ve
         loop_count: 1,
         codec: format!("{codec} ({} meshes, {} triangles)", s.meshes, s.triangles),
         missing: false,
-        sequence: Vec::new().into(),
+        sequence: Vec::new(),
         color_profile: None,
         ..Default::default()
     })
@@ -196,7 +196,7 @@ pub(crate) fn footage_from_info(path: &str, info: &filmcraft_media::MediaInfo) -
         loop_count: 1,
         codec,
         missing: false,
-        sequence: Vec::new().into(),
+        sequence: Vec::new(),
         color_profile: v.and_then(|v| profile_of(&v.color)),
         // counted in video frames, so only with a video stream
         file_timecode: v.and(info.start_timecode),
@@ -244,7 +244,7 @@ pub(crate) fn still_footage(path: &str, w: u32, h: u32, fmt: image::ImageFormat,
         loop_count: 1,
         codec,
         missing: false,
-        sequence: Vec::new().into(),
+        sequence: Vec::new(),
         color_profile: None,
         ..Default::default()
     }

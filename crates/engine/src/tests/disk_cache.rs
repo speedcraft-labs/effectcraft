@@ -101,7 +101,7 @@ fn comp_content_keys_come_from_memory() {
             loop_count: 1,
             codec: "PNG".into(),
             missing: false,
-            sequence: vec![].into(),
+            sequence: vec![],
             color_profile: None,
             layer: None,
             ..Default::default()

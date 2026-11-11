@@ -206,7 +206,7 @@ pub fn import(
                 loop_count: 1,
                 codec: String::new(),
                 missing: false,
-                sequence: vec![].into(),
+                sequence: vec![],
                 color_profile: None,
                 ..Default::default()
             };

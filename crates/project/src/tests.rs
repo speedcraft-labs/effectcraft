@@ -269,40 +269,6 @@ fn file_open_parses_project_and_metadata_together() {
     assert_eq!(saved_by.as_deref(), Some(crate::APP_VERSION));
 }
 
-#[test]
-fn file_open_keeps_sequence_paths_deferred() {
-    let (mut project, _) = project_with_layer();
-    let paths = vec!["/media/shot_0001.exr".to_string(), "relative/quote\"line\nbreak.exr".to_string()];
-    let mut footage = super::Footage::default();
-    footage.kind = super::FootageKind::Sequence;
-    footage.sequence = paths.clone().into();
-    project.add_item("Sequence", effectcraft_color::Label::None, None, ItemKind::Footage(footage));
-
-    let json = project.to_file_json().unwrap();
-    let (opened, _, _, _) = Project::from_file_json_repaired(json.as_bytes()).unwrap();
-    let sequence = opened
-        .items
-        .values()
-        .find_map(|item| match &item.kind {
-            ItemKind::Footage(footage) if footage.kind == super::FootageKind::Sequence => Some(&footage.sequence),
-            _ => None,
-        })
-        .unwrap();
-    assert!(!sequence.is_materialized());
-    assert!(!sequence.has_plain_absolute_local_paths());
-    assert_eq!(&**sequence, paths.as_slice());
-}
-
-#[test]
-fn file_open_keeps_legacy_kind_field_order() {
-    let (mut p, _) = project_with_layer();
-    p.add_item("Folder", effectcraft_color::Label::None, None, ItemKind::Folder);
-    let text = p.to_file_json().unwrap();
-    let legacy = text.replacen("\"type\": \"Folder\"", "\"legacyField\": 0, \"type\": \"Folder\"", 1);
-    let (opened, _, _, _) = Project::from_file_json_repaired(legacy.as_bytes()).unwrap();
-    assert_eq!(opened, p);
-}
-
 /// The Project panel's "used N times": layers in every comp that use the item directly, a precomp
 /// counted by the comps it is nested in, and an unused item used by nothing.
 #[test]

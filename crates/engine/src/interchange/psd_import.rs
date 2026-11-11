@@ -194,7 +194,7 @@ fn footage_item(proj: &mut Project, cx: &mut Ctx, index: usize, name: &str) -> (
         loop_count: 1,
         codec: "PSD".into(),
         missing: false,
-        sequence: vec![].into(),
+        sequence: vec![],
         color_profile: None,
         layer: Some(SourceLayer { index: index as u32, name: name.to_string(), layer_size: retain && !l.rect.is_empty(), embedded: None, placed: false }),
         ..Default::default()

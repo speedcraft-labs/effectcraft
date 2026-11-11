@@ -297,7 +297,6 @@ fn import_footage(project: &mut Project, cx: &mut Ctx<'_>, item: &AepItem<'_, '_
         // footage), and only then.
         has_audio: kind == FootageKind::Audio || (kind == FootageKind::Video && f.audio_sample_rate.is_some()),
         missing: !present,
-        placed_page,
         sequence,
         ..Footage::default()
     };

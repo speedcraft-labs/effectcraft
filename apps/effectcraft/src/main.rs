@@ -182,23 +182,6 @@ fn start_helpers_if_opted_in(session: &mut effectcraft_engine::Session) {
 /// Builds the session, loads settings, plugins, the requested project/media and the optional control server, then
 /// reports startup failure through `startup_failed`. Returns the event loop's result.
 fn main() -> eframe::Result {
-    let args: Vec<_> = std::env::args_os().skip(1).collect();
-    if crash_report::maybe_run(&args, |description| {
-        rfd::MessageDialog::new().set_level(rfd::MessageLevel::Error).set_title("EffectCraft diagnostic report").set_description(description).show();
-    }) {
-        return Ok(());
-    }
-    let reporter = crash_report::Shutdown::default();
-    let result = run_desktop(&reporter);
-    // run_desktop has dropped the app and handled any startup error with its existing dialog.
-    // An unwinding panic or abort never reaches this marker.
-    if let Err(error) = reporter.finish() {
-        log::warn!("could not mark crash reporter clean: {error}");
-    }
-    result
-}
-
-fn run_desktop(reporter: &crash_report::Shutdown) -> eframe::Result {
     // Windows: the update helper is a copy of this program started with `--finish-update`.
     #[cfg(windows)]
     if let Some(result) = craft_update::self_update::finish(&effectcraft_ui_egui::UPDATE_APP, &std::env::args_os().skip(1).collect::<Vec<_>>()) {

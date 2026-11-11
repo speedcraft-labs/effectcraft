@@ -255,7 +255,7 @@ impl Importer for MockImporter {
             loop_count: 1,
             codec: "mock".into(),
             missing: false,
-            sequence: vec![].into(),
+            sequence: vec![],
             color_profile: None,
             ..Default::default()
         })

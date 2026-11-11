@@ -746,7 +746,7 @@ fn images_embed_as_base64_and_come_back() {
             loop_count: 1,
             codec: String::new(),
             missing: false,
-            sequence: vec![].into(),
+            sequence: vec![],
             color_profile: None,
             ..Default::default()
         }),

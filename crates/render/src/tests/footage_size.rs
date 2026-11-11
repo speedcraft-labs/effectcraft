@@ -8,7 +8,7 @@ use rayon::prelude::*;
 
 use effectcraft_color::Label;
 use effectcraft_project::build;
-use effectcraft_project::{AlphaMode, BitDepth, Comp, Footage, FootageKind, ItemId, ItemKind, LayerSource, Project, Solid};
+use effectcraft_project::{AlphaMode, BitDepth, Comp, Footage, FootageKind, ItemId, ItemKind, LayerSource, Project};
 use effectcraft_time::{FrameRate, Tick};
 
 use crate::{FootageSource, Image, RenderOpts, Renderer};
@@ -84,57 +84,6 @@ fn reduced_renders_take_footage_resampled_by_the_source() {
 
 /// #1812: a still's layer is kept in the layer cache across times (its texture then uploads to
 /// the GPU once, not every frame); a movie's is fetched again at every time.
-#[test]
-fn inverted_ignored_alpha_does_not_occlude_lower_solid() {
-    let mut project = Project::default();
-    let comp = Comp::new(96, 54, FrameRate::FPS_30, Tick::from_seconds_f64(1.0));
-    let comp_id = project.add_item("Comp", Label::Sandstone, None, ItemKind::Comp(comp.clone().into()));
-    let solid_id =
-        project.add_item("Background", Label::Red, None, ItemKind::Solid(Solid { color: [0.3, 0.5, 0.7], width: 96, height: 54, pixel_aspect: 1.0 }));
-    let background = build::layer(&mut project, &comp, "Background", LayerSource::Solid { item: solid_id }, (96, 54), None);
-    project.comp_mut(comp_id).unwrap().layers.push(background);
-    let footage_id = project.add_item(
-        "Inverted",
-        Label::Aqua,
-        None,
-        ItemKind::Footage(Footage {
-            path: "clip.mp4".into(),
-            kind: FootageKind::Still,
-            width: 96,
-            height: 54,
-            pixel_aspect: 1.0,
-            frame_rate: FrameRate::FPS_30,
-            duration: Tick::ZERO,
-            has_video: true,
-            alpha: AlphaMode::Ignore,
-            invert_alpha: true,
-            ..Default::default()
-        }),
-    );
-    let inverted = build::layer(&mut project, &comp, "Inverted", LayerSource::Footage { item: footage_id }, (96, 54), None);
-    project.comp_mut(comp_id).unwrap().layers.push(inverted);
-    let empty_id = project.add_item(
-        "Empty footage",
-        Label::Aqua,
-        None,
-        ItemKind::Footage(Footage {
-            path: "empty.mp4".into(),
-            kind: FootageKind::Video,
-            width: 96,
-            height: 54,
-            pixel_aspect: 1.0,
-            frame_rate: FrameRate::FPS_30,
-            alpha: AlphaMode::Ignore,
-            ..Default::default()
-        }),
-    );
-    let empty = build::layer(&mut project, &comp, "Empty footage", LayerSource::Footage { item: empty_id }, (96, 54), None);
-    project.comp_mut(comp_id).unwrap().layers.push(empty);
-
-    let frame = Renderer::new(&project, &Clip { sizes: None }, RenderOpts::default()).comp_frame(comp_id, Tick::ZERO);
-    assert_eq!(frame.get(48, 27)[3], 1.0, "transparent or unavailable footage must leave the solid visible");
-}
-
 #[test]
 fn still_layers_are_cached_across_times_and_movies_are_not() {
     for (kind, fetches) in [(FootageKind::Still, 1), (FootageKind::Video, 3)] {

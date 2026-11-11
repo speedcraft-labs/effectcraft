@@ -76,10 +76,6 @@ pub struct Renderer<'a> {
     pub reads: Option<&'a reads::ReadLog>,
     /// Optional per-layer timing sink (`frame --bench` / perf readouts).
     pub profile: Option<&'a std::sync::Mutex<Vec<LayerTiming>>>,
-    /// Per-top-level-frame cache for repeated static precomps.
-    pub(crate) comp_frames: Arc<crate::pipeline::CompFrameCache>,
-    /// Disabled by profile renders so every nested layer remains visible in layer timings.
-    pub(crate) cache_static_comps: bool,
     /// GPU backend used when [`RenderOpts::backend`] asks for it.
     pub accel: Option<&'a dyn Accelerator>,
     /// Current nesting depth (precomp recursion guard).

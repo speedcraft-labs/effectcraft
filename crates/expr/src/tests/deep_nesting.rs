@@ -71,9 +71,6 @@ fn eval_and_function_still_work() {
 
 #[test]
 fn deep_array_result_is_an_error_or_text_not_a_crash() {
-    // This exercises the structural nesting guard; don't let the wall-clock guard win first
-    // when another workspace test has the machine loaded.
-    crate::runtime::TIME_LIMIT.with(|t| t.set(std::time::Duration::from_secs(3600)));
     // The result itself: detaching it used to `toString` it past depth 4.
     let _ = eval_small_stack(&format!("{DEEP_ARRAY} a"));
     // Explicit conversions inside the script.
@@ -84,7 +81,6 @@ fn deep_array_result_is_an_error_or_text_not_a_crash() {
     }
     // A deep array as a text style value goes through JSON.stringify in the prelude.
     let _ = eval_small_stack(&format!("{DEEP_ARRAY} text.sourceText.style.setFontSize(a)"));
-    crate::runtime::TIME_LIMIT.with(|t| t.set(crate::MAX_TIME));
 }
 
 #[test]

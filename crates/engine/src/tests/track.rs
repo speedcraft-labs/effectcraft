@@ -99,7 +99,7 @@ pub(crate) fn setup(make: impl Fn(u32) -> Image + Send + Sync + 'static) -> (Ses
                 loop_count: 1,
                 codec: String::new(),
                 missing: false,
-                sequence: vec![].into(),
+                sequence: vec![],
                 color_profile: None,
                 ..Default::default()
             };
@@ -409,7 +409,7 @@ fn analyze_1080p_single_point_speed() {
                 loop_count: 1,
                 codec: String::new(),
                 missing: false,
-                sequence: vec![].into(),
+                sequence: vec![],
                 color_profile: None,
                 ..Default::default()
             };

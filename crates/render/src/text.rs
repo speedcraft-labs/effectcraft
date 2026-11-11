@@ -1166,12 +1166,6 @@ pub(crate) fn raster_window(b: kurbo::Rect, s: f64, clip: Option<kurbo::Rect>) -
 
 /// Render a text layer into a layer-space buffer at scale `s`.
 pub fn render(ctx: &EvalCtx, layer: &Layer, s: f64) -> Buf {
-    render_in(ctx, layer, s, None)
-}
-
-/// [`render`], only the part of the layer inside `clip` (layer space; the part the output shows,
-/// see `Renderer::raster_clip`).
-pub fn render_in(ctx: &EvalCtx, layer: &Layer, s: f64, clip: Option<kurbo::Rect>) -> Buf {
     let empty = || Buf { img: Image::new(1, 1), offset: [0.0; 2], scale: s };
     let Some(geom) = text_geom(ctx, layer) else { return empty() };
     let mut bounds: Option<kurbo::Rect> = None;
@@ -1185,7 +1179,9 @@ pub fn render_in(ctx: &EvalCtx, layer: &Layer, s: f64, clip: Option<kurbo::Rect>
     }
     let Some(b) = bounds else { return empty() };
     let b = b.intersect(kurbo::Rect::new(-20000.0, -20000.0, 20000.0, 20000.0));
-    let Some((w, h, offset)) = raster_window(b, s, clip) else { return empty() };
+    let w = ((b.width() * s).ceil() as u32 + 4).clamp(1, 16384);
+    let h = ((b.height() * s).ceil() as u32 + 4).clamp(1, 16384);
+    let offset = [-b.x0 * s + 2.0, -b.y0 * s + 2.0];
     let mut img = Image::new(w, h);
     let base = Mat3::translate(vec2(offset[0], offset[1])) * Mat3::scale(vec2(s, s));
     draw_glyphs(&geom, &mut img, &base, s, None);

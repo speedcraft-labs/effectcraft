@@ -824,7 +824,7 @@ fn export_template(s: &mut Session, p: &Value) -> Result<Value> {
         if let ItemKind::Footage(f) = &mut it.kind
             && f.data.is_none()
         {
-            let files: Vec<String> = if f.sequence.is_empty() { vec![f.path.clone()] } else { f.sequence.to_vec() };
+            let files: Vec<String> = if f.sequence.is_empty() { vec![f.path.clone()] } else { f.sequence.clone() };
             let mut stored = vec![];
             for (k, file) in files.iter().enumerate() {
                 if let Ok(bytes) = s.services.read_file(file) {
@@ -838,7 +838,7 @@ fn export_template(s: &mut Session, p: &Value) -> Result<Value> {
             }
             if !stored.is_empty() {
                 if !f.sequence.is_empty() {
-                    f.sequence = stored.clone().into();
+                    f.sequence = stored.clone();
                 }
                 media.push(json!({"item": id.0, "files": stored}));
             }
