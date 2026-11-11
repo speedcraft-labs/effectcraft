@@ -150,7 +150,7 @@ mod tests {
     #[test]
     fn a_gap_holds_the_file_shown_for_the_preceding_number() {
         let mut f = seq(&[]);
-        f.sequence = ["a_0001.png", "a_0002.png", "a_002.png", "a_0005.png"].map(String::from).to_vec().into();
+        f.sequence = ["a_0001.png", "a_0002.png", "a_002.png", "a_0005.png"].map(String::from).to_vec();
         assert_eq!(f.sequence_file(1), Some("a_0002.png"));
         // Frames 3 and 4 (numbers 3, 4) hold what number 2 shows: the first file with it.
         assert_eq!(f.sequence_file_held(2), Some("a_0002.png"));
@@ -229,70 +229,5 @@ mod tests {
         f.sync_sequence_duration();
         assert!((f.duration.seconds() - 0.5).abs() < 1e-9);
         assert_eq!(Footage::default().sequence_frames(), 0);
-    }
-
-    #[test]
-    fn sequence_paths_stay_deferred_until_used_or_serialized() -> Result<(), Box<dyn std::error::Error>> {
-        let mut value = serde_json::to_value(Footage::default())?;
-        value["sequence"] = serde_json::json!(["shot_0001.exr", "shot_0002.exr"]);
-        let json = serde_json::to_string(&value)?;
-
-        let footage: Footage = serde_json::from_str(&json)?;
-        assert!(!footage.sequence.is_materialized());
-
-        let saved = serde_json::to_value(&footage)?;
-        assert_eq!(saved["sequence"], value["sequence"]);
-        assert!(footage.sequence.is_materialized());
-
-        assert_eq!(&*footage.sequence, &["shot_0001.exr", "shot_0002.exr"]);
-        assert!(footage.sequence.is_materialized());
-        Ok(())
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn plain_absolute_paths_are_classified_and_serialization_materializes() -> Result<(), Box<dyn std::error::Error>> {
-        let mut value = serde_json::to_value(Footage::default())?;
-        value["sequence"] = serde_json::json!(["/media/shot_0001.exr", "/media/shot_0002.exr"]);
-        let json = serde_json::to_string(&value)?;
-        let mut footage: Footage = serde_json::from_str(&json)?;
-
-        assert!(footage.sequence.has_plain_absolute_local_paths());
-        assert!(!footage.sequence.is_materialized());
-        assert_eq!(serde_json::to_value(&footage)?["sequence"], value["sequence"]);
-        assert!(footage.sequence.is_materialized());
-
-        footage.sequence[0] = "relative/frame.exr".into();
-        assert!(!footage.sequence.has_plain_absolute_local_paths());
-        assert!(footage.sequence.is_materialized());
-        Ok(())
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn paths_needing_resolution_are_not_plain_absolute_local() -> Result<(), Box<dyn std::error::Error>> {
-        for path in ["relative/frame.exr", "//host/share/frame.exr", "/media/../frame.exr", "/media/NUL.exr", "/media/??/frame.exr"] {
-            let mut value = serde_json::to_value(Footage::default())?;
-            value["sequence"] = serde_json::json!([path]);
-            let footage: Footage = serde_json::from_value(value)?;
-            assert!(!footage.sequence.has_plain_absolute_local_paths(), "{path}");
-            assert!(!footage.sequence.is_materialized(), "{path}");
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn deferred_empty_sequence_is_omitted_and_non_strings_are_rejected() -> Result<(), Box<dyn std::error::Error>> {
-        let mut value = serde_json::to_value(Footage::default())?;
-        value["sequence"] = serde_json::json!(["placeholder"]);
-        let json = serde_json::to_string(&value)?.replace("[\"placeholder\"]", "[ \n ]");
-        let footage: Footage = serde_json::from_str(&json)?;
-        assert!(footage.sequence.is_empty());
-        assert!(serde_json::to_value(&footage)?.get("sequence").is_none());
-
-        value["sequence"] = serde_json::json!([null]);
-        let invalid = serde_json::to_string(&value)?;
-        assert!(serde_json::from_str::<Footage>(&invalid).is_err());
-        Ok(())
     }
 }

@@ -66,7 +66,7 @@ fn automatic_paths(s: &Session) -> BTreeSet<String> {
 /// reloaded. Compare these paths without cloning sequences during unrelated project edits.
 fn data_paths(project: &effectcraft_project::Project) -> impl Iterator<Item = (ItemId, &str, &[String])> {
     project.items.values().filter_map(|item| match &item.kind {
-        ItemKind::Footage(f) if f.kind == FootageKind::Data => Some((item.id, f.path.as_str(), &f.sequence[..])),
+        ItemKind::Footage(f) if f.kind == FootageKind::Data => Some((item.id, f.path.as_str(), f.sequence.as_slice())),
         _ => None,
     })
 }
