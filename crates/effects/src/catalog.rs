@@ -95,9 +95,6 @@ const CPU_ONLY_CONTROLS: &[(&str, &[&str])] = &[
 /// `CPU_ONLY_CONTROLS`; plus Cell Pattern's HQ variants, Turbulent Displace's locked
 /// pinning and CC Particle World's motion trails and textured squares).
 pub fn gpu_supported(id: &str, ctx: &crate::EffectCtx) -> bool {
-    if !crate::GPU_EFFECTS.contains(&id) {
-        return false;
-    }
     match id {
         "ec.generate.cellpattern" if (6..=10).contains(&ctx.params.e("cellPattern")) => return false,
         "ec.distort.turbulentdisplace" if ctx.params.e("pinning") >= 8 => return false,
@@ -219,9 +216,8 @@ mod tests {
             let ctx = crate::EffectCtx { params: &params, time: 0.0, layer_size: [64.0, 64.0], seed: 0, adjustment: false, env: Default::default() };
             super::gpu_supported(id, &ctx)
         };
-        // Effects with known GPU parity gaps fall back for every setting.
-        assert!(!ok("ec.color.lumetri", &[]));
-        assert!(!ok("ec.stylize.glow", &[]));
+        assert!(ok("ec.color.lumetri", &[]));
+        assert!(!ok("ec.color.lumetri", &[("hslSecondary/correction/saturation", Value::Scalar(50.0))]));
         assert!(!ok("ec.noise.addgrain", &[("preset", Value::Enum(2))]));
         // #1195: CC Particle World's motion trails (shutter samples) render on the CPU.
         {

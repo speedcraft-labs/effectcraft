@@ -143,14 +143,7 @@ fn opengl_adapters_get_cpu_compositing_at_once() {
     desc.backends = wgpu::Backends::GL;
     let Some((adapter, device, queue)) = native_device(desc, false) else { return };
     let t = std::time::Instant::now();
-    let error = match crate::Gpu::new(&adapter, device, queue) {
-        Err(error) if error.contains("Parent device is lost") => {
-            eprintln!("initialization tests: OpenGL adapter has no usable device, explicitly skipping");
-            return;
-        }
-        Err(error) => error,
-        Ok(_) => panic!("no GPU compositor on OpenGL"),
-    };
+    let error = crate::Gpu::new(&adapter, device, queue).err().expect("no GPU compositor on OpenGL");
     assert!(error.contains("(Gl)"), "{error}");
     assert!(t.elapsed() < std::time::Duration::from_secs(1), "{:?}", t.elapsed());
 }

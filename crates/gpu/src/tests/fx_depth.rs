@@ -104,9 +104,6 @@ pub(crate) fn aux_scene(w: u32, h: u32, scale: f64) -> AuxChannels {
 pub(crate) fn direct(id: &str, vals: &[(&str, Value)], allow: f64) {
     let Some(g) = gpu() else { return };
     let spec = effectcraft_effects::find(id).unwrap();
-    if !spec.gpu {
-        return;
-    }
     let size = [70.0, 44.0];
     let mut params =
         effectcraft_effects::Params { values: spec.params.iter().map(|ps| (ps.id.to_string(), effectcraft_effects::default_value(ps, size))).collect() };

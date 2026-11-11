@@ -1654,8 +1654,6 @@ name = "effectcraft-gpu"
 version = "0.23.1"
 dependencies = [
  "bytemuck",
- "craft-bench",
- "craft-blur",
  "craft-resample",
  "effectcraft-color",
  "effectcraft-effects",

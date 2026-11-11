@@ -391,7 +391,7 @@ mod tests {
                 let variance: f64 =
                     output.data.iter().enumerate().map(|(index, pixel)| f64::from(pixel[3]) * (index as f64 - center as f64).powi(2)).sum::<f64>() / mass;
                 assert!((mass - 1.0).abs() < 1e-5, "sigma={sigma}, vertical={vertical}, mass={mass}");
-                assert!((variance / sigma.powi(2) - 1.0).abs() < 0.005, "sigma={sigma}, vertical={vertical}, variance={variance}");
+                assert!((variance / f64::from(sigma).powi(2) - 1.0).abs() < 0.005, "sigma={sigma}, vertical={vertical}, variance={variance}");
             }
         }
     }

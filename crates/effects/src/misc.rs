@@ -148,11 +148,11 @@ pub fn glow_ab_t(l: f32, looping: u32, loops: f32, phase: f32, mid: f32) -> f32 
     t.max(0.0).powf(0.5f32.ln() / m.ln())
 }
 
-/// Glow's blur: a Gaussian of σ = 0.427 × Glow Radius. Fitted to After Effects 2026 (cases
+/// Glow's blur: a Gaussian of σ = 0.384 × Glow Radius. Fitted to After Effects 2026 (cases
 /// 807 and 808, Glow Radius 10 and 30 on a grey solid): the edge profile of the glow's
 /// coverage is an erfc step of that σ within 1.7/255 (it was σ = radius / 2).
 pub fn glow_sigma(radius: f64) -> f64 {
-    (radius * 0.427).max(0.5)
+    (radius * 0.384).max(0.5)
 }
 
 /// Glow's bright pass for the original colours, per channel of the straight colour `v`:

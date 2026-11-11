@@ -168,7 +168,7 @@ fn parse_project_item(raw: &serde_json::value::RawValue) -> Result<Item, serde_j
     })
 }
 
-fn parse_project_layers(layers: Vec<&serde_json::value::RawValue>) -> Result<super::Layers, serde_json::Error> {
+fn parse_project_layers<'a>(layers: Vec<&'a serde_json::value::RawValue>) -> Result<super::Layers, serde_json::Error> {
     #[cfg(not(target_arch = "wasm32"))]
     {
         use rayon::prelude::*;
@@ -181,7 +181,7 @@ fn parse_project_layers(layers: Vec<&serde_json::value::RawValue>) -> Result<sup
     }
 }
 
-fn parse_project_items(items: BTreeMap<ItemId, &serde_json::value::RawValue>) -> Result<BTreeMap<ItemId, Item>, serde_json::Error> {
+fn parse_project_items<'a>(items: BTreeMap<ItemId, &'a serde_json::value::RawValue>) -> Result<BTreeMap<ItemId, Item>, serde_json::Error> {
     #[cfg(not(target_arch = "wasm32"))]
     {
         use rayon::prelude::*;
