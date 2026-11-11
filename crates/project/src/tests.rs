@@ -257,6 +257,50 @@ fn project_files_remember_the_open_comps() {
     assert_eq!(crate::saved_view(&not_a_map), crate::SavedView { comp_times: Default::default(), ..view });
 }
 
+#[test]
+fn file_open_parses_project_and_metadata_together() {
+    let (p, cid) = project_with_layer();
+    let view = crate::SavedView { active_comp: Some(cid), open_comps: vec![cid], comp_times: [(cid, Tick(42))].into() };
+    let text = p.to_file_json_with_view(&view, false).unwrap();
+    let (opened, repaired, parsed_view, saved_by) = Project::from_file_json_repaired(text.as_bytes()).unwrap();
+    assert_eq!(opened, p);
+    assert!(repaired.is_empty());
+    assert_eq!(parsed_view, view);
+    assert_eq!(saved_by.as_deref(), Some(crate::APP_VERSION));
+}
+
+#[test]
+fn file_open_keeps_sequence_paths_deferred() {
+    let (mut project, _) = project_with_layer();
+    let paths = vec!["/media/shot_0001.exr".to_string(), "relative/quote\"line\nbreak.exr".to_string()];
+    let footage = super::Footage { kind: super::FootageKind::Sequence, sequence: paths.clone().into(), ..super::Footage::default() };
+    project.add_item("Sequence", effectcraft_color::Label::None, None, ItemKind::Footage(footage));
+
+    let json = project.to_file_json().unwrap();
+    let (opened, _, _, _) = Project::from_file_json_repaired(json.as_bytes()).unwrap();
+    let sequence = opened
+        .items
+        .values()
+        .find_map(|item| match &item.kind {
+            ItemKind::Footage(footage) if footage.kind == super::FootageKind::Sequence => Some(&footage.sequence),
+            _ => None,
+        })
+        .unwrap();
+    assert!(!sequence.is_materialized());
+    assert!(!sequence.has_plain_absolute_local_paths());
+    assert_eq!(&**sequence, paths.as_slice());
+}
+
+#[test]
+fn file_open_keeps_legacy_kind_field_order() {
+    let (mut p, _) = project_with_layer();
+    p.add_item("Folder", effectcraft_color::Label::None, None, ItemKind::Folder);
+    let text = p.to_file_json().unwrap();
+    let legacy = text.replacen("\"type\": \"Folder\"", "\"legacyField\": 0, \"type\": \"Folder\"", 1);
+    let (opened, _, _, _) = Project::from_file_json_repaired(legacy.as_bytes()).unwrap();
+    assert_eq!(opened, p);
+}
+
 /// The Project panel's "used N times": layers in every comp that use the item directly, a precomp
 /// counted by the comps it is nested in, and an unused item used by nothing.
 #[test]

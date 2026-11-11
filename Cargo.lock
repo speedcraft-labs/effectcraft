@@ -1090,6 +1090,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "craft-bench"
+version = "0.1.0"
+source = "git+https://github.com/speedcraft-labs/craft-libs?branch=algo%2Fintegration#1043d147881d2d75f4417a27e703e3000a380eaa"
+dependencies = [
+ "chrono",
+ "cpu-time",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "craft-blur"
+version = "0.1.0"
+source = "git+https://github.com/speedcraft-labs/craft-libs?rev=bd4514470391e50388cb399d9531ced2ec8d87f3#bd4514470391e50388cb399d9531ced2ec8d87f3"
+
+[[package]]
 name = "craft-docpath"
 version = "0.1.0"
 source = "git+https://github.com/storytold/craft-libs?rev=e11f9d9aebea5f6b8e74643c1ea1ed172ba5f545#e11f9d9aebea5f6b8e74643c1ea1ed172ba5f545"
@@ -1158,6 +1175,14 @@ dependencies = [
  "egui",
  "objc2 0.6.5",
  "objc2-app-kit 0.3.2",
+]
+
+[[package]]
+name = "craft-resample"
+version = "0.1.0"
+source = "git+https://github.com/storytold/craft-libs?rev=fd21a0a80a8e4f4c183a8e0da0953e1b033b817d#fd21a0a80a8e4f4c183a8e0da0953e1b033b817d"
+dependencies = [
+ "rayon",
 ]
 
 [[package]]
@@ -1427,6 +1452,7 @@ dependencies = [
  "craft-update",
  "effectcraft-engine",
  "effectcraft-host",
+ "effectcraft-render",
  "effectcraft-ui-egui",
  "eframe",
  "egui",
@@ -1513,6 +1539,8 @@ name = "effectcraft-effects"
 version = "0.23.1"
 dependencies = [
  "chrono",
+ "craft-blur",
+ "craft-resample",
  "effectcraft-color",
  "effectcraft-geom",
  "effectcraft-keyframe",
@@ -1520,6 +1548,7 @@ dependencies = [
  "effectcraft-raster",
  "effectcraft-segment",
  "effectcraft-track",
+ "image",
  "log",
  "rayon",
  "serde",
@@ -1626,6 +1655,8 @@ name = "effectcraft-gpu"
 version = "0.23.1"
 dependencies = [
  "bytemuck",
+ "craft-bench",
+ "craft-resample",
  "effectcraft-color",
  "effectcraft-effects",
  "effectcraft-geom",
@@ -1808,6 +1839,7 @@ name = "effectcraft-pdf"
 version = "0.23.1"
 dependencies = [
  "craft-pdf",
+ "craft-resample",
  "effectcraft-raster",
  "effectcraft-svg",
  "effectcraft-text",
@@ -1840,8 +1872,10 @@ dependencies = [
  "effectcraft-geom",
  "effectcraft-keyframe",
  "effectcraft-time",
+ "rayon",
  "serde",
  "serde_json",
+ "simd-json",
  "thiserror 2.0.21",
 ]
 
@@ -1856,6 +1890,8 @@ dependencies = [
 name = "effectcraft-raster"
 version = "0.23.1"
 dependencies = [
+ "craft-blur",
+ "craft-resample",
  "effectcraft-color",
  "effectcraft-geom",
  "rayon",
@@ -2781,6 +2817,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "float-cmp"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b09cf3155332e944990140d967ff5eceb70df778b34f77d8075db46e4704e6d8"
+dependencies = [
+ "num-traits",
+]
+
+[[package]]
 name = "float8"
 version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3261,6 +3306,16 @@ dependencies = [
  "rand 0.9.5",
  "rand_distr",
  "zerocopy",
+]
+
+[[package]]
+name = "halfbrown"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0c7ed2f2edad8a14c8186b847909a41fbb9c3eafa44f88bd891114ed5019da09"
+dependencies = [
+ "hashbrown 0.16.1",
+ "serde",
 ]
 
 [[package]]
@@ -5443,6 +5498,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "ryu"
+version = "1.0.23"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
+
+[[package]]
 name = "ryu-js"
 version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5646,6 +5707,19 @@ name = "simd-adler32"
 version = "0.3.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3a219298ac11a56ea9a6d2120044824d6f01aeb034955e7af7bc16858527deea"
+
+[[package]]
+name = "simd-json"
+version = "0.19.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e8f2e4d523646f7da6dde3983bd18ede0babc21c258ab708b3dd93ea0259719d"
+dependencies = [
+ "halfbrown",
+ "serde",
+ "serde_json",
+ "simdutf8",
+ "value-trait",
+]
 
 [[package]]
 name = "simd_cesu8"
@@ -6582,6 +6656,18 @@ dependencies = [
  "js-sys",
  "serde_core",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "value-trait"
+version = "0.12.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "545a3d7089f11f1741d12963c057adf9443fc24325110a6a6daf582e825fd51b"
+dependencies = [
+ "float-cmp",
+ "halfbrown",
+ "itoa",
+ "ryu",
 ]
 
 [[package]]

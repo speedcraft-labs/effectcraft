@@ -1,5 +1,328 @@
 use super::settings::{Marker, yes};
 use super::{ColorSpace, Deserialize, FrameRate, Serialize, Tick};
+use serde::de::{DeserializeSeed, Error as _, MapAccess, SeqAccess, Visitor};
+use serde::{Deserializer, Serializer};
+use std::ops::{Deref, DerefMut};
+use std::sync::{Arc, OnceLock};
+
+/// An image sequence's file paths, kept as raw JSON until something needs the paths.
+///
+/// Large projects can contain tens of thousands of sequence paths that the first rendered frame
+/// never reads. Keeping the valid JSON array here defers per-path string allocation until a
+/// sequence is inspected or used. Serialization materializes the paths for compatibility with
+/// all Serde serializers.
+#[derive(Clone, Debug)]
+pub struct SequenceFiles {
+    raw: Option<Arc<str>>,
+    parsed: OnceLock<Vec<String>>,
+    plain_absolute_local: OnceLock<bool>,
+}
+
+impl SequenceFiles {
+    pub fn is_empty(&self) -> bool {
+        if let Some(paths) = self.parsed.get() {
+            return paths.is_empty();
+        }
+        self.raw.as_ref().is_none_or(|raw| raw.trim().strip_prefix('[').and_then(|value| value.strip_suffix(']')).is_some_and(|value| value.trim().is_empty()))
+    }
+
+    /// Whether this list has been expanded into path strings yet.
+    pub fn is_materialized(&self) -> bool {
+        self.parsed.get().is_some()
+    }
+
+    /// Whether every path is a plain absolute local path that needs no document-relative
+    /// resolution. This is recorded while validating deferred JSON, so checking it does not
+    /// allocate the sequence's path strings.
+    pub fn has_plain_absolute_local_paths(&self) -> bool {
+        *self.plain_absolute_local.get_or_init(|| self.paths().iter().all(|path| plain_absolute_local(path)))
+    }
+
+    fn paths(&self) -> &[String] {
+        self.parsed.get_or_init(|| self.raw.as_ref().and_then(|raw| serde_json::from_str::<Vec<String>>(raw).ok()).unwrap_or_default())
+    }
+}
+
+impl Default for SequenceFiles {
+    fn default() -> Self {
+        SequenceFiles { raw: None, parsed: OnceLock::new(), plain_absolute_local: OnceLock::from(true) }
+    }
+}
+
+impl From<Vec<String>> for SequenceFiles {
+    fn from(paths: Vec<String>) -> Self {
+        let plain_absolute_local = paths.iter().all(|path| plain_absolute_local(path));
+        SequenceFiles { raw: None, parsed: OnceLock::from(paths), plain_absolute_local: OnceLock::from(plain_absolute_local) }
+    }
+}
+
+impl FromIterator<String> for SequenceFiles {
+    fn from_iter<T: IntoIterator<Item = String>>(iter: T) -> Self {
+        SequenceFiles::from(iter.into_iter().collect::<Vec<String>>())
+    }
+}
+
+impl Deref for SequenceFiles {
+    type Target = [String];
+
+    fn deref(&self) -> &Self::Target {
+        self.paths()
+    }
+}
+
+impl DerefMut for SequenceFiles {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.plain_absolute_local.take();
+        if self.parsed.get().is_none() {
+            let paths = self.raw.as_ref().and_then(|raw| serde_json::from_str::<Vec<String>>(raw).ok()).unwrap_or_default();
+            self.parsed = OnceLock::from(paths);
+        }
+        self.raw = None;
+        match self.parsed.get_mut() {
+            Some(paths) => paths,
+            None => &mut [],
+        }
+    }
+}
+
+impl<'a> IntoIterator for &'a SequenceFiles {
+    type Item = &'a String;
+    type IntoIter = std::slice::Iter<'a, String>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.paths().iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a mut SequenceFiles {
+    type Item = &'a mut String;
+    type IntoIter = std::slice::IterMut<'a, String>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.deref_mut().iter_mut()
+    }
+}
+
+impl PartialEq for SequenceFiles {
+    fn eq(&self, other: &Self) -> bool {
+        self.paths() == other.paths()
+    }
+}
+
+impl Eq for SequenceFiles {}
+
+impl Serialize for SequenceFiles {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        self.paths().serialize(serializer)
+    }
+}
+
+struct SequenceString(bool);
+
+impl<'de> Deserialize<'de> for SequenceString {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct StringVisitor;
+
+        impl<'de> Visitor<'de> for StringVisitor {
+            type Value = SequenceString;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a sequence path string")
+            }
+
+            fn visit_str<E>(self, path: &str) -> Result<Self::Value, E> {
+                Ok(SequenceString(plain_absolute_local(path)))
+            }
+
+            fn visit_borrowed_str<E>(self, path: &'de str) -> Result<Self::Value, E> {
+                Ok(SequenceString(plain_absolute_local(path)))
+            }
+
+            fn visit_string<E>(self, path: String) -> Result<Self::Value, E> {
+                Ok(SequenceString(plain_absolute_local(&path)))
+            }
+        }
+
+        deserializer.deserialize_str(StringVisitor)
+    }
+}
+
+struct SequencePathSeed<'a> {
+    raw: &'a mut String,
+    first: &'a mut bool,
+    plain_absolute_local: &'a mut bool,
+}
+
+impl<'de> DeserializeSeed<'de> for SequencePathSeed<'_> {
+    type Value = ();
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct PathVisitor<'a>(SequencePathSeed<'a>);
+
+        impl PathVisitor<'_> {
+            fn append(self, path: &str) {
+                if !*self.0.first {
+                    self.0.raw.push(',');
+                }
+                *self.0.first = false;
+                *self.0.plain_absolute_local &= plain_absolute_local(path);
+                append_json_string(self.0.raw, path);
+            }
+        }
+
+        impl Visitor<'_> for PathVisitor<'_> {
+            type Value = ();
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a sequence path string")
+            }
+
+            fn visit_str<E>(self, path: &str) -> Result<Self::Value, E> {
+                self.append(path);
+                Ok(())
+            }
+
+            fn visit_borrowed_str<E>(self, path: &str) -> Result<Self::Value, E> {
+                self.append(path);
+                Ok(())
+            }
+
+            fn visit_string<E>(self, path: String) -> Result<Self::Value, E> {
+                self.append(&path);
+                Ok(())
+            }
+        }
+
+        deserializer.deserialize_str(PathVisitor(self))
+    }
+}
+
+fn append_json_string(output: &mut String, value: &str) {
+    use std::fmt::Write as _;
+
+    output.push('"');
+    for ch in value.chars() {
+        match ch {
+            '"' => output.push_str("\\\""),
+            '\\' => output.push_str("\\\\"),
+            '\u{08}' => output.push_str("\\b"),
+            '\u{0c}' => output.push_str("\\f"),
+            '\n' => output.push_str("\\n"),
+            '\r' => output.push_str("\\r"),
+            '\t' => output.push_str("\\t"),
+            ch if ch <= '\u{1f}' => {
+                let _ = write!(output, "\\u{:04x}", ch as u32);
+            }
+            ch => output.push(ch),
+        }
+    }
+    output.push('"');
+}
+
+fn sequence_files_from_seq<'de, A>(mut seq: A) -> Result<SequenceFiles, A::Error>
+where
+    A: SeqAccess<'de>,
+{
+    let mut raw = String::from("[");
+    let mut first = true;
+    let mut plain_absolute_local = true;
+    while seq.next_element_seed(SequencePathSeed { raw: &mut raw, first: &mut first, plain_absolute_local: &mut plain_absolute_local })?.is_some() {}
+    raw.push(']');
+    Ok(SequenceFiles { raw: Some(Arc::from(raw)), parsed: OnceLock::new(), plain_absolute_local: OnceLock::from(plain_absolute_local) })
+}
+
+impl<'de> Deserialize<'de> for SequenceFiles {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        const RAW_VALUE_TOKEN: &str = "$serde_json::private::RawValue";
+
+        struct FilesVisitor;
+
+        impl<'de> Visitor<'de> for FilesVisitor {
+            type Value = SequenceFiles;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("an array of sequence paths")
+            }
+
+            fn visit_newtype_struct<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+            where
+                D: Deserializer<'de>,
+            {
+                deserializer.deserialize_seq(FilesVisitor)
+            }
+
+            fn visit_seq<A>(self, seq: A) -> Result<Self::Value, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                sequence_files_from_seq(seq)
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                let key = map.next_key::<String>()?;
+                if key.as_deref() != Some(RAW_VALUE_TOKEN) {
+                    return Err(A::Error::custom("invalid raw sequence paths"));
+                }
+                let raw: String = map.next_value()?;
+                if map.next_key::<serde::de::IgnoredAny>()?.is_some() {
+                    return Err(A::Error::custom("invalid raw sequence paths"));
+                }
+                // Validate the array and its element types now, retaining only a small fast-path
+                // flag instead of allocating every path. The paths themselves decode on access.
+                let paths: Vec<SequenceString> = serde_json::from_str(&raw).map_err(A::Error::custom)?;
+                let plain_absolute_local = paths.iter().all(|path| path.0);
+                Ok(SequenceFiles { raw: Some(Arc::from(raw)), parsed: OnceLock::new(), plain_absolute_local: OnceLock::from(plain_absolute_local) })
+            }
+        }
+
+        deserializer.deserialize_newtype_struct(RAW_VALUE_TOKEN, FilesVisitor)
+    }
+}
+
+/// The resolver can leave an absolute Unix path as-is only when it cannot contain URL, network,
+/// device, or traversal syntax. Windows paths use the ordinary resolver on every platform.
+fn plain_absolute_local(path: &str) -> bool {
+    if !cfg!(unix) || !path.starts_with('/') || path.starts_with("//") || path.contains(['\\', ':', '\0']) {
+        return false;
+    }
+    let Some(components) = path.strip_prefix('/') else { return false };
+    if components.starts_with("??/") {
+        return false;
+    }
+    components.split('/').all(|component| {
+        !component.is_empty()
+            && component != "."
+            && component != ".."
+            && !component.contains(['?', '*'])
+            && !component.chars().all(|ch| ch == '.' || ch == ' ')
+            && !dos_device(component)
+    })
+}
+
+fn dos_device(component: &str) -> bool {
+    let stem = component.split(['.', ':']).next().unwrap_or_default().trim_end_matches(' ');
+    if ["CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"].iter().any(|name| stem.eq_ignore_ascii_case(name)) {
+        return true;
+    }
+    let Some(head) = stem.get(..3) else { return false };
+    let mut tail = stem.get(3..).unwrap_or_default().chars();
+    (head.eq_ignore_ascii_case("COM") || head.eq_ignore_ascii_case("LPT")) && matches!((tail.next(), tail.next()), (Some('0'..='9' | '¹' | '²' | '³'), None))
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FootageKind {
@@ -217,8 +540,8 @@ pub struct Footage {
     #[serde(default)]
     pub missing: bool,
     /// Image sequence files (when kind = Sequence).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub sequence: Vec<String>,
+    #[serde(default, skip_serializing_if = "SequenceFiles::is_empty")]
+    pub sequence: SequenceFiles,
     /// Colour profile (from the file's metadata, or Interpret Footage). `None` = sRGB.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub color_profile: Option<ColorSpace>,
@@ -300,7 +623,7 @@ impl Default for Footage {
             loop_count: 1,
             codec: String::new(),
             missing: false,
-            sequence: vec![],
+            sequence: SequenceFiles::default(),
             color_profile: None,
             fields: FieldOrder::Off,
             invert_alpha: false,

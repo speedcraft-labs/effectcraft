@@ -78,7 +78,7 @@ fn setup(mode: FrameBlend, size: (u32, u32)) -> (Project, ItemId) {
         loop_count: 1,
         codec: String::new(),
         missing: false,
-        sequence: vec![],
+        sequence: vec![].into(),
         color_profile: None,
         ..Default::default()
     };

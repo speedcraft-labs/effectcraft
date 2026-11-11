@@ -114,7 +114,7 @@ fn placeholder_footage(p: &Value) -> Footage {
         loop_count: 1,
         codec: "Placeholder".into(),
         missing: true,
-        sequence: vec![],
+        sequence: vec![].into(),
         color_profile: None,
         ..Default::default()
     }
@@ -448,7 +448,7 @@ fn collect_files(s: &mut Session, p: &Value) -> Result<Value> {
             f.path = new_paths.pop().unwrap_or_default();
         } else {
             f.path = new_paths.first().cloned().unwrap_or_default();
-            f.sequence = new_paths;
+            f.sequence = new_paths.into();
         }
     }
     s.write_output_with(&protected, &out, proj.to_json().as_bytes())?;
@@ -1091,7 +1091,7 @@ fn replace_footage(s: &mut Session, p: &Value) -> Result<Value> {
     // one-frame sequence, so a later default replacement still brings numbered runs (#2073).
     if inherited && previous.0 && matches!(src, crate::sequence::Source::File(_)) && f.kind == FootageKind::Still {
         f.kind = FootageKind::Sequence;
-        f.sequence = vec![f.path.clone()];
+        f.sequence = vec![f.path.clone()].into();
         f.alphabetical = opts.alphabetical;
         f.frame_rate = s.sequence_rate();
         f.native_rate = None;

@@ -816,10 +816,14 @@ fn fanning_out_reads_stop_at_a_budget() {
 fn loops_stop_at_a_million_iterations() {
     // Found by the expression fuzzer (#786): `for (…; i < 1e15; …)` ran ten million iterations
     // per run (seconds), once more for every property the script reads after it.
+    // Keep the wall-clock budget out of this iteration-limit test; loaded builders can otherwise
+    // time out before reaching the loop cap.
+    crate::runtime::TIME_LIMIT.with(|t| t.set(std::time::Duration::from_secs(3600)));
     let f = fx();
     assert_close!(f.num("var n = 0; while (n < 900000) n++; n", 0.0), 900_000.0);
     assert!(f.err("var n = 0; while (n < 2000000) n++; n").contains("iteration"));
     assert!(f.err("for (;;) {}").contains("iteration"));
+    crate::runtime::TIME_LIMIT.with(|t| t.set(crate::MAX_TIME));
 }
 
 #[test]

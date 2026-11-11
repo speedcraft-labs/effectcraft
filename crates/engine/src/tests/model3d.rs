@@ -50,7 +50,7 @@ impl Importer for ModelImporter {
             loop_count: 1,
             codec: "glTF".into(),
             missing: false,
-            sequence: vec![],
+            sequence: vec![].into(),
             color_profile: None,
             ..Default::default()
         })

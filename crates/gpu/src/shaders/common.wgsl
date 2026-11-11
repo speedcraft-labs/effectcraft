@@ -225,6 +225,47 @@ fn sample(t: texture_2d<f32>, sampling: u32, x: f32, y: f32) -> vec4<f32> {
     return sample_bilinear(t, x, y);
 }
 
+// Sample a uniform opaque rectangle exactly like a texture containing `color` inside `size`
+// and transparent pixels outside it. This avoids uploading a large constant solid raster.
+fn solid_texel(color: vec4<f32>, x: i32, y: i32, size: vec2<i32>) -> vec4<f32> {
+    if (x < 0 || y < 0 || x >= size.x || y >= size.y) {
+        return vec4<f32>(0.0);
+    }
+    return color;
+}
+
+fn sample_solid(color: vec4<f32>, sampling: u32, x: f32, y: f32, size: vec2<i32>) -> vec4<f32> {
+    if (sampling == 0u) {
+        return solid_texel(color, i32(floor(x)), i32(floor(y)), size);
+    }
+    let fx = x - 0.5;
+    let fy = y - 0.5;
+    let x0 = floor(fx);
+    let y0 = floor(fy);
+    let xi = i32(x0);
+    let yi = i32(y0);
+    if (sampling == 2u) {
+        let wx = cubic_w(fx - x0);
+        let wy = cubic_w(fy - y0);
+        var o = vec4<f32>(0.0);
+        for (var j = 0; j < 4; j++) {
+            for (var i = 0; i < 4; i++) {
+                o += solid_texel(color, xi - 1 + i, yi - 1 + j, size) * (wx[i] * wy[j]);
+            }
+        }
+        return max(o, vec4<f32>(0.0));
+    }
+    let tx = fx - x0;
+    let ty = fy - y0;
+    let a = solid_texel(color, xi, yi, size);
+    let b = solid_texel(color, xi + 1, yi, size);
+    let c = solid_texel(color, xi, yi + 1, size);
+    let d = solid_texel(color, xi + 1, yi + 1, size);
+    let top = a + (b - a) * tx;
+    let bot = c + (d - c) * tx;
+    return top + (bot - top) * ty;
+}
+
 // raster::hash_noise.
 fn hash_noise(x: u32, y: u32, seed: u32) -> f32 {
     var h = (x * 0x8da6b343u) ^ (y * 0xd8163841u) ^ (seed * 0xcb1ab31fu);
