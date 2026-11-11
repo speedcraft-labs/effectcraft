@@ -1888,6 +1888,7 @@ dependencies = [
 name = "effectcraft-raster"
 version = "0.23.1"
 dependencies = [
+ "craft-blur",
  "effectcraft-color",
  "effectcraft-geom",
  "rayon",

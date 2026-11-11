@@ -425,6 +425,28 @@ impl<'a> Renderer<'a> {
         None
     }
 
+    /// Whether a plain precomp layer has nothing to draw at its nested time. Rendering an empty
+    /// comp would allocate and warp a full-frame transparent image, so skip that work when it
+    /// cannot change the result.
+    fn empty_precomp(&self, ctx: &EvalCtx, layer: &Layer) -> bool {
+        if !matches!(layer.source, LayerSource::Comp { .. })
+            || layer.switches.adjustment
+            || layer.blend_mode != BlendMode::Normal
+            || layer.track_matte.is_some()
+            || layer.preserve_transparency
+            || (layer.switches.effects && layer.effects().is_some_and(|fx| fx.groups().any(|g| g.enabled)))
+            || styles::active(ctx, layer)
+        {
+            return false;
+        }
+        let Some((sub, comp_id, time, _)) = self.precomp_source(ctx, layer) else { return false };
+        let Some(nested_ctx) = sub.eval_ctx(comp_id, time) else { return false };
+        if nested_ctx.comp.layers.iter().any(|l| l.environment && l.switches.video && l.is_active_at(time)) {
+            return false;
+        }
+        sub.visible_layers(&nested_ctx).is_empty()
+    }
+
     /// Draw a 2D layer into `canvas`; returns the region it may have changed.
     pub(crate) fn draw_layer(&self, ctx: &EvalCtx, layer: &Layer, canvas: &mut Image, blank: bool) -> Region {
         let opacity = ctx.opacity(layer) as f32 * self.opacity_mul;
@@ -433,6 +455,9 @@ impl<'a> Renderer<'a> {
             return Region::Full;
         }
         if opacity <= 0.0 && !layer.switches.adjustment {
+            return Region::Empty;
+        }
+        if self.empty_precomp(ctx, layer) {
             return Region::Empty;
         }
         if layer.switches.adjustment {
