@@ -298,7 +298,7 @@ fn import_footage(project: &mut Project, cx: &mut Ctx<'_>, item: &AepItem<'_, '_
         has_audio: kind == FootageKind::Audio || (kind == FootageKind::Video && f.audio_sample_rate.is_some()),
         missing: !present,
         placed_page,
-        sequence: sequence.into(),
+        sequence,
         ..Footage::default()
     };
     // The native frame rate and the stored duration of sequences and clips (352, 603, 606).
