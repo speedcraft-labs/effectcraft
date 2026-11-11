@@ -1,8 +1,206 @@
 use super::comp::Comp;
 use super::footage::{Footage, FootageKind, Proxy, Solid};
-use super::layer::LayerSource;
+use super::layer::{Layer, LayerSource};
 use super::settings::{APP_VERSION, ProjectError, ProjectSettings, SCHEMA_VERSION, SavedView};
 use super::{Arc, BTreeMap, Deserialize, FrameRate, Label, Project, Serialize, Tick, file_check, limits};
+
+#[derive(Deserialize)]
+struct ProjectItemPartsFast {
+    id: ItemId,
+    name: String,
+    label: Label,
+    #[serde(default)]
+    comment: String,
+    #[serde(default)]
+    parent: Option<ItemId>,
+    #[serde(deserialize_with = "deserialize_project_kind")]
+    kind: ItemKind,
+    #[serde(default)]
+    proxy: Option<Box<Proxy>>,
+}
+
+struct ProjectItemsFast(BTreeMap<ItemId, super::Item>);
+
+impl<'de> Deserialize<'de> for ProjectItemsFast {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct ItemsVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for ItemsVisitor {
+            type Value = ProjectItemsFast;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a map of project item ids to project items")
+            }
+
+            fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
+            where
+                M: serde::de::MapAccess<'de>,
+            {
+                let mut items = BTreeMap::new();
+                while let Some(id) = map.next_key::<ItemId>()? {
+                    let item = map.next_value::<ProjectItemPartsFast>()?;
+                    items.insert(
+                        id,
+                        super::Item {
+                            id: item.id,
+                            name: item.name,
+                            label: item.label,
+                            comment: item.comment,
+                            parent: item.parent,
+                            kind: item.kind,
+                            proxy: item.proxy,
+                        },
+                    );
+                }
+                Ok(ProjectItemsFast(items))
+            }
+        }
+
+        deserializer.deserialize_map(ItemsVisitor)
+    }
+}
+
+fn deserialize_project_kind<'de, D>(deserializer: D) -> Result<ItemKind, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserializer.deserialize_map(ProjectItemKindVisitor)
+}
+
+#[derive(Deserialize)]
+struct ProjectCompParts {
+    width: u32,
+    height: u32,
+    pixel_aspect: f64,
+    frame_rate: FrameRate,
+    duration: Tick,
+    display_start: Tick,
+    background: [f32; 3],
+    work_area: (Tick, Tick),
+    layers: Vec<Layer>,
+    #[serde(default)]
+    markers: Vec<super::settings::Marker>,
+    shutter_angle: f64,
+    shutter_phase: f64,
+    motion_blur_samples: u32,
+    #[serde(default = "comp_adaptive_limit_default")]
+    motion_blur_adaptive_limit: u32,
+    #[serde(default)]
+    renderer: super::comp::Renderer,
+    #[serde(default)]
+    hide_shy: bool,
+    #[serde(default = "comp_default_true")]
+    enable_motion_blur: bool,
+    #[serde(default = "comp_default_true")]
+    enable_frame_blending: bool,
+    #[serde(default)]
+    draft_3d: bool,
+    #[serde(default)]
+    preserve_frame_rate: bool,
+    #[serde(default)]
+    preserve_resolution: bool,
+    #[serde(default)]
+    poster_time: Tick,
+    #[serde(default)]
+    global_light: super::styles::GlobalLight,
+    #[serde(default)]
+    guides: Vec<super::comp::Guide>,
+    #[serde(default)]
+    essential: Option<super::essential::EssentialGraphics>,
+    #[serde(default)]
+    resolution: super::comp::Resolution,
+}
+
+impl ProjectCompParts {
+    fn into_comp(self) -> Comp {
+        Comp {
+            width: self.width,
+            height: self.height,
+            pixel_aspect: self.pixel_aspect,
+            frame_rate: self.frame_rate,
+            duration: self.duration,
+            display_start: self.display_start,
+            background: self.background,
+            work_area: self.work_area,
+            layers: self.layers.into(),
+            markers: self.markers,
+            shutter_angle: self.shutter_angle,
+            shutter_phase: self.shutter_phase,
+            motion_blur_samples: self.motion_blur_samples,
+            motion_blur_adaptive_limit: self.motion_blur_adaptive_limit,
+            renderer: self.renderer,
+            hide_shy: self.hide_shy,
+            enable_motion_blur: self.enable_motion_blur,
+            enable_frame_blending: self.enable_frame_blending,
+            draft_3d: self.draft_3d,
+            preserve_frame_rate: self.preserve_frame_rate,
+            preserve_resolution: self.preserve_resolution,
+            poster_time: self.poster_time,
+            global_light: self.global_light,
+            guides: self.guides,
+            essential: self.essential,
+            resolution: self.resolution,
+        }
+    }
+}
+
+fn comp_adaptive_limit_default() -> u32 {
+    128
+}
+
+fn comp_default_true() -> bool {
+    true
+}
+
+struct ProjectItemKindVisitor;
+
+impl<'de> serde::de::Visitor<'de> for ProjectItemKindVisitor {
+    type Value = ItemKind;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("an EffectCraft project item kind")
+    }
+
+    fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
+    where
+        M: serde::de::MapAccess<'de>,
+    {
+        use serde::de::Error;
+
+        let Some(first_key) = map.next_key::<String>()? else {
+            return Err(M::Error::custom("missing item kind discriminator"));
+        };
+        if first_key != "type" {
+            // Older projects may put other fields before the discriminator. Keep the common
+            // tag-first form on the streaming path; use a DOM only for this compatibility case.
+            let mut fields = serde_json::Map::new();
+            fields.insert(first_key, map.next_value()?);
+            while let Some(key) = map.next_key::<String>()? {
+                fields.insert(key, map.next_value()?);
+            }
+            return serde_json::from_value(serde_json::Value::Object(fields)).map_err(M::Error::custom);
+        }
+        let tag = map.next_value::<String>()?;
+        match tag.as_str() {
+            "Folder" => {
+                while map.next_key::<serde::de::IgnoredAny>()?.is_some() {
+                    let _: serde::de::IgnoredAny = map.next_value()?;
+                }
+                Ok(ItemKind::Folder)
+            }
+            "Comp" => {
+                let comp = ProjectCompParts::deserialize(serde::de::value::MapAccessDeserializer::new(map))?;
+                Ok(ItemKind::Comp(Arc::new(comp.into_comp())))
+            }
+            "Footage" => Footage::deserialize(serde::de::value::MapAccessDeserializer::new(map)).map(ItemKind::Footage),
+            "Solid" => Solid::deserialize(serde::de::value::MapAccessDeserializer::new(map)).map(ItemKind::Solid),
+            _ => Err(M::Error::unknown_variant(&tag, &["Folder", "Comp", "Footage", "Solid"])),
+        }
+    }
+}
 
 /// `base` numbered with the lowest counter from 2 for which `taken` is false: a copy of an item or
 /// another layer of the same name. A number set off by a space is a counter and is replaced
@@ -55,13 +253,6 @@ pub struct Item {
 }
 
 impl Item {
-    /// Whether an external original or proxy is known to be offline, even if the other can
-    /// still provide a preview. Generated items and embedded data have no external dependency.
-    pub fn has_missing_footage(&self) -> bool {
-        let missing = |f: &crate::Footage| f.missing && !f.path.is_empty() && f.kind != FootageKind::Data;
-        matches!(&self.kind, ItemKind::Footage(f) if missing(f)) || self.proxy.as_ref().is_some_and(|p| missing(&p.footage))
-    }
-
     pub fn type_name(&self) -> &'static str {
         match &self.kind {
             ItemKind::Folder => "Folder",
@@ -136,78 +327,6 @@ impl Project {
             })
         }
         self.comps().any(|(_, c)| c.layers.iter().any(|l| any_expr(&l.props)))
-    }
-
-    /// The layers whose audio something draws ([`Heard`]): those a layer picks in an effect (an
-    /// Audio Spectrum or Audio Waveform's Audio Layer, even on itself), and the layers inside a
-    /// picked precomp, whose audio it mixes. With an expression anywhere (it can read any layer's
-    /// Audio Levels) every layer may be heard ([`Heard::contains`]).
-    pub fn heard_layers(&self) -> Heard {
-        let mut layers = std::collections::BTreeSet::new();
-        let mut stack: Vec<(ItemId, LayerId)> =
-            self.comps().flat_map(|(id, c)| c.layers.iter().flat_map(move |l| l.picked_layers().into_iter().map(move |r| (*id, r)))).collect();
-        // (bounded: each (comp, layer) is visited once)
-        while let Some((cid, lid)) = stack.pop() {
-            if !layers.insert((cid, lid)) {
-                continue;
-            }
-            let inner = self.comp(cid).and_then(|c| c.layer(lid)).and_then(|l| match l.source {
-                LayerSource::Comp { item } => Some(item),
-                _ => None,
-            });
-            if let Some(inner) = inner
-                && let Some(c) = self.comp(inner)
-            {
-                stack.extend(c.layers.iter().map(|l| (inner, l.id)));
-            }
-        }
-        Heard { expressions: self.reads_markers(), audio_exprs: self.reads_audio(), layers }
-    }
-
-    /// Some expression may read a layer's audio: its text names it (`audio`, `"Audio Levels"`,
-    /// `"ADBE Audio Group"`) or walks properties by index (`layer(1)(3)`).
-    // ponytail: text heuristic; misses an index walk through a variable (`g = layer(1); g(3)`).
-    // Upgrade: record audio reads in the expression host.
-    fn reads_audio(&self) -> bool {
-        fn reads(text: &str) -> bool {
-            let t: String = text.chars().filter(|c| !c.is_whitespace()).collect::<String>().to_lowercase();
-            t.contains("audio") || t.match_indices(")(").any(|(i, _)| t.get(i + 2..).and_then(|r| r.chars().next()).is_some_and(|c| c.is_ascii_digit()))
-        }
-        fn any(g: &crate::PropGroup) -> bool {
-            g.children.iter().any(|c| match c {
-                crate::Node::Prop(p) => p.expr.as_ref().is_some_and(|e| reads(&e.text)),
-                crate::Node::Group(sub) => any(sub),
-            })
-        }
-        self.comps().any(|(_, c)| c.layers.iter().any(|l| any(&l.props)))
-    }
-
-    /// Layers of `comp` (item `id`) that can't change its pixels: footage layers of files without
-    /// video (music, voice-over) and layers with the Video switch off, unless another layer reads
-    /// them (a hidden track matte) or something draws their audio ([`Self::heard_layers`]: the
-    /// Audio Spectrum's Audio Layer, also from a comp that nests this one). Cameras, lights,
-    /// nulls, environment layers and soloed layers (Solo hides every other layer) are never
-    /// silent. Expressions, which can read any layer, are the caller's concern.
-    pub fn silent_layers(&self, id: ItemId, comp: &Comp, heard: &Heard) -> std::collections::BTreeSet<LayerId> {
-        let read: std::collections::BTreeSet<LayerId> =
-            comp.layers.iter().flat_map(|l| l.referenced_layers().into_iter().filter(move |r| *r != l.id)).collect();
-        comp.layers
-            .iter()
-            .filter(|l| {
-                let no_picture = match &l.source {
-                    LayerSource::Footage { item } => matches!(self.item(*item).map(|i| &i.kind), Some(ItemKind::Footage(f)) if !f.has_video),
-                    _ => false,
-                };
-                // (environment layers light Advanced 3D scenes without being drawn)
-                (no_picture || l.source.is_av() && !l.switches.video)
-                    && !l.switches.solo
-                    && !l.environment
-                    && !l.environment_background
-                    && !read.contains(&l.id)
-                    && !heard.picked(id, l.id)
-            })
-            .map(|l| l.id)
-            .collect()
     }
 
     /// Allocate an id (items, layers and property uids share one counter).
@@ -393,86 +512,91 @@ impl Project {
     /// was corrected (a composition of a billion pixels, a zero frame rate…), so a corrupt or
     /// hostile file still opens, within bounds, and the user can be told what changed.
     pub fn from_json_repaired(s: &str) -> Result<(Project, Vec<String>), ProjectError> {
-        let mut p: Project = serde_json::from_str(s).map_err(|e| ProjectError::Invalid(e.to_string()))?;
+        let p: Project = serde_json::from_str(s).map_err(|e| ProjectError::Invalid(e.to_string()))?;
+        Self::repair(p)
+    }
+
+    /// Parse a project file and its editor metadata in one pass. The project file stores
+    /// `savedBy` and the saved view next to the project fields, so parsing them separately would
+    /// rescan a large file for each small metadata object.
+    pub fn from_file_json_repaired(bytes: &[u8]) -> Result<(Project, Vec<String>, SavedView, Option<String>), ProjectError> {
+        #[cfg(not(target_arch = "wasm32"))]
+        let profile_open = std::env::var_os("EFFECTCRAFT_PROFILE_OPEN").is_some();
+        #[cfg(target_arch = "wasm32")]
+        let profile_open = false;
+        #[cfg(not(target_arch = "wasm32"))]
+        let serde_started = std::time::Instant::now();
+        #[derive(Deserialize)]
+        struct ProjectFile {
+            schema: u32,
+            settings: ProjectSettings,
+            items: ProjectItemsFast,
+            next_id: u64,
+            #[serde(default)]
+            render_queue: Vec<super::render_queue::RenderQueueItem>,
+            #[serde(default)]
+            render_templates: super::render_templates::RenderTemplates,
+            #[serde(default)]
+            render_prefs: super::render_queue::RenderQueuePrefs,
+            #[serde(default, rename = "savedBy")]
+            saved_by: Option<serde_json::Value>,
+            #[serde(default, rename = "activeComp")]
+            active_comp: Option<serde_json::Value>,
+            #[serde(default, rename = "openComps")]
+            open_comps: Option<serde_json::Value>,
+            #[serde(default, rename = "compTimes")]
+            comp_times: Option<serde_json::Value>,
+        }
+
+        let parsed = serde_json::from_slice::<ProjectFile>(bytes);
+        let file = parsed.map_err(|e| ProjectError::Invalid(e.to_string()))?;
+        #[cfg(not(target_arch = "wasm32"))]
+        let serde_ms = serde_started.elapsed().as_secs_f64() * 1e3;
+        #[cfg(target_arch = "wasm32")]
+        let serde_ms = 0.0;
+        let saved_by = file.saved_by.as_ref().and_then(serde_json::Value::as_str).map(str::to_string);
+        let view = SavedView {
+            active_comp: file.active_comp.as_ref().and_then(serde_json::Value::as_u64).map(ItemId),
+            open_comps: file
+                .open_comps
+                .as_ref()
+                .and_then(serde_json::Value::as_array)
+                .map_or_else(Vec::new, |a| a.iter().filter_map(serde_json::Value::as_u64).map(ItemId).collect()),
+            comp_times: file
+                .comp_times
+                .as_ref()
+                .and_then(serde_json::Value::as_object)
+                .map_or_else(BTreeMap::new, |o| o.iter().filter_map(|(k, v)| Some((ItemId(k.parse().ok()?), Tick(v.as_i64()?)))).collect()),
+        };
+        let p = Project {
+            schema: file.schema,
+            settings: file.settings,
+            items: file.items.0,
+            next_id: file.next_id,
+            render_queue: file.render_queue,
+            render_templates: file.render_templates,
+            render_prefs: file.render_prefs,
+        };
+        #[cfg(not(target_arch = "wasm32"))]
+        let repair_started = std::time::Instant::now();
+        let (project, repaired) = Self::repair(p)?;
+        #[cfg(not(target_arch = "wasm32"))]
+        let repair_ms = repair_started.elapsed().as_secs_f64() * 1e3;
+        #[cfg(target_arch = "wasm32")]
+        let repair_ms = 0.0;
+        if profile_open {
+            eprintln!("open-profile-project bytes={} serde={serde_ms:.3}ms repair={repair_ms:.3}ms", bytes.len());
+        }
+        Ok((project, repaired, view, saved_by))
+    }
+
+    fn repair(mut p: Project) -> Result<(Project, Vec<String>), ProjectError> {
         craft_ecproj_format::check_schema(p.schema).map_err(|e| ProjectError::Invalid(e.to_string()))?;
         p.fix_next_id();
         let mut notes = vec![];
         for item in p.items.values_mut() {
             limits::repair_item(item, &mut notes);
         }
-        // An item inside a composition, a solid or footage (or inside an item that is not there) is
-        // in no folder: it would not be listed under any parent. It moves to the top level.
-        let folders: std::collections::BTreeSet<ItemId> = p.items.values().filter(|i| i.is_folder()).map(|i| i.id).collect();
-        for item in p.items.values_mut() {
-            if let Some(parent) = item.parent
-                && !folders.contains(&parent)
-            {
-                notes.push(format!("{}: its parent is not a folder, moved to the top level", item.name));
-                item.parent = None;
-            }
-        }
         Ok((p, notes))
-    }
-}
-
-/// The layers whose audio something draws ([`Project::heard_layers`]): their Audio switch, Audio
-/// group and audio effects change pixels.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct Heard {
-    /// Some layer has an expression (it can read anything).
-    pub expressions: bool,
-    /// Some expression may read a layer's audio ([`Project::reads_audio`]).
-    audio_exprs: bool,
-    layers: std::collections::BTreeSet<(ItemId, LayerId)>,
-}
-
-impl Heard {
-    /// Something may draw the audio of layer `layer` of comp `comp`: a layer picks it
-    /// ([`Self::picked`]) or an expression may read it.
-    pub fn contains(&self, comp: ItemId, layer: LayerId) -> bool {
-        self.audio_exprs || self.picked(comp, layer)
-    }
-
-    /// A layer picks layer `layer` of comp `comp` in an effect (or a precomp of it), so draws its
-    /// audio. Expressions aside: they draw in their own layers.
-    pub fn picked(&self, comp: ItemId, layer: LayerId) -> bool {
-        self.layers.contains(&(comp, layer))
-    }
-
-    /// Heard in `self` or in `o` (the states before and after an edit).
-    pub fn union(mut self, o: &Heard) -> Heard {
-        self.expressions |= o.expressions;
-        self.audio_exprs |= o.audio_exprs;
-        self.layers.extend(o.layers.iter().copied());
-        self
-    }
-}
-
-#[cfg(test)]
-mod availability_tests {
-    use super::*;
-
-    #[test]
-    fn inventory_status_tracks_original_and_proxy_independently() {
-        let footage = crate::Footage { path: "/original.png".into(), ..Default::default() };
-        let mut item = Item {
-            id: ItemId(1),
-            name: "Plate".into(),
-            label: Label::None,
-            comment: String::new(),
-            parent: None,
-            kind: ItemKind::Footage(footage.clone()),
-            proxy: None,
-        };
-        assert!(!item.has_missing_footage());
-        item.proxy = Some(Box::new(Proxy { footage: crate::Footage { path: "/proxy.png".into(), missing: true, ..footage.clone() }, enabled: false }));
-        assert!(item.has_missing_footage(), "unused missing proxies still need repair");
-        item.proxy.as_mut().unwrap().footage.missing = false;
-        assert!(!item.has_missing_footage());
-        if let ItemKind::Footage(f) = &mut item.kind {
-            f.missing = true;
-        }
-        item.proxy.as_mut().unwrap().enabled = true;
-        assert!(item.has_missing_footage(), "a working proxy does not make the original available");
     }
 }

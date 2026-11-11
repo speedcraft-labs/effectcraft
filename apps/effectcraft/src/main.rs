@@ -199,6 +199,7 @@ fn main() -> eframe::Result {
 }
 
 fn run_desktop(reporter: &crash_report::Shutdown) -> eframe::Result {
+    effectcraft_render::configure_parallelism();
     // Windows: the update helper is a copy of this program started with `--finish-update`.
     #[cfg(windows)]
     if let Some(result) = craft_update::self_update::finish(&effectcraft_ui_egui::UPDATE_APP, &std::env::args_os().skip(1).collect::<Vec<_>>()) {

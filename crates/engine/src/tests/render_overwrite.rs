@@ -121,7 +121,7 @@ impl Fixture {
         let f = Footage {
             path: files[0].clone(),
             kind: FootageKind::Sequence,
-            sequence: files,
+            sequence: files.into(),
             width: 16,
             height: 16,
             has_video: true,

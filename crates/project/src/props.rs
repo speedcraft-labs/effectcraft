@@ -2,12 +2,14 @@
 
 use effectcraft_keyframe::{Keyframe, Value};
 use effectcraft_time::Tick;
-use serde::{Deserialize, Serialize};
+use serde::de::{self, IntoDeserializer, MapAccess, Visitor, value::MapAccessDeserializer};
+use serde::{Deserialize, Deserializer, Serialize};
+use std::fmt;
 
 pub type Uid = u64;
 
 /// How a property is presented and edited.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
 #[serde(tag = "kind")]
 pub enum ParamUi {
     /// Plain number with an optional valid range and a (narrower) slider range.
@@ -45,6 +47,247 @@ pub enum ParamUi {
     Gradient,
     /// Not shown in Effect Controls / the timeline (internal data).
     Hidden,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "kind")]
+enum BufferedParamUi {
+    Number,
+    Slider { min: f64, max: f64, slider_min: f64, slider_max: f64, decimals: u8 },
+    Percent,
+    Angle,
+    Pixels,
+    Point,
+    Point3,
+    Color,
+    Checkbox,
+    Popup { options: Vec<String> },
+    Layer,
+    Mask,
+    Path,
+    Text,
+    File { filters: Vec<String> },
+    Gradient,
+    Hidden,
+}
+
+impl From<BufferedParamUi> for ParamUi {
+    fn from(ui: BufferedParamUi) -> Self {
+        match ui {
+            BufferedParamUi::Number => ParamUi::Number,
+            BufferedParamUi::Slider { min, max, slider_min, slider_max, decimals } => ParamUi::Slider { min, max, slider_min, slider_max, decimals },
+            BufferedParamUi::Percent => ParamUi::Percent,
+            BufferedParamUi::Angle => ParamUi::Angle,
+            BufferedParamUi::Pixels => ParamUi::Pixels,
+            BufferedParamUi::Point => ParamUi::Point,
+            BufferedParamUi::Point3 => ParamUi::Point3,
+            BufferedParamUi::Color => ParamUi::Color,
+            BufferedParamUi::Checkbox => ParamUi::Checkbox,
+            BufferedParamUi::Popup { options } => ParamUi::Popup { options },
+            BufferedParamUi::Layer => ParamUi::Layer,
+            BufferedParamUi::Mask => ParamUi::Mask,
+            BufferedParamUi::Path => ParamUi::Path,
+            BufferedParamUi::Text => ParamUi::Text,
+            BufferedParamUi::File { filters } => ParamUi::File { filters },
+            BufferedParamUi::Gradient => ParamUi::Gradient,
+            BufferedParamUi::Hidden => ParamUi::Hidden,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Deserialize)]
+enum ParamUiTag {
+    Number,
+    Slider,
+    Percent,
+    Angle,
+    Pixels,
+    Point,
+    Point3,
+    Color,
+    Checkbox,
+    Popup,
+    Layer,
+    Mask,
+    Path,
+    Text,
+    File,
+    Gradient,
+    Hidden,
+}
+
+#[derive(Deserialize)]
+struct ParamUiSliderFields {
+    min: f64,
+    max: f64,
+    slider_min: f64,
+    slider_max: f64,
+    decimals: u8,
+}
+
+#[derive(Deserialize)]
+struct ParamUiPopupFields {
+    options: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct ParamUiFileFields {
+    filters: Vec<String>,
+}
+
+enum TaggedKindField {
+    Kind,
+    Other(String),
+}
+
+impl<'de> Deserialize<'de> for TaggedKindField {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct FieldVisitor;
+
+        impl<'de> Visitor<'de> for FieldVisitor {
+            type Value = TaggedKindField;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a tagged property field")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E> {
+                Ok(if value == "kind" { TaggedKindField::Kind } else { TaggedKindField::Other(value.to_owned()) })
+            }
+
+            fn visit_borrowed_str<E>(self, value: &'de str) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                self.visit_str(value)
+            }
+
+            fn visit_string<E>(self, value: String) -> Result<Self::Value, E> {
+                Ok(if value == "kind" { TaggedKindField::Kind } else { TaggedKindField::Other(value) })
+            }
+        }
+
+        deserializer.deserialize_identifier(FieldVisitor)
+    }
+}
+
+struct ParamUiVisitor;
+
+impl<'de> Visitor<'de> for ParamUiVisitor {
+    type Value = ParamUi;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a tagged property UI")
+    }
+
+    fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
+    where
+        M: MapAccess<'de>,
+    {
+        let Some(first) = map.next_key::<TaggedKindField>()? else {
+            return Err(de::Error::custom("empty property UI"));
+        };
+        match first {
+            TaggedKindField::Kind => {}
+            TaggedKindField::Other(name) => {
+                let mut fields = serde_json::Map::new();
+                fields.insert(name, map.next_value()?);
+                while let Some(key) = map.next_key::<String>()? {
+                    let value = map.next_value()?;
+                    if fields.insert(key.clone(), value).is_some() {
+                        return Err(de::Error::custom(format!("duplicate field `{key}`")));
+                    }
+                }
+                return BufferedParamUi::deserialize(serde_json::Value::Object(fields)).map(Into::into).map_err(de::Error::custom);
+            }
+        }
+
+        match map.next_value::<ParamUiTag>()? {
+            ParamUiTag::Number => skip_tagged_unit_fields(map).map(|()| ParamUi::Number),
+            ParamUiTag::Percent => skip_tagged_unit_fields(map).map(|()| ParamUi::Percent),
+            ParamUiTag::Angle => skip_tagged_unit_fields(map).map(|()| ParamUi::Angle),
+            ParamUiTag::Pixels => skip_tagged_unit_fields(map).map(|()| ParamUi::Pixels),
+            ParamUiTag::Point => skip_tagged_unit_fields(map).map(|()| ParamUi::Point),
+            ParamUiTag::Point3 => skip_tagged_unit_fields(map).map(|()| ParamUi::Point3),
+            ParamUiTag::Color => skip_tagged_unit_fields(map).map(|()| ParamUi::Color),
+            ParamUiTag::Checkbox => skip_tagged_unit_fields(map).map(|()| ParamUi::Checkbox),
+            ParamUiTag::Layer => skip_tagged_unit_fields(map).map(|()| ParamUi::Layer),
+            ParamUiTag::Mask => skip_tagged_unit_fields(map).map(|()| ParamUi::Mask),
+            ParamUiTag::Path => skip_tagged_unit_fields(map).map(|()| ParamUi::Path),
+            ParamUiTag::Text => skip_tagged_unit_fields(map).map(|()| ParamUi::Text),
+            ParamUiTag::Gradient => skip_tagged_unit_fields(map).map(|()| ParamUi::Gradient),
+            ParamUiTag::Hidden => skip_tagged_unit_fields(map).map(|()| ParamUi::Hidden),
+            ParamUiTag::Slider => ParamUiSliderFields::deserialize(MapAccessDeserializer::new(TaggedPayloadFields(map))).map(|fields| ParamUi::Slider {
+                min: fields.min,
+                max: fields.max,
+                slider_min: fields.slider_min,
+                slider_max: fields.slider_max,
+                decimals: fields.decimals,
+            }),
+            ParamUiTag::Popup => {
+                ParamUiPopupFields::deserialize(MapAccessDeserializer::new(TaggedPayloadFields(map))).map(|fields| ParamUi::Popup { options: fields.options })
+            }
+            ParamUiTag::File => {
+                ParamUiFileFields::deserialize(MapAccessDeserializer::new(TaggedPayloadFields(map))).map(|fields| ParamUi::File { filters: fields.filters })
+            }
+        }
+    }
+}
+
+fn skip_tagged_unit_fields<'de, M>(mut map: M) -> Result<(), M::Error>
+where
+    M: MapAccess<'de>,
+{
+    while let Some(key) = map.next_key::<String>()? {
+        if key == "kind" {
+            return Err(de::Error::duplicate_field("kind"));
+        }
+        let _: de::IgnoredAny = map.next_value()?;
+    }
+    Ok(())
+}
+
+struct TaggedPayloadFields<M>(M);
+
+impl<'de, M> MapAccess<'de> for TaggedPayloadFields<M>
+where
+    M: MapAccess<'de>,
+{
+    type Error = M::Error;
+
+    fn next_key_seed<K>(&mut self, seed: K) -> Result<Option<K::Value>, Self::Error>
+    where
+        K: serde::de::DeserializeSeed<'de>,
+    {
+        let Some(key) = self.0.next_key::<String>()? else { return Ok(None) };
+        if key == "kind" {
+            return Err(de::Error::duplicate_field("kind"));
+        }
+        seed.deserialize(key.into_deserializer()).map(Some)
+    }
+
+    fn next_value_seed<V>(&mut self, seed: V) -> Result<V::Value, Self::Error>
+    where
+        V: serde::de::DeserializeSeed<'de>,
+    {
+        self.0.next_value_seed(seed)
+    }
+
+    fn size_hint(&self) -> Option<usize> {
+        self.0.size_hint()
+    }
+}
+
+impl<'de> Deserialize<'de> for ParamUi {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_map(ParamUiVisitor)
+    }
 }
 
 /// Expression attached to a property.
@@ -164,7 +407,7 @@ impl Property {
 }
 
 /// What a group represents, with its non-animatable header data.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
 #[serde(tag = "kind")]
 pub enum GroupKind {
     #[default]
@@ -200,6 +443,155 @@ pub enum GroupKind {
         #[serde(default)]
         overridden: Vec<Uid>,
     },
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "kind")]
+enum BufferedGroupKind {
+    Plain,
+    Indexed,
+    Mask {
+        mode: MaskMode,
+        inverted: bool,
+        color: [u8; 3],
+        locked: bool,
+        #[serde(default)]
+        motion_blur: MaskMotionBlur,
+        #[serde(default)]
+        feather_falloff: FeatherFalloff,
+        #[serde(default)]
+        roto_bezier: bool,
+    },
+    Effect {
+        effect: String,
+    },
+    Tracker {
+        settings: Box<crate::tracking::TrackerSettings>,
+    },
+    Essential {
+        #[serde(default)]
+        overridden: Vec<Uid>,
+    },
+}
+
+impl From<BufferedGroupKind> for GroupKind {
+    fn from(kind: BufferedGroupKind) -> Self {
+        match kind {
+            BufferedGroupKind::Plain => GroupKind::Plain,
+            BufferedGroupKind::Indexed => GroupKind::Indexed,
+            BufferedGroupKind::Mask { mode, inverted, color, locked, motion_blur, feather_falloff, roto_bezier } => {
+                GroupKind::Mask { mode, inverted, color, locked, motion_blur, feather_falloff, roto_bezier }
+            }
+            BufferedGroupKind::Effect { effect } => GroupKind::Effect { effect },
+            BufferedGroupKind::Tracker { settings } => GroupKind::Tracker { settings },
+            BufferedGroupKind::Essential { overridden } => GroupKind::Essential { overridden },
+        }
+    }
+}
+
+#[derive(Clone, Copy, Deserialize)]
+enum GroupKindTag {
+    Plain,
+    Indexed,
+    Mask,
+    Effect,
+    Tracker,
+    Essential,
+}
+
+#[derive(Deserialize)]
+struct MaskGroupKindFields {
+    mode: MaskMode,
+    inverted: bool,
+    color: [u8; 3],
+    locked: bool,
+    #[serde(default)]
+    motion_blur: MaskMotionBlur,
+    #[serde(default)]
+    feather_falloff: FeatherFalloff,
+    #[serde(default)]
+    roto_bezier: bool,
+}
+
+#[derive(Deserialize)]
+struct EffectGroupKindFields {
+    effect: String,
+}
+
+#[derive(Deserialize)]
+struct TrackerGroupKindFields {
+    settings: Box<crate::tracking::TrackerSettings>,
+}
+
+#[derive(Deserialize)]
+struct EssentialGroupKindFields {
+    #[serde(default)]
+    overridden: Vec<Uid>,
+}
+
+struct GroupKindVisitor;
+
+impl<'de> Visitor<'de> for GroupKindVisitor {
+    type Value = GroupKind;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a tagged property-group kind")
+    }
+
+    fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
+    where
+        M: MapAccess<'de>,
+    {
+        let Some(first) = map.next_key::<TaggedKindField>()? else {
+            return Err(de::Error::custom("empty property-group kind"));
+        };
+        match first {
+            TaggedKindField::Kind => {}
+            TaggedKindField::Other(name) => {
+                let mut fields = serde_json::Map::new();
+                fields.insert(name, map.next_value()?);
+                while let Some(key) = map.next_key::<String>()? {
+                    let value = map.next_value()?;
+                    if fields.insert(key.clone(), value).is_some() {
+                        return Err(de::Error::custom(format!("duplicate field `{key}`")));
+                    }
+                }
+                return BufferedGroupKind::deserialize(serde_json::Value::Object(fields)).map(Into::into).map_err(de::Error::custom);
+            }
+        }
+
+        match map.next_value::<GroupKindTag>()? {
+            GroupKindTag::Plain => skip_tagged_unit_fields(map).map(|()| GroupKind::Plain),
+            GroupKindTag::Indexed => skip_tagged_unit_fields(map).map(|()| GroupKind::Indexed),
+            GroupKindTag::Mask => {
+                let fields = MaskGroupKindFields::deserialize(MapAccessDeserializer::new(TaggedPayloadFields(map)))?;
+                Ok(GroupKind::Mask {
+                    mode: fields.mode,
+                    inverted: fields.inverted,
+                    color: fields.color,
+                    locked: fields.locked,
+                    motion_blur: fields.motion_blur,
+                    feather_falloff: fields.feather_falloff,
+                    roto_bezier: fields.roto_bezier,
+                })
+            }
+            GroupKindTag::Effect => EffectGroupKindFields::deserialize(MapAccessDeserializer::new(TaggedPayloadFields(map)))
+                .map(|fields| GroupKind::Effect { effect: fields.effect }),
+            GroupKindTag::Tracker => TrackerGroupKindFields::deserialize(MapAccessDeserializer::new(TaggedPayloadFields(map)))
+                .map(|fields| GroupKind::Tracker { settings: fields.settings }),
+            GroupKindTag::Essential => EssentialGroupKindFields::deserialize(MapAccessDeserializer::new(TaggedPayloadFields(map)))
+                .map(|fields| GroupKind::Essential { overridden: fields.overridden }),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for GroupKind {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_map(GroupKindVisitor)
+    }
 }
 
 /// Mask motion blur (sub-frame samples of an animated mask path).
@@ -275,11 +667,62 @@ fn yes() -> bool {
     true
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(tag = "node")]
 pub enum Node {
     Prop(Property),
     Group(PropGroup),
+}
+
+/// The derive for an internally tagged enum buffers every node into `Content` before it can
+/// choose a variant. Project files written by EffectCraft put `node` first, so deserialize the
+/// selected struct directly from the remaining map. Keep a buffered fallback for valid files
+/// whose object keys are ordered differently.
+#[derive(Deserialize)]
+#[serde(tag = "node")]
+enum BufferedNode {
+    Prop(Property),
+    Group(PropGroup),
+}
+
+struct NodeVisitor;
+
+impl<'de> Visitor<'de> for NodeVisitor {
+    type Value = Node;
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("a tagged property or group node")
+    }
+
+    fn visit_map<M: MapAccess<'de>>(self, mut map: M) -> Result<Node, M::Error> {
+        let Some(first) = map.next_key::<String>()? else {
+            return Err(de::Error::custom("empty project node"));
+        };
+        if first == "node" {
+            let tag = map.next_value::<String>()?;
+            return match tag.as_str() {
+                "Prop" => Property::deserialize(MapAccessDeserializer::new(map)).map(Node::Prop),
+                "Group" => PropGroup::deserialize(MapAccessDeserializer::new(map)).map(Node::Group),
+                _ => Err(de::Error::unknown_variant(&tag, &["Prop", "Group"])),
+            };
+        }
+
+        let mut fields = serde_json::Map::new();
+        fields.insert(first, map.next_value()?);
+        while let Some(key) = map.next_key::<String>()? {
+            fields.insert(key, map.next_value()?);
+        }
+        match BufferedNode::deserialize(serde_json::Value::Object(fields)).map_err(de::Error::custom)? {
+            BufferedNode::Prop(p) => Ok(Node::Prop(p)),
+            BufferedNode::Group(g) => Ok(Node::Group(g)),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for Node {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Node, D::Error> {
+        deserializer.deserialize_map(NodeVisitor)
+    }
 }
 
 impl Node {
@@ -620,5 +1063,94 @@ impl From<Property> for Node {
 impl From<PropGroup> for Node {
     fn from(g: PropGroup) -> Node {
         Node::Group(g)
+    }
+}
+
+#[cfg(test)]
+mod node_deserialization_tests {
+    use super::Node;
+
+    #[test]
+    fn tagged_nodes_accept_tag_first_and_reordered_fields() {
+        let tag_first = r#"{"node":"Group","uid":2,"match":"root","name":"Root","children":[{"node":"Prop","uid":1,"match":"value","name":"Value","value":{"t":"Scalar","v":2.0}}]}"#;
+        let reordered = r#"{"uid":2,"match":"root","name":"Root","children":[{"uid":1,"match":"value","name":"Value","value":{"t":"Scalar","v":2.0},"node":"Prop"}],"node":"Group"}"#;
+        let direct: Node = serde_json::from_str(tag_first).unwrap();
+        let fallback: Node = serde_json::from_str(reordered).unwrap();
+        assert_eq!(direct, fallback);
+    }
+}
+
+#[cfg(test)]
+mod group_kind_deserialization_tests {
+    use super::{FeatherFalloff, GroupKind, MaskMode, MaskMotionBlur};
+
+    #[test]
+    fn tagged_group_kinds_accept_tag_first_and_reordered_fields() {
+        let samples = [
+            GroupKind::Plain,
+            GroupKind::Indexed,
+            GroupKind::Mask {
+                mode: MaskMode::Subtract,
+                inverted: true,
+                color: [7, 19, 31],
+                locked: true,
+                motion_blur: MaskMotionBlur::On,
+                feather_falloff: FeatherFalloff::Linear,
+                roto_bezier: true,
+            },
+            GroupKind::Effect { effect: "ec.blur.gaussian".into() },
+            GroupKind::Tracker { settings: Box::default() },
+            GroupKind::Essential { overridden: vec![4, 8, 15] },
+        ];
+        for sample in &samples {
+            let encoded = serde_json::to_string(sample).unwrap();
+            let parsed: GroupKind = serde_json::from_str(&encoded).unwrap();
+            assert_eq!(&parsed, sample, "tag-first encoding: {encoded}");
+        }
+
+        let reordered = r#"{"mode":"Subtract","inverted":true,"color":[7,19,31],"locked":true,"kind":"Mask","motion_blur":"On","feather_falloff":"Linear","roto_bezier":true}"#;
+        let parsed: GroupKind = serde_json::from_str(reordered).unwrap();
+        assert_eq!(parsed, samples[2]);
+        assert!(serde_json::from_str::<GroupKind>(r#"{"kind":"Plain","kind":"Indexed"}"#).is_err());
+        assert!(serde_json::from_str::<GroupKind>(r#"{"kind":"Effect","effect":"x","kind":"Plain"}"#).is_err());
+    }
+}
+
+#[cfg(test)]
+mod param_ui_deserialization_tests {
+    use super::ParamUi;
+
+    #[test]
+    fn tagged_property_uis_accept_tag_first_and_reordered_fields() {
+        let samples = [
+            ParamUi::Number,
+            ParamUi::Slider { min: -3.0, max: 9.0, slider_min: 0.0, slider_max: 6.0, decimals: 2 },
+            ParamUi::Percent,
+            ParamUi::Angle,
+            ParamUi::Pixels,
+            ParamUi::Point,
+            ParamUi::Point3,
+            ParamUi::Color,
+            ParamUi::Checkbox,
+            ParamUi::Popup { options: vec!["One".into(), "Two".into()] },
+            ParamUi::Layer,
+            ParamUi::Mask,
+            ParamUi::Path,
+            ParamUi::Text,
+            ParamUi::File { filters: vec!["*.cube".into()] },
+            ParamUi::Gradient,
+            ParamUi::Hidden,
+        ];
+        for sample in &samples {
+            let encoded = serde_json::to_string(sample).unwrap();
+            let parsed: ParamUi = serde_json::from_str(&encoded).unwrap();
+            assert_eq!(&parsed, sample, "tag-first encoding: {encoded}");
+        }
+
+        let reordered = r#"{"min":-3.0,"max":9.0,"slider_min":0.0,"slider_max":6.0,"decimals":2,"kind":"Slider"}"#;
+        let parsed: ParamUi = serde_json::from_str(reordered).unwrap();
+        assert_eq!(parsed, samples[1]);
+        assert!(serde_json::from_str::<ParamUi>(r#"{"kind":"Number","kind":"Percent"}"#).is_err());
+        assert!(serde_json::from_str::<ParamUi>(r#"{"kind":"Popup","options":[],"kind":"Number"}"#).is_err());
     }
 }

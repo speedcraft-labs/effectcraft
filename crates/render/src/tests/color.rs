@@ -170,7 +170,7 @@ fn footage(profile: Option<ColorSpace>) -> Footage {
         loop_count: 1,
         codec: String::new(),
         missing: false,
-        sequence: vec![],
+        sequence: vec![].into(),
         color_profile: profile,
         ..Default::default()
     }

@@ -356,7 +356,7 @@ impl Scene {
             loop_count: 1,
             codec: String::new(),
             missing: false,
-            sequence: vec![],
+            sequence: vec![].into(),
             color_profile: None,
             ..Default::default()
         };
@@ -654,6 +654,10 @@ fn layer_styles_collapsed_precomps_and_cpu_fallbacks() {
 pub(crate) fn effect_direct(id: &str, vals: &[(&str, Value)], adjustment: bool) {
     let Some(g) = gpu() else { return };
     let spec = effectcraft_effects::find(id).unwrap();
+    if !spec.gpu {
+        // The frame tests in effect_case exercise the exact CPU fallback and GPU compositor.
+        return;
+    }
     let size = [70.0, 44.0];
     let mut params =
         effectcraft_effects::Params { values: spec.params.iter().map(|ps| (ps.id.to_string(), effectcraft_effects::default_value(ps, size))).collect() };
