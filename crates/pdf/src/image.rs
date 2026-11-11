@@ -6,6 +6,7 @@
 
 use crate::color::{Cs, color_space};
 use crate::object::{Dict, File, Obj, decode_stream};
+use craft_resample::{NearestAlignment, resize_nearest};
 
 pub(crate) struct Decoded {
     pub width: u32,
@@ -172,30 +173,11 @@ fn unpack(data: &[u8], w: usize, h: usize, n: usize, bpc: usize) -> Vec<u16> {
 
 /// Nearest-neighbour resample of a single-channel 8-bit mask to `w`×`h`.
 fn resample(m: &[u8], mw: usize, mh: usize, w: usize, h: usize) -> Vec<u8> {
-    let Some(pixels) = w.checked_mul(h).filter(|p| *p <= MAX_PIXELS) else { return Vec::new() };
+    let Some(_pixels) = w.checked_mul(h).filter(|p| *p <= MAX_PIXELS) else { return Vec::new() };
     if mw.checked_mul(mh).is_none_or(|n| n > m.len()) {
         return Vec::new();
     }
-    if mw == w && mh == h {
-        let mut out = Vec::new();
-        if out.try_reserve_exact(pixels).is_err() {
-            return Vec::new();
-        }
-        out.extend_from_slice(&m[..pixels]);
-        return out;
-    }
-    let mut out = Vec::new();
-    if out.try_reserve_exact(pixels).is_err() {
-        return Vec::new();
-    }
-    for y in 0..h {
-        let sy = (y * mh / h.max(1)).min(mh.saturating_sub(1));
-        for x in 0..w {
-            let sx = (x * mw / w.max(1)).min(mw.saturating_sub(1));
-            out.push(m.get(sy * mw + sx).copied().unwrap_or(255));
-        }
-    }
-    out
+    resize_nearest(m, [mw, mh], [w, h], 1, NearestAlignment::Corner).unwrap_or_default()
 }
 
 /// A stencil or soft mask stream as 8-bit coverage.

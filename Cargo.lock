@@ -1838,6 +1838,7 @@ name = "effectcraft-pdf"
 version = "0.23.1"
 dependencies = [
  "craft-pdf",
+ "craft-resample",
  "effectcraft-raster",
  "effectcraft-svg",
  "effectcraft-text",
@@ -1889,6 +1890,7 @@ name = "effectcraft-raster"
 version = "0.23.1"
 dependencies = [
  "craft-blur",
+ "craft-resample",
  "effectcraft-color",
  "effectcraft-geom",
  "rayon",
