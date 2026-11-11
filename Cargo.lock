@@ -1090,6 +1090,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "craft-bench"
+version = "0.1.0"
+source = "git+https://github.com/speedcraft-labs/craft-libs?branch=algo%2Fintegration#396a9d9a2e38b15d3e2f75aeedc3da5a107d6fb2"
+dependencies = [
+ "chrono",
+ "cpu-time",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "craft-blur"
+version = "0.1.0"
+source = "git+https://github.com/speedcraft-labs/craft-libs?rev=bd4514470391e50388cb399d9531ced2ec8d87f3#bd4514470391e50388cb399d9531ced2ec8d87f3"
+
+[[package]]
 name = "craft-docpath"
 version = "0.1.0"
 source = "git+https://github.com/storytold/craft-libs?rev=e11f9d9aebea5f6b8e74643c1ea1ed172ba5f545#e11f9d9aebea5f6b8e74643c1ea1ed172ba5f545"
@@ -1158,6 +1175,14 @@ dependencies = [
  "egui",
  "objc2 0.6.5",
  "objc2-app-kit 0.3.2",
+]
+
+[[package]]
+name = "craft-resample"
+version = "0.1.0"
+source = "git+https://github.com/storytold/craft-libs?rev=fd21a0a80a8e4f4c183a8e0da0953e1b033b817d#fd21a0a80a8e4f4c183a8e0da0953e1b033b817d"
+dependencies = [
+ "rayon",
 ]
 
 [[package]]
@@ -1513,6 +1538,8 @@ name = "effectcraft-effects"
 version = "0.23.1"
 dependencies = [
  "chrono",
+ "craft-blur",
+ "craft-resample",
  "effectcraft-color",
  "effectcraft-geom",
  "effectcraft-keyframe",
@@ -1520,6 +1547,7 @@ dependencies = [
  "effectcraft-raster",
  "effectcraft-segment",
  "effectcraft-track",
+ "image",
  "log",
  "rayon",
  "serde",
@@ -1626,6 +1654,8 @@ name = "effectcraft-gpu"
 version = "0.23.1"
 dependencies = [
  "bytemuck",
+ "craft-bench",
+ "craft-resample",
  "effectcraft-color",
  "effectcraft-effects",
  "effectcraft-geom",
