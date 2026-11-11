@@ -78,8 +78,6 @@ pub struct Renderer<'a> {
     pub profile: Option<&'a std::sync::Mutex<Vec<LayerTiming>>>,
     /// Per-top-level-frame cache for repeated static precomps.
     pub(crate) comp_frames: Arc<crate::pipeline::CompFrameCache>,
-    /// Bounded cache for identical static shape rasters shared by layers in this render.
-    pub(crate) shape_sources: Arc<crate::pipeline::ShapeSourceCache>,
     /// Disabled by profile renders so every nested layer remains visible in layer timings.
     pub(crate) cache_static_comps: bool,
     /// GPU backend used when [`RenderOpts::backend`] asks for it.
