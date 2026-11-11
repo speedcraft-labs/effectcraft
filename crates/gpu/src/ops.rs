@@ -153,24 +153,12 @@ fn warp_q_pingpong_inner(
     if clear {
         return PingPongWarp::Unsupported;
     }
-    let draw_region = dispatch_region(region, current.width, current.height);
-    let mut work_region = draw_region;
     if let Some(previous) = previous {
-        let union = (previous.0.min(draw_region.0), previous.1.min(draw_region.1), previous.2.max(draw_region.2), previous.3.max(draw_region.3));
-        let area = |(x0, y0, x1, y1): (u32, u32, u32, u32)| u64::from(x1 - x0) * u64::from(y1 - y0);
-        // `warp_blend` copies `current` to `next` outside the layer bounds. When the two
-        // dispatch footprints overlap or are close, it can also copy the previous dirty region,
-        // replacing a separate texture-copy command with the same shader dispatch. Bound the
-        // extra work to four times the two footprints; for distant layers, keep the direct copy.
-        if area(union) <= (area(previous) + area(draw_region)).saturating_mul(4) {
-            work_region = union;
-        } else {
-            e.copy_region(current, next, previous);
-        }
+        e.copy_region(current, next, previous);
     }
-    e.pixels_region("warp_blend", &p, &img, Some(current), next, work_region, None);
+    e.pixels_region("warp_blend", &p, &img, Some(current), next, region, None);
     next.levels = levels;
-    PingPongWarp::Drawn(draw_region)
+    PingPongWarp::Drawn(dispatch_region(region, current.width, current.height))
 }
 
 fn warp_params(

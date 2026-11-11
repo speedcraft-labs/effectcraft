@@ -79,8 +79,7 @@ fn draw_comp<'a>(e: &mut Enc, r: &Renderer<'a>, ctx: &EvalCtx<'a>, canvas: &mut 
     // Quantizing uploaded texels is equivalent to quantizing CPU-rendered sources only when
     // the renderer is already in the blending space. A color-space conversion must keep its
     // full-precision input until after conversion.
-    // Preserve RGBA32Float filtering until compact uploads reproduce the baseline hash exactly.
-    let compact_8bit_sources = false;
+    let compact_8bit_sources = levels == Some(255.0) && r.pipe().to_blend().is_none();
     let mut i = 0;
     while i < visible.len() {
         // A device that ran out of memory (or was lost) on an earlier layer fails every later
@@ -528,7 +527,9 @@ fn composite_layer(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, buf:
     let matte = r.track_matte(ctx, layer).is_some();
     if !matte && !layer.preserve_transparency {
         // The comp is quantised after the layer (8/16 bpc) in the same pass.
-        *canvas = place(e, r, ctx, layer, buf, canvas, layer.blend_mode, opacity, r.pipe().levels)?;
+        let source_is_8bit = r.pipe().levels == Some(255.0) && r.pipe().to_blend().is_none();
+        let src = if source_is_8bit { e.g.upload_buf_8bit(buf, quantize_source)? } else { e.g.upload_buf(buf)? };
+        *canvas = place_src(e, r, ctx, layer, buf, src, canvas, layer.blend_mode, opacity, r.pipe().levels, quantize_source || source_is_8bit)?;
         return Some(());
     }
     // Render in isolation, then matte / preserve transparency, then blend.
