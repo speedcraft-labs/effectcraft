@@ -55,7 +55,7 @@ fn warp_blend(@builtin(global_invocation_id) gid: vec3<u32>) {
         store_q(vec2<i32>(x, y), d, P.f[3].z, P.f[3].w);
         return;
     }
-    let s = sample(src, sampling, px, py);
+    var s = sample(src, sampling, px, py);
     if ((flags & 1u) != 0u) {
         if (s.w > 0.0) {
             d = d + s * P.f[3].y;
