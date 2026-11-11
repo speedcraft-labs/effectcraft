@@ -150,7 +150,7 @@ mod tests {
     #[test]
     fn a_gap_holds_the_file_shown_for_the_preceding_number() {
         let mut f = seq(&[]);
-        f.sequence = ["a_0001.png", "a_0002.png", "a_002.png", "a_0005.png"].map(String::from).to_vec().into();
+        f.sequence = ["a_0001.png", "a_0002.png", "a_002.png", "a_0005.png"].map(String::from).to_vec();
         assert_eq!(f.sequence_file(1), Some("a_0002.png"));
         // Frames 3 and 4 (numbers 3, 4) hold what number 2 shows: the first file with it.
         assert_eq!(f.sequence_file_held(2), Some("a_0002.png"));

@@ -1128,7 +1128,7 @@ mod tests {
         }
         let mut f = crate::probe_bytes(&paths[0], rgb_and_gloss(0.5)).unwrap();
         f.kind = effectcraft_project::FootageKind::Sequence;
-        f.sequence = paths.clone().into();
+        f.sequence = paths.clone();
         let at = |i: i64| f.frame_rate.tick_of(i);
         // (counted on this thread, so other tests sharing the channel cache don't change them)
         let frame = |i: i64| {

@@ -2851,7 +2851,7 @@ mod frame_files {
         let seq_dir = dir.join("seq");
         std::fs::create_dir_all(&seq_dir).unwrap();
         let files: Vec<String> = (0..FRAMES).map(|i| png(&seq_dir.join(format!("f_{i:04}.png")), level(i))).collect();
-        let mut seq = Footage { kind: FootageKind::Sequence, sequence: files.clone().into(), frame_rate: RATE, ..effectcraft_media::probe(&files[0]).unwrap() };
+        let mut seq = Footage { kind: FootageKind::Sequence, sequence: files.clone(), frame_rate: RATE, ..effectcraft_media::probe(&files[0]).unwrap() };
         seq.sync_sequence_duration();
         let unused = Footage {
             kind: FootageKind::Sequence,

@@ -1104,7 +1104,7 @@ dependencies = [
 [[package]]
 name = "craft-blur"
 version = "0.1.0"
-source = "git+https://github.com/speedcraft-labs/craft-libs?rev=bd4514470391e50388cb399d9531ced2ec8d87f3#bd4514470391e50388cb399d9531ced2ec8d87f3"
+source = "git+https://github.com/speedcraft-labs/craft-libs?rev=f0507f3d4512dfc880388a4b9687e411a27e0b35#f0507f3d4512dfc880388a4b9687e411a27e0b35"
 
 [[package]]
 name = "craft-docpath"
@@ -1656,6 +1656,7 @@ version = "0.23.1"
 dependencies = [
  "bytemuck",
  "craft-bench",
+ "craft-blur",
  "craft-resample",
  "effectcraft-color",
  "effectcraft-effects",

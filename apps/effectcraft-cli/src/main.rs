@@ -315,6 +315,7 @@ fn utf8_args(raw: impl IntoIterator<Item = std::ffi::OsString>) -> Result<Vec<St
 }
 
 fn main() {
+    effectcraft_render::configure_parallelism();
     // Warnings and errors to standard error (`RUST_LOG` overrides), so a GPU that declines
     // frames or runs out of memory says so instead of silently rendering on the CPU.
     effectcraft_engine::logging::install_with("warn");
@@ -1571,6 +1572,8 @@ fn bench_gpu(s: &Session, args: &Args) -> Result<(), Failure> {
         r.expr = s.expr.as_deref();
         r.accel = Some(&gpu);
         let transfers = gpu.context().transfer_stats();
+        let pipelines = gpu.context().pipeline_build_stats();
+        let precomps = gpu.context().static_precomp_stats();
         let pool = gpu.context().pool_stats();
         let start = std::time::Instant::now();
         let frame = r.comp_frame(cid, t);
@@ -1583,10 +1586,20 @@ fn bench_gpu(s: &Session, args: &Args) -> Result<(), Failure> {
             .flat_map(|channel| channel.to_bits().to_le_bytes())
             .fold(0xcbf29ce484222325, |hash, byte| (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3));
         let transfers_after = gpu.context().transfer_stats();
+        let pipelines_after = gpu.context().pipeline_build_stats();
+        let precomps_after = gpu.context().static_precomp_stats();
         let pool_after = gpu.context().pool_stats();
         note!("GPU-only first frame: {}x{} {first_frame_ms:.2} ms, hash {pixel_hash:016x}", frame.width, frame.height);
         note!(
-            "  uploads {} ({:.1} MB), readbacks {} ({:.1} MB), texture pool {}/{} hits/misses",
+            "  shader modules {} ({:.2} ms), lazy pipelines {} ({:.2} ms), pipeline cache {}/{} hits; static precomps {}/{} hits/misses; uploads {} ({:.1} MB), readbacks {} ({:.1} MB), texture pool {}/{} hits/misses",
+            pipelines_after.shader_modules - pipelines.shader_modules,
+            (pipelines_after.shader_module_ns - pipelines.shader_module_ns) as f64 / 1.0e6,
+            pipelines_after.pipelines - pipelines.pipelines,
+            (pipelines_after.pipeline_ns - pipelines.pipeline_ns) as f64 / 1.0e6,
+            pipelines_after.cache_hits - pipelines.cache_hits,
+            pipelines_after.requests - pipelines.requests,
+            precomps_after.hits - precomps.hits,
+            precomps_after.misses - precomps.misses,
             transfers_after.uploads - transfers.uploads,
             (transfers_after.upload_bytes - transfers.upload_bytes) as f64 / (1u64 << 20) as f64,
             transfers_after.readbacks - transfers.readbacks,
@@ -1627,11 +1640,15 @@ fn bench_gpu(s: &Session, args: &Args) -> Result<(), Failure> {
                 std::hint::black_box(mk(Backend::Cpu, None));
             });
             let cold_transfers_before = gpu.context().transfer_stats();
+            let cold_pipelines_before = gpu.context().pipeline_build_stats();
+            let cold_precomps_before = gpu.context().static_precomp_stats();
             let cold_pool_before = gpu.context().pool_stats();
             let gpu_cold = time_ms(n, || {
                 std::hint::black_box(mk(Backend::Gpu, None));
             });
             let cold_transfers = gpu.context().transfer_stats();
+            let cold_pipelines = gpu.context().pipeline_build_stats();
+            let cold_precomps = gpu.context().static_precomp_stats();
             let cold_pool = gpu.context().pool_stats();
             let cache = LayerCache::default();
             let cpu_warm = time_ms(n, || {
@@ -1690,7 +1707,15 @@ fn bench_gpu(s: &Session, args: &Args) -> Result<(), Failure> {
                 "{name:<28} {label:>5} {size:>10} {cpu_cold:>9.2} {gpu_cold:>9.2} {cpu_warm:>9.2} {gpu_warm:>9.2} {view:>9.2} {speedup:>7.2}x {auto:>9.2} {pct:>8.3}% {traffic:>11}"
             );
             note!(
-                "  cold profile: uploads {} ({:.1} MB), readbacks {} ({:.1} MB), texture pool {}/{} hits/misses",
+                "  cold profile: shader modules {} ({:.2} ms), lazy pipelines {} ({:.2} ms), pipeline cache {}/{} hits; static precomps {}/{} hits/misses; uploads {} ({:.1} MB), readbacks {} ({:.1} MB), texture pool {}/{} hits/misses",
+                cold_pipelines.shader_modules - cold_pipelines_before.shader_modules,
+                (cold_pipelines.shader_module_ns - cold_pipelines_before.shader_module_ns) as f64 / 1.0e6,
+                cold_pipelines.pipelines - cold_pipelines_before.pipelines,
+                (cold_pipelines.pipeline_ns - cold_pipelines_before.pipeline_ns) as f64 / 1.0e6,
+                cold_pipelines.cache_hits - cold_pipelines_before.cache_hits,
+                cold_pipelines.requests - cold_pipelines_before.requests,
+                cold_precomps.hits - cold_precomps_before.hits,
+                cold_precomps.misses - cold_precomps_before.misses,
                 cold_transfers.uploads - cold_transfers_before.uploads,
                 (cold_transfers.upload_bytes - cold_transfers_before.upload_bytes) as f64 / (1u64 << 20) as f64,
                 cold_transfers.readbacks - cold_transfers_before.readbacks,

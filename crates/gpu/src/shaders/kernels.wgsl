@@ -381,6 +381,145 @@ fn box_pass(gid: vec3<u32>, horizontal: bool) {
     }
 }
 
+// Sampled Gaussian for the RecursiveRaw kernel's <2.5 px path. The caller packs
+// the calibrated weights in P.f[1..5]; u[0] = (radius, vertical, clamp edges, _).
+fn gaussian_weight(index: u32) -> f32 {
+    return P.f[1u + index / 4u][index % 4u];
+}
+
+@compute @workgroup_size(16, 16)
+fn gaussian_sample(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let dims = out_dims();
+    let p = vec2<i32>(gid.xy);
+    if (p.x >= dims.x || p.y >= dims.y) { return; }
+    let radius = i32(P.u[0].x);
+    let vertical = P.u[0].y != 0u;
+    let clamp_edges = P.u[0].z != 0u;
+    var sum = vec4<f32>(0.0);
+    for (var i = -radius; i <= radius; i++) {
+        var q = p;
+        if (vertical) { q.y += i; } else { q.x += i; }
+        var pixel = tex_get(src, q.x, q.y);
+        if (clamp_edges) { pixel = tex_get_clamped(src, q.x, q.y); }
+        sum += pixel * gaussian_weight(u32(i + radius));
+    }
+    textureStore(out, p, sum);
+}
+
+// The CPU's small-sigma Gaussian uses f64 weights and accumulates taps in order before
+// rounding back to f32. Each weight is packed as a high/low f32 pair; double-single arithmetic
+// preserves that accumulation closely enough to retain the CPU's final f32 rounding.
+fn gaussian_exact_weight(index: u32) -> vec2<f32> {
+    let first = index * 2u;
+    let second = first + 1u;
+    return vec2<f32>(P.f[1u + first / 4u][first % 4u], P.f[1u + second / 4u][second % 4u]);
+}
+
+@compute @workgroup_size(16, 16)
+fn gaussian_sample_exact(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let dims = out_dims();
+    let p = vec2<i32>(gid.xy);
+    if (p.x >= dims.x || p.y >= dims.y) { return; }
+    let radius = i32(P.u[0].x);
+    let vertical = P.u[0].y != 0u;
+    let clamp_edges = P.u[0].z != 0u;
+    var sum_hi = vec4<f32>(0.0);
+    var sum_lo = vec4<f32>(0.0);
+    for (var tap = 0u; tap <= u32(radius * 2); tap++) {
+        let offset = i32(tap) - radius;
+        var q = p;
+        if (vertical) { q.y += offset; } else { q.x += offset; }
+        var pixel = tex_get(src, q.x, q.y);
+        if (clamp_edges) { pixel = tex_get_clamped(src, q.x, q.y); }
+        let weight = gaussian_exact_weight(tap);
+        let weight_hi = vec4<f32>(weight.x);
+        let product_hi = pixel * weight_hi;
+        let product_lo = fma(pixel, weight_hi, -product_hi) + pixel * vec4<f32>(weight.y);
+        let high = sum_hi + product_hi;
+        let bridge = high - sum_hi;
+        let error = (sum_hi - (high - bridge)) + (product_hi - bridge);
+        let tail = sum_lo + product_lo + error;
+        sum_hi = high + tail;
+        sum_lo = tail - (sum_hi - high);
+    }
+    textureStore(out, p, sum_hi + sum_lo);
+}
+
+fn gaussian_coord(line: i32, position: i32, vertical: bool) -> vec2<i32> {
+    if (vertical) { return vec2<i32>(line, position); }
+    return vec2<i32>(position, line);
+}
+
+// Young–van Vliet forward recurrence. One invocation owns a whole line so the feedback
+// remains sequential; the reverse pass reads this forward texture and writes the final result.
+// f[0] = (feedback0, feedback1, feedback2, gain); u[0] = (vertical, clamp edges, _, _).
+@compute @workgroup_size(1)
+fn gaussian_forward(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let dims = textureDimensions(src);
+    let vertical = P.u[0].x != 0u;
+    let line = i32(select(gid.y, gid.x, vertical));
+    let length = i32(select(dims.x, dims.y, vertical));
+    let line_count = i32(select(dims.y, dims.x, vertical));
+    if (line >= line_count || length <= 0) { return; }
+    let zero = vec4<f32>(0.0);
+    var left = zero;
+    if (P.u[0].y != 0u) {
+        left = textureLoad(src, gaussian_coord(line, 0, vertical), 0);
+    }
+    var state0 = zero;
+    var state1 = zero;
+    var state2 = zero;
+    for (var position = 0; position < length; position++) {
+        let pixel = textureLoad(src, gaussian_coord(line, position, vertical), 0);
+        let value = P.f[0].w * (pixel - left) + P.f[0].x * state0 + P.f[0].y * state1 + P.f[0].z * state2;
+        textureStore(out, gaussian_coord(line, position, vertical), value);
+        state2 = state1;
+        state1 = state0;
+        state0 = value;
+    }
+}
+
+// Young–van Vliet reverse recurrence with Triggs–Sdika boundary conditions. f[1..3] are
+// the rows of the 3×3 boundary matrix; aux is the original line for its edge values.
+@compute @workgroup_size(1)
+fn gaussian_backward(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let dims = textureDimensions(src);
+    let vertical = P.u[0].x != 0u;
+    let line = i32(select(gid.y, gid.x, vertical));
+    let length = i32(select(dims.x, dims.y, vertical));
+    let line_count = i32(select(dims.y, dims.x, vertical));
+    if (line >= line_count || length <= 0) { return; }
+    let zero = vec4<f32>(0.0);
+    var left = zero;
+    var right = zero;
+    if (P.u[0].y != 0u) {
+        left = textureLoad(aux, gaussian_coord(line, 0, vertical), 0);
+        right = textureLoad(aux, gaussian_coord(line, length - 1, vertical), 0);
+    }
+    let last0 = textureLoad(src, gaussian_coord(line, length - 1, vertical), 0);
+    var last1 = zero;
+    var last2 = zero;
+    if (length > 1) { last1 = textureLoad(src, gaussian_coord(line, length - 2, vertical), 0); }
+    if (length > 2) { last2 = textureLoad(src, gaussian_coord(line, length - 3, vertical), 0); }
+    let edge_delta = left - right;
+    var future0 = P.f[1].x * (last0 + edge_delta) + P.f[1].y * (last1 + edge_delta) + P.f[1].z * (last2 + edge_delta);
+    var future1 = P.f[2].x * (last0 + edge_delta) + P.f[2].y * (last1 + edge_delta) + P.f[2].z * (last2 + edge_delta);
+    var future2 = P.f[3].x * (last0 + edge_delta) + P.f[3].y * (last1 + edge_delta) + P.f[3].z * (last2 + edge_delta);
+    var position = length - 1;
+    loop {
+        if (position < length - 1) {
+            let forward = textureLoad(src, gaussian_coord(line, position, vertical), 0);
+            let value = P.f[0].w * (forward + edge_delta) + P.f[0].x * future0 + P.f[0].y * future1 + P.f[0].z * future2;
+            future2 = future1;
+            future1 = future0;
+            future0 = value;
+        }
+        textureStore(out, gaussian_coord(line, position, vertical), future0 + right);
+        if (position == 0) { break; }
+        position -= 1;
+    }
+}
+
 // u[0] = (radius, repeat edges, block); dispatched over (line, block).
 @compute @workgroup_size(64, 1)
 fn box_h(@builtin(global_invocation_id) gid: vec3<u32>) {

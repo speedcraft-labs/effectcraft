@@ -17,7 +17,7 @@ fn still(path: &str, w: u32, h: u32) -> Footage {
 
 fn seq(dir: &str, prefix: &str, start: u32, n: u32, digits: usize, suffix: &str, rate: FrameRate) -> Footage {
     let files: Vec<String> = (start..start + n).map(|k| format!("{dir}\\{prefix}{k:0digits$}{suffix}")).collect();
-    let mut f = Footage { kind: FootageKind::Sequence, frame_rate: rate, sequence: files.clone().into(), ..still(&files[0], 64, 48) };
+    let mut f = Footage { kind: FootageKind::Sequence, frame_rate: rate, sequence: files.clone(), ..still(&files[0], 64, 48) };
     f.sync_sequence_duration();
     f
 }
@@ -288,9 +288,7 @@ fn what_cannot_be_written_is_reported() {
     add_footage(&mut p, c, "bmp", still(r"C:\m\a.bmp", 8, 8));
     add_footage(&mut p, c, "ntsc", Footage { kind: FootageKind::Video, frame_rate: FrameRate::FPS_29_97, ..still(r"C:\m\a.mp4", 8, 8) });
     let mut gaps = seq(r"C:\m", "g_", 1, 3, 2, ".png", FrameRate::new(25, 1));
-    let mut gap_paths = gaps.sequence.to_vec();
-    gap_paths.remove(1);
-    gaps.sequence = gap_paths.into();
+    gaps.sequence.remove(1);
     add_footage(&mut p, c, "gaps", gaps);
     add_footage(&mut p, c, "nopath", still("", 8, 8));
     add_footage(&mut p, c, "mp3", Footage { kind: FootageKind::Audio, ..still(r"C:\m\a.mp3", 0, 0) });

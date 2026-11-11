@@ -1191,15 +1191,7 @@ mod tests {
         use effectcraft_engine::project::{Footage, FootageKind, ItemKind};
         let mut app = EffectcraftApp::new(effectcraft_engine::Session::default());
         let sequence: Vec<String> = ["/m/a_001.png", "/m/a_002.png", "/m/a_005.png"].map(String::from).to_vec();
-        let footage = Footage {
-            path: sequence[0].clone(),
-            kind: FootageKind::Sequence,
-            sequence: sequence.into(),
-            width: 4,
-            height: 4,
-            has_video: true,
-            ..Default::default()
-        };
+        let footage = Footage { path: sequence[0].clone(), kind: FootageKind::Sequence, sequence, width: 4, height: 4, has_video: true, ..Default::default() };
         let project = std::sync::Arc::make_mut(&mut app.session.project);
         let item = project.add_item("a_[001-005].png", Default::default(), None, ItemKind::Footage(footage));
         app.session.state.project_selection = vec![item];
