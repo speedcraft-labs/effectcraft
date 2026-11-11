@@ -11,13 +11,13 @@ fn out_dims() -> vec2<i32> {
 
 // Warp `src` by the inverse matrix (output pixel → source pixel) and blend over `aux`
 // (raster::composite_warp / accumulate_warp).
-// u[0] = (mode, sampling, seed, flags: 1 accumulate, 2 clear outside, 4 uniform solid)
-// f[0..3] = inverse rows; f[3] = (opacity, weight); f[4] = bounds; f[6] = solid color; f[7] = source size
+// u[0] = (mode, sampling, seed, flags: 1 accumulate, 2 clear outside bounds)
+// f[0..3] = inverse rows; f[3] = (opacity, weight); f[4] = bounds
 @compute @workgroup_size(16, 16)
 fn warp_blend(@builtin(global_invocation_id) gid: vec3<u32>) {
     let dims = out_dims();
-    let x = i32(gid.x + P.u[3].x);
-    let y = i32(gid.y + P.u[3].y);
+    let x = i32(gid.x);
+    let y = i32(gid.y);
     if (x >= dims.x || y >= dims.y) {
         return;
     }
@@ -46,10 +46,7 @@ fn warp_blend(@builtin(global_invocation_id) gid: vec3<u32>) {
         px = px / w;
         py = py / w;
     }
-    var sz = vec2<f32>(textureDimensions(src));
-    if ((flags & 4u) != 0u) {
-        sz = P.f[7].xy;
-    }
+    let sz = vec2<f32>(textureDimensions(src));
     let stencil = is_stencil(mode);
     if (px < -1.0 || py < -1.0 || px > sz.x + 1.0 || py > sz.y + 1.0) {
         if (stencil && (flags & 1u) == 0u) {
@@ -58,19 +55,7 @@ fn warp_blend(@builtin(global_invocation_id) gid: vec3<u32>) {
         store_q(vec2<i32>(x, y), d, P.f[3].z, P.f[3].w);
         return;
     }
-    let source_levels = P.f[5].x;
-    var s: vec4<f32>;
-    if ((flags & 4u) != 0u) {
-        var color = P.f[6];
-        if (source_levels > 0.0) {
-            color = quantize_px(color, source_levels, P.f[5].y);
-        }
-        s = sample_solid(color, sampling, px, py, vec2<i32>(sz));
-    } else if (source_levels > 0.0) {
-        s = sample_quantized(src, sampling, px, py, source_levels, P.f[5].y);
-    } else {
-        s = sample(src, sampling, px, py);
-    }
+    let s = sample(src, sampling, px, py);
     if ((flags & 1u) != 0u) {
         if (s.w > 0.0) {
             d = d + s * P.f[3].y;
@@ -207,57 +192,6 @@ fn quantize_px(s: vec4<f32>, levels: f32, inv: f32) -> vec4<f32> {
     return o;
 }
 
-fn tex_get_quantized(t: texture_2d<f32>, x: i32, y: i32, levels: f32, inv: f32) -> vec4<f32> {
-    return quantize_px(tex_get(t, x, y), levels, inv);
-}
-
-fn sample_bilinear_quantized(t: texture_2d<f32>, x: f32, y: f32, levels: f32, inv: f32) -> vec4<f32> {
-    let fx = x - 0.5;
-    let fy = y - 0.5;
-    let x0 = floor(fx);
-    let y0 = floor(fy);
-    let tx = fx - x0;
-    let ty = fy - y0;
-    let xi = i32(x0);
-    let yi = i32(y0);
-    let a = tex_get_quantized(t, xi, yi, levels, inv);
-    let b = tex_get_quantized(t, xi + 1, yi, levels, inv);
-    let c = tex_get_quantized(t, xi, yi + 1, levels, inv);
-    let d = tex_get_quantized(t, xi + 1, yi + 1, levels, inv);
-    let top = a + (b - a) * tx;
-    let bot = c + (d - c) * tx;
-    return top + (bot - top) * ty;
-}
-
-fn sample_bicubic_quantized(t: texture_2d<f32>, x: f32, y: f32, levels: f32, inv: f32) -> vec4<f32> {
-    let fx = x - 0.5;
-    let fy = y - 0.5;
-    let x0 = floor(fx);
-    let y0 = floor(fy);
-    let wx = cubic_w(fx - x0);
-    let wy = cubic_w(fy - y0);
-    let xi = i32(x0);
-    let yi = i32(y0);
-    var o = vec4<f32>(0.0);
-    for (var j = 0; j < 4; j++) {
-        for (var i = 0; i < 4; i++) {
-            let p = tex_get_quantized(t, xi - 1 + i, yi - 1 + j, levels, inv);
-            o += p * (wx[i] * wy[j]);
-        }
-    }
-    return max(o, vec4<f32>(0.0));
-}
-
-fn sample_quantized(t: texture_2d<f32>, sampling: u32, x: f32, y: f32, levels: f32, inv: f32) -> vec4<f32> {
-    if (sampling == 0u) {
-        return tex_get_quantized(t, i32(floor(x)), i32(floor(y)), levels, inv);
-    }
-    if (sampling == 2u) {
-        return sample_bicubic_quantized(t, x, y, levels, inv);
-    }
-    return sample_bilinear_quantized(t, x, y, levels, inv);
-}
-
 // Store a compositing result, clamped and quantised to `levels` when > 0 (8/16 bpc: the comp
 // after a layer, fused into the layer's composite).
 fn store_q(p: vec2<i32>, v: vec4<f32>, levels: f32, inv: f32) {
@@ -312,20 +246,10 @@ fn half(@builtin(global_invocation_id) gid: vec3<u32>) {
     let sx = 2 * p.x;
     let sy = 2 * p.y;
     var acc = vec4<f32>(0.0);
-    var a = tex_get_clamped(src, sx, sy);
-    var b = tex_get_clamped(src, sx + 1, sy);
-    var c = tex_get_clamped(src, sx, sy + 1);
-    var d = tex_get_clamped(src, sx + 1, sy + 1);
-    if (P.f[0].x > 0.0) {
-        a = quantize_px(a, P.f[0].x, P.f[0].y);
-        b = quantize_px(b, P.f[0].x, P.f[0].y);
-        c = quantize_px(c, P.f[0].x, P.f[0].y);
-        d = quantize_px(d, P.f[0].x, P.f[0].y);
-    }
-    acc += a;
-    acc += b;
-    acc += c;
-    acc += d;
+    acc += tex_get_clamped(src, sx, sy);
+    acc += tex_get_clamped(src, sx + 1, sy);
+    acc += tex_get_clamped(src, sx, sy + 1);
+    acc += tex_get_clamped(src, sx + 1, sy + 1);
     textureStore(out, p, acc * 0.25);
 }
 
