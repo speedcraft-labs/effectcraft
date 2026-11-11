@@ -666,7 +666,7 @@ struct Upload {
 
 #[derive(Default)]
 struct Uploads {
-    map: HashMap<usize, Upload>,
+    map: HashMap<(usize, bool), Upload>,
     bytes: usize,
     clock: u64,
 }
@@ -1779,52 +1779,32 @@ impl GpuContext {
         if let Some(t) = self.pictures.lock().ok().and_then(|mut p| p.get(img)) {
             return Some(t);
         }
-        let byte_len = img.data.len() * 4;
-        // write_texture copies this slice before returning; keep the high-water buffer for the next layer.
-        RGBA8_UPLOAD_SCRATCH.with(|scratch| {
-            let mut storage = scratch.borrow_mut();
-            if storage.len() < byte_len {
-                storage.resize(byte_len, 0);
+        let mut bytes = Vec::with_capacity(img.data.len() * 4);
+        for px in &img.data {
+            let a = if quantize { ((px[3].clamp(0.0, 1.0) * 255.0 + 0.5) as u32).min(255) as f32 / 255.0 } else { px[3] };
+            for value in [px[0], px[1], px[2], a] {
+                let v = if quantize { value.clamp(0.0, a) } else { value.clamp(0.0, 1.0) };
+                bytes.push((v * 255.0 + 0.5).clamp(0.0, 255.0) as u8);
             }
-            let bytes = &mut storage[..byte_len];
-            if quantize {
-                bytes.par_chunks_exact_mut(4).zip(img.data.par_iter()).with_min_len(4096).for_each(|(dst, px)| {
-                    let alpha = ((px[3].clamp(0.0, 1.0) * 255.0 + 0.5) as u32).min(255) as u8;
-                    let a = alpha as f32 / 255.0;
-                    // The input clamp bounds the scaled channel to [0, 255.5], and float-to-u8
-                    // conversion saturates at 255, so a second clamp is unnecessary.
-                    dst[0] = (px[0].clamp(0.0, a) * 255.0 + 0.5) as u8;
-                    dst[1] = (px[1].clamp(0.0, a) * 255.0 + 0.5) as u8;
-                    dst[2] = (px[2].clamp(0.0, a) * 255.0 + 0.5) as u8;
-                    dst[3] = alpha;
-                });
-            } else {
-                bytes.par_chunks_exact_mut(4).zip(img.data.par_iter()).with_min_len(4096).for_each(|(dst, px)| {
-                    dst[0] = (px[0].clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
-                    dst[1] = (px[1].clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
-                    dst[2] = (px[2].clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
-                    dst[3] = (px[3].clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
-                });
-            }
-            let texture = self.device.create_texture(&wgpu::TextureDescriptor {
-                label: Some("8-bit layer source"),
-                size: wgpu::Extent3d { width: img.width.max(1), height: img.height.max(1), depth_or_array_layers: 1 },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::Rgba8Unorm,
-                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::COPY_DST,
-                view_formats: &[],
-            });
-            self.transfers.count(true, byte_len);
-            self.queue.write_texture(
-                wgpu::TexelCopyTextureInfo { texture: &texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
-                bytes,
-                wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(img.width * 4), rows_per_image: Some(img.height) },
-                wgpu::Extent3d { width: img.width, height: img.height, depth_or_array_layers: 1 },
-            );
-            Some(GpuImage::new(texture, img.width, img.height))
-        })
+        }
+        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("8-bit layer source"),
+            size: wgpu::Extent3d { width: img.width.max(1), height: img.height.max(1), depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        self.transfers.count(true, bytes.len());
+        self.queue.write_texture(
+            wgpu::TexelCopyTextureInfo { texture: &texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            &bytes,
+            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(img.width * 4), rows_per_image: Some(img.height) },
+            wgpu::Extent3d { width: img.width, height: img.height, depth_or_array_layers: 1 },
+        );
+        Some(GpuImage::new(texture, img.width, img.height))
     }
 
     /// Entries in the layer upload cache.
@@ -1836,7 +1816,25 @@ impl GpuContext {
     /// Upload a (layer cache) buffer, reusing the texture while the same `Arc` is alive: static
     /// layers upload once, not every frame.
     pub(crate) fn upload_buf(&self, buf: &Arc<Buf>) -> Option<GpuImage> {
-        let key = Arc::as_ptr(buf) as usize;
+        self.upload_buf_format(buf, false, false)
+    }
+
+    /// Upload a project-quantized 8-bit layer source with one byte per channel.
+    pub(crate) fn upload_buf_8bit(&self, buf: &Arc<Buf>, quantize: bool) -> Option<GpuImage> {
+        self.upload_buf_format(buf, true, quantize)
+    }
+
+    fn upload_buf_format(&self, buf: &Arc<Buf>, rgba8: bool, quantize: bool) -> Option<GpuImage> {
+        if let Some(img) = self.cached_upload_buf(buf, rgba8) {
+            return Some(img);
+        }
+        let img = if rgba8 { self.upload_image_8bit(&buf.img, quantize)? } else { self.upload_image(&buf.img)? };
+        self.cache_upload_buf(buf, rgba8, img.clone());
+        Some(img)
+    }
+
+    fn cached_upload_buf(&self, buf: &Arc<Buf>, rgba8: bool) -> Option<GpuImage> {
+        let key = (Arc::as_ptr(buf) as usize, rgba8);
         if let Ok(mut u) = self.uploads.lock() {
             u.clock += 1;
             let now = u.clock;
@@ -1847,7 +1845,11 @@ impl GpuContext {
                 return Some(e.img.clone());
             }
         }
-        let img = self.upload_image(&buf.img)?;
+        None
+    }
+
+    fn cache_upload_buf(&self, buf: &Arc<Buf>, rgba8: bool, img: GpuImage) {
+        let key = (Arc::as_ptr(buf) as usize, rgba8);
         if let Ok(mut u) = self.uploads.lock() {
             let bytes = buf.img.data.len() * 16;
             let now = u.clock;
@@ -1859,7 +1861,7 @@ impl GpuContext {
             // makes a new one each time, and nothing can hit the old one again), then the least
             // recently used over budget.
             let budget = self.upload_budget();
-            let dead: Vec<usize> = u.map.iter().filter(|(_, e)| e.buf.strong_count() == 0).map(|(k, _)| *k).collect();
+            let dead: Vec<(usize, bool)> = u.map.iter().filter(|(_, e)| e.buf.strong_count() == 0).map(|(k, _)| *k).collect();
             for k in dead {
                 if let Some(e) = u.map.remove(&k) {
                     u.bytes -= e.bytes;
@@ -1929,6 +1931,17 @@ pub(crate) struct Enc<'g> {
     owner: u64,
     /// `owner` is lent ([`Enc::lent`]) and outlives this `Enc`.
     lent: bool,
+    /// Bounded memo for repeated, contentful static precomps in this frame.
+    static_comps: HashMap<effectcraft_render::CompFrameKey, GpuImage>,
+    static_comp_bytes: usize,
+    /// Bounded memo for duplicate plain footage layers in this frame.
+    footage_sources: HashMap<effectcraft_render::GpuFootageSourceKey, GpuImage>,
+    footage_source_bytes: usize,
+    /// Source images whose initial texture upload is encoded through one mapped staging buffer.
+    staged_uploads: HashMap<usize, StagedUpload>,
+    staged_to_copy: Vec<usize>,
+    staged_bytes: usize,
+    encoded_staged_bytes: usize,
 }
 
 /// Images bound to a compute kernel's source, optional auxiliary and output slots.
@@ -1969,7 +1982,177 @@ impl<'g> Enc<'g> {
     /// effect's intermediates stayed allocated until the frame ended.
     pub(crate) fn lent(g: &'g GpuContext) -> Enc<'g> {
         let owner = g.pool.lock().map(|mut p| p.lend()).unwrap_or(0);
-        Enc { g, enc: None, last_submit: None, pending: 0, missing: false, owner, lent: true }
+        let (uniform_buffer, uniform_stride, uniform_capacity, uniform_data) = Self::uniform_ring(g);
+        Enc {
+            g,
+            enc: None,
+            last_submit: None,
+            pending: 0,
+            missing: false,
+            owner,
+            uniform_buffer,
+            uniform_stride,
+            uniform_capacity,
+            uniform_data,
+            uniform_offset: 0,
+            lent: true,
+            static_comps: HashMap::new(),
+            static_comp_bytes: 0,
+            footage_sources: HashMap::new(),
+            footage_source_bytes: 0,
+            staged_uploads: HashMap::new(),
+            staged_to_copy: Vec::new(),
+            staged_bytes: 0,
+            encoded_staged_bytes: 0,
+        }
+    }
+
+    pub fn static_comp(&mut self, key: &effectcraft_render::CompFrameKey) -> Option<GpuImage> {
+        let image = self.static_comps.get(key).cloned();
+        let counter = if image.is_some() { &self.g.static_precomp_hits } else { &self.g.static_precomp_misses };
+        counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        image
+    }
+
+    pub fn cache_static_comp(&mut self, key: effectcraft_render::CompFrameKey, image: &GpuImage) {
+        let bytes = image.width as usize * image.height as usize * 16;
+        if bytes == 0 || bytes > STATIC_PRECOMP_CACHE_SINGLE || self.static_comps.contains_key(&key) {
+            return;
+        }
+        if self.static_comp_bytes.saturating_add(bytes) > STATIC_PRECOMP_CACHE_BYTES {
+            self.static_comps.clear();
+            self.static_comp_bytes = 0;
+        }
+        self.static_comps.insert(key, image.clone());
+        self.static_comp_bytes += bytes;
+    }
+
+    /// Upload a plain footage source once per stable item/frame key in this encoder.
+    pub fn upload_footage_source(&mut self, key: effectcraft_render::GpuFootageSourceKey, buf: &Arc<Buf>) -> Option<GpuImage> {
+        if let Some(image) = self.footage_sources.get(&key).cloned() {
+            self.uses(&image);
+            return Some(image);
+        }
+        let image = self.g.upload_buf(buf)?;
+        self.uses(&image);
+        let bytes = image.width as usize * image.height as usize * 16;
+        if bytes <= FRAME_SOURCE_CACHE_BYTES && self.footage_source_bytes.saturating_add(bytes) <= FRAME_SOURCE_CACHE_BYTES {
+            self.footage_sources.insert(key, image.clone());
+            self.footage_source_bytes += bytes;
+        }
+        Some(image)
+    }
+
+    /// Like [`Self::upload_footage_source`], but queue a buffer-to-texture copy through the
+    /// frame's staging batch. The renderer calls this before issuing the ordered layer draws.
+    pub fn stage_footage_source(&mut self, key: effectcraft_render::GpuFootageSourceKey, buf: &Arc<Buf>) -> Option<GpuImage> {
+        if let Some(image) = self.footage_sources.get(&key).cloned() {
+            self.uses(&image);
+            return Some(image);
+        }
+        let image = if key.is_static() { self.g.upload_buf(buf)? } else { self.stage_upload_buf(buf)? };
+        self.uses(&image);
+        let bytes = image.width as usize * image.height as usize * 16;
+        if bytes <= FRAME_SOURCE_CACHE_BYTES && self.footage_source_bytes.saturating_add(bytes) <= FRAME_SOURCE_CACHE_BYTES {
+            self.footage_sources.insert(key, image.clone());
+            self.footage_source_bytes += bytes;
+        }
+        Some(image)
+    }
+
+    /// Prepare an RGBA32Float source texture and defer its transfer until [`Self::flush_staged_uploads`].
+    pub fn stage_upload_buf(&mut self, buf: &Arc<Buf>) -> Option<GpuImage> {
+        if !self.g.fits(buf.img.width, buf.img.height) {
+            return None;
+        }
+        if let Some(image) = self.g.cached_upload_buf(buf, false) {
+            return Some(image);
+        }
+        let key = Arc::as_ptr(buf) as usize;
+        if let Some(upload) = self.staged_uploads.get(&key)
+            && Arc::ptr_eq(&upload.buf, buf)
+        {
+            return Some(upload.img.clone());
+        }
+        let row_bytes = buf.img.width as usize * 16;
+        let bytes_per_row = row_bytes.div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT as usize) * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT as usize;
+        let bytes = bytes_per_row.saturating_mul(buf.img.height as usize);
+        if self.encoded_staged_bytes.saturating_add(self.staged_bytes).saturating_add(bytes) > STAGED_UPLOAD_LIMIT
+            && (!self.staged_to_copy.is_empty() || self.encoded_staged_bytes > 0)
+        {
+            self.flush_staged_uploads();
+            self.submit();
+        }
+        let image = self.g.image(buf.img.width, buf.img.height);
+        self.g.transfers.count(true, buf.img.data.len() * 16);
+        self.staged_uploads.insert(key, StagedUpload { buf: buf.clone(), img: image.clone(), offset: 0, bytes_per_row: bytes_per_row as u32 });
+        self.staged_to_copy.push(key);
+        self.staged_bytes = self.staged_bytes.saturating_add(bytes);
+        if self.staged_bytes >= STAGED_UPLOAD_LIMIT {
+            self.flush_staged_uploads();
+        }
+        if self.encoded_staged_bytes >= STAGED_UPLOAD_LIMIT {
+            self.submit();
+        }
+        Some(image)
+    }
+
+    /// Record the pending source copies as one padded, mapped staging buffer.
+    pub fn flush_staged_uploads(&mut self) {
+        if self.staged_to_copy.is_empty() {
+            return;
+        }
+        let mut cursor = 0usize;
+        for key in &self.staged_to_copy {
+            let upload = self.staged_uploads.get_mut(key).expect("staged upload");
+            cursor = cursor.div_ceil(wgpu::COPY_BUFFER_ALIGNMENT as usize) * wgpu::COPY_BUFFER_ALIGNMENT as usize;
+            upload.offset = cursor as u64;
+            let rows = upload.bytes_per_row as usize * upload.img.height as usize;
+            cursor = cursor.saturating_add(rows);
+        }
+        let buffer = self.g.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("effectcraft batched source uploads"),
+            size: cursor.max(4) as u64,
+            usage: wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: true,
+        });
+        self.encoded_staged_bytes = self.encoded_staged_bytes.saturating_add(cursor);
+        {
+            let mut mapped = buffer.slice(..).get_mapped_range_mut().expect("mapped staging buffer");
+            for key in &self.staged_to_copy {
+                let upload = &self.staged_uploads[key];
+                let row_bytes = upload.img.width as usize * 16;
+                let stride = upload.bytes_per_row as usize;
+                let base = upload.offset as usize;
+                let source = bytemuck::cast_slice::<[f32; 4], u8>(&upload.buf.img.data);
+                for row in 0..upload.img.height as usize {
+                    let src = &source[row * row_bytes..(row + 1) * row_bytes];
+                    mapped.slice(base + row * stride..base + row * stride + row_bytes).copy_from_slice(src);
+                }
+            }
+        }
+        buffer.unmap();
+        let copies: Vec<_> = self
+            .staged_to_copy
+            .iter()
+            .map(|key| {
+                let upload = &self.staged_uploads[key];
+                (upload.img.texture.clone(), upload.offset, upload.bytes_per_row, upload.img.width, upload.img.height)
+            })
+            .collect();
+        let enc = self.encoder();
+        for (texture, offset, bytes_per_row, width, height) in copies {
+            enc.copy_buffer_to_texture(
+                wgpu::TexelCopyBufferInfo {
+                    buffer: &buffer,
+                    layout: wgpu::TexelCopyBufferLayout { offset, bytes_per_row: Some(bytes_per_row), rows_per_image: Some(height) },
+                },
+                wgpu::TexelCopyTextureInfo { texture: &texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+                wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+            );
+        }
+        self.staged_to_copy.clear();
+        self.staged_bytes = 0;
     }
 
     /// `img` is used by this `Enc`: if another `Enc` made it, that one must not reuse it at once
@@ -2161,6 +2344,10 @@ impl<'g> Enc<'g> {
                 p.close(id);
             }
         }
+        for (_, upload) in std::mem::take(&mut self.staged_uploads) {
+            self.g.cache_upload_buf(&upload.buf, false, upload.img);
+        }
+        self.encoded_staged_bytes = 0;
         self.pending = 0;
     }
 

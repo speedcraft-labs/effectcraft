@@ -76,12 +76,99 @@ fn on_cpu(e: &mut Enc, canvas: &mut GpuImage, f: impl FnOnce(&mut Image)) -> Opt
 fn draw_comp<'a>(e: &mut Enc, r: &Renderer<'a>, ctx: &EvalCtx<'a>, canvas: &mut GpuImage) -> Option<()> {
     let visible = r.visible_layers(ctx);
     let levels = r.pipe().levels;
+    // Quantizing uploaded texels is equivalent to quantizing CPU-rendered sources only when
+    // the renderer is already in the blending space. A color-space conversion must keep its
+    // full-precision input until after conversion.
+    // Preserve RGBA32Float filtering until compact uploads reproduce the baseline hash exactly.
+    let compact_8bit_sources = false;
     let mut i = 0;
     while i < visible.len() {
         // A device that ran out of memory (or was lost) on an earlier layer fails every later
         // one: give the frame back to the CPU now instead of drawing the rest of the comp.
         e.g.check_health().ok()?;
-        if visible[i].is_3d() {
+        if occluded[i] {
+            i += 1;
+            continue;
+        }
+        if r.can_prepare_gpu_layer(visible[i]) {
+            let mut end = i + 1;
+            while end < visible.len() && r.can_prepare_gpu_layer(visible[end]) {
+                end += 1;
+            }
+            if end - i >= 16 {
+                const BATCH: usize = 32;
+                let mut ping_pong: Option<PingPongCanvas> = None;
+                for start in (i..end).step_by(BATCH) {
+                    let stop = (start + BATCH).min(end);
+                    let prepared = r.prepare_gpu_layer_batch(ctx, &visible[start..stop], &occluded[start..stop], canvas.width, canvas.height)?;
+                    let mut uploaded = vec![None; prepared.len()];
+                    for (offset, st) in prepared.iter().enumerate() {
+                        let Some(st) = st.as_ref() else { continue };
+                        let layer = visible[start + offset];
+                        if !st.plain || r.layer_opacity(ctx, layer) <= 0.0 || st.solid_color.is_some() {
+                            continue;
+                        }
+                        let placement = r.placement(ctx, layer, &st.body);
+                        if !matches!(placement.matrices.as_slice(), [_]) {
+                            continue;
+                        }
+                        let key = r.gpu_footage_source_key(ctx, layer, st.quantize_source());
+                        uploaded[offset] = Some(if let Some(key) = key { e.stage_footage_source(key, &st.body)? } else { e.stage_upload_buf(&st.body)? });
+                    }
+                    e.flush_staged_uploads();
+                    for (offset, st) in prepared.into_iter().enumerate() {
+                        e.g.check_health().ok()?;
+                        let Some(st) = st else { continue };
+                        let layer = visible[start + offset];
+                        let opacity = r.layer_opacity(ctx, layer);
+                        let quantize_source = st.quantize_source() || compact_8bit_sources;
+                        let prepared_by_ping_pong = if st.plain && opacity > 0.0 {
+                            let placement = r.placement(ctx, layer, &st.body);
+                            if let [matrix] = placement.matrices.as_slice() {
+                                let ping_pong = ping_pong.get_or_insert_with(|| PingPongCanvas::new(e, canvas));
+                                let opts = ops::WarpOptions { sampling: placement.sampling, mode: layer.blend_mode, opacity, seed: placement.seed };
+                                if let (Some(color), Some(size)) = (st.solid_color, st.solid_size) {
+                                    ping_pong.draw_solid(e, color, size, matrix, opts, levels, quantize_source)
+                                } else {
+                                    let src = if compact_8bit_sources {
+                                        e.g.upload_buf_8bit(&st.body, st.quantize_source())?
+                                    } else if let Some(src) = uploaded[offset].take() {
+                                        src
+                                    } else if let Some(key) = r.gpu_footage_source_key(ctx, layer, st.quantize_source()) {
+                                        e.upload_footage_source(key, &st.body)?
+                                    } else {
+                                        e.g.upload_buf(&st.body)?
+                                    };
+                                    ping_pong.draw(e, &src, matrix, opts, levels, quantize_source)
+                                }
+                            } else {
+                                false
+                            }
+                        } else {
+                            false
+                        };
+                        if !prepared_by_ping_pong && let Some(ping_pong) = ping_pong.take() {
+                            ping_pong.finish(canvas);
+                        }
+                        let full_quantize = if prepared_by_ping_pong {
+                            e.mem_gate();
+                            false
+                        } else {
+                            !draw_prepared_layer(e, r, ctx, layer, canvas, st)?
+                        };
+                        if full_quantize && let Some(l) = levels {
+                            *canvas = ops::quantize(e, canvas, l);
+                        }
+                    }
+                }
+                if let Some(ping_pong) = ping_pong {
+                    ping_pong.finish(canvas);
+                }
+                i = end;
+                continue;
+            }
+        }
+        let full_quantize = if visible[i].is_3d() {
             let mut j = i;
             while j < visible.len() && visible[j].is_3d() {
                 j += 1;
