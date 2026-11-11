@@ -188,7 +188,6 @@ fn gaussian_legacy(e: &mut Enc, ctx: &EffectCtx, mut b: GBuf) -> Option<GBuf> {
         2 => (0.0, 1.0),
         _ => (1.0, 1.0),
     };
-    // Small sigmas use the CPU's sampled kernel (#1939).
     if effectcraft_raster::gaussian_is_exact(s * kx, s * ky) {
         return None;
     }

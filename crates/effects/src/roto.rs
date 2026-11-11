@@ -27,6 +27,7 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
 
+use craft_resample::{NearestAlignment, resize_nearest};
 use effectcraft_keyframe::Value;
 use effectcraft_project::ParamUi;
 use effectcraft_raster::Image;
@@ -901,6 +902,13 @@ pub fn resample(s: &FrameSeg, w: usize, h: usize) -> FrameSeg {
     }
     let mut out = FrameSeg { w, h, matte: vec![0; w * h], refine: vec![0; w * h], fg: s.fg.clone(), bg: s.bg.clone() };
     if s.w == 0 || s.h == 0 {
+        return out;
+    }
+    if let (Some(matte), Some(refine)) =
+        (resize_nearest(&s.matte, [s.w, s.h], [w, h], 1, NearestAlignment::Center), resize_nearest(&s.refine, [s.w, s.h], [w, h], 1, NearestAlignment::Center))
+    {
+        out.matte = matte;
+        out.refine = refine;
         return out;
     }
     for y in 0..h {

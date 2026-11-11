@@ -25,6 +25,6 @@ serde_json = { workspace = true }
 log = { workspace = true }
 chrono = { workspace = true }
 
-
 [dev-dependencies]
 image = { workspace = true, features = ["png"] }
+
