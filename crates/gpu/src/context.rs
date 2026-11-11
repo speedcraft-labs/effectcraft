@@ -136,9 +136,12 @@ const UPLOAD_OWNER: u64 = 0;
 /// Readback staging buffers kept for reuse across sizes (bytes).
 const STAGING_BUDGET: u64 = 256 << 20;
 
-/// A GPU image: premultiplied RGBA f32 in a texture (cheap to clone; immutable once written).
-/// Working images come from the context's texture pool and go back to it when the last clone
-/// is dropped.
+/// Per-frame cache for rasters of repeated static precomps.
+const STATIC_PRECOMP_CACHE_BYTES: usize = 256 << 20;
+const STATIC_PRECOMP_CACHE_SINGLE: usize = 32 << 20;
+
+/// A GPU image (cheap to clone; immutable once written). Working images use premultiplied RGBA
+/// f32; an exact 8-bit layer upload may use RGBA8Unorm.
 #[derive(Clone, Debug)]
 pub struct GpuImage {
     pub texture: wgpu::Texture,
@@ -1922,9 +1925,6 @@ pub(crate) struct Enc<'g> {
     /// Bounded memo for repeated, contentful static precomps in this frame.
     static_comps: HashMap<effectcraft_render::CompFrameKey, GpuImage>,
     static_comp_bytes: usize,
-    /// Bounded memo for duplicate plain footage layers in this frame.
-    footage_sources: HashMap<effectcraft_render::GpuFootageSourceKey, GpuImage>,
-    footage_source_bytes: usize,
 }
 
 /// Images bound to a compute kernel's source, optional auxiliary and output slots.
@@ -1969,8 +1969,6 @@ impl<'g> Enc<'g> {
             lent: false,
             static_comps: HashMap::new(),
             static_comp_bytes: 0,
-            footage_sources: HashMap::new(),
-            footage_source_bytes: 0,
         }
     }
 
@@ -1999,8 +1997,6 @@ impl<'g> Enc<'g> {
             lent: true,
             static_comps: HashMap::new(),
             static_comp_bytes: 0,
-            footage_sources: HashMap::new(),
-            footage_source_bytes: 0,
         }
     }
 
@@ -2022,22 +2018,6 @@ impl<'g> Enc<'g> {
         }
         self.static_comps.insert(key, image.clone());
         self.static_comp_bytes += bytes;
-    }
-
-    /// Upload a plain footage source once per stable item/frame key in this encoder.
-    pub fn upload_footage_source(&mut self, key: effectcraft_render::GpuFootageSourceKey, buf: &Arc<Buf>) -> Option<GpuImage> {
-        if let Some(image) = self.footage_sources.get(&key).cloned() {
-            self.uses(&image);
-            return Some(image);
-        }
-        let image = self.g.upload_buf(buf)?;
-        self.uses(&image);
-        let bytes = image.width as usize * image.height as usize * 16;
-        if bytes <= FRAME_SOURCE_CACHE_BYTES && self.footage_source_bytes.saturating_add(bytes) <= FRAME_SOURCE_CACHE_BYTES {
-            self.footage_sources.insert(key, image.clone());
-            self.footage_source_bytes += bytes;
-        }
-        Some(image)
     }
 
     /// `img` is used by this `Enc`: if another `Enc` made it, that one must not reuse it at once

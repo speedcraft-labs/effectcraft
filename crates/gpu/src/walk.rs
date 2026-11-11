@@ -115,13 +115,8 @@ fn draw_comp<'a>(e: &mut Enc, r: &Renderer<'a>, ctx: &EvalCtx<'a>, canvas: &mut 
                                 if let (Some(color), Some(size)) = (st.solid_color, st.solid_size) {
                                     ping_pong.draw_solid(e, color, size, matrix, opts, levels, quantize_source)
                                 } else {
-                                    let src = if compact_8bit_sources {
-                                        e.g.upload_buf_8bit(&st.body, st.quantize_source())?
-                                    } else if let Some(key) = r.gpu_footage_source_key(ctx, layer, st.quantize_source()) {
-                                        e.upload_footage_source(key, &st.body)?
-                                    } else {
-                                        e.g.upload_buf(&st.body)?
-                                    };
+                                    let src =
+                                        if compact_8bit_sources { e.g.upload_buf_8bit(&st.body, st.quantize_source())? } else { e.g.upload_buf(&st.body)? };
                                     ping_pong.draw(e, &src, matrix, opts, levels, quantize_source)
                                 }
                             } else {
