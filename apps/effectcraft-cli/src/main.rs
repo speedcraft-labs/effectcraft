@@ -217,6 +217,7 @@ const FLAGS: &[&str] = &[
     "--demo",
     "--empty",
     "--gpu",
+    "--gpu-only",
     "--list",
     "--schemas",
     "--enabled",
@@ -225,10 +226,10 @@ const FLAGS: &[&str] = &[
     "--work-area",
     "--queue",
     "--ops",
+    "--realistic",
     "--roto",
     "--small",
     "--adv3d",
-    "--gpu-only",
     "--autosave",
     "--keep-going",
     "--progress",
@@ -1076,7 +1077,7 @@ fn bench_cmd(args: &Args) -> Result<(), Failure> {
     if let Some(c) = args.opt("--comp") {
         s.execute("comp.open", json!({"comp": c})).map_err(|e| Failure::Error(e.to_string()))?;
     }
-    if args.flag("--gpu") || args.flag("--gpu-only") {
+    if args.flag("--gpu") {
         return bench_gpu(&s, args);
     }
     let cid = s.active_comp_id().ok_or_else(|| Failure::Error("no composition".into()))?;
@@ -1217,7 +1218,11 @@ fn bench_ops(args: &Args) -> Result<(), Failure> {
     if let Some(n) = args.num("--footage")? {
         spec.footage = n.max(0.0) as usize;
     }
+    if args.flag("--realistic") {
+        spec.realistic = true;
+    }
     let dir = std::env::temp_dir().join(format!("effectcraft-bench-ops-{}", std::process::id()));
+    let keep_bench_file = std::env::var_os("EFFECTCRAFT_KEEP_BENCH_FILE").is_some();
     std::fs::create_dir_all(&dir).map_err(|e| Failure::Error(format!("{}: {e}", dir.display())))?;
     if let Some(measure) = args.opt("--measure") {
         if !matches!(measure, "open" | "firstFrame") {
@@ -1233,7 +1238,11 @@ fn bench_ops(args: &Args) -> Result<(), Failure> {
         } else if let Some(x) = m.first() {
             say!("{}: {:.2} ms ({})", x.name, x.ms, x.note);
         }
-        let _ = std::fs::remove_dir_all(&dir);
+        if keep_bench_file {
+            eprintln!("bench fixture retained at {}", dir.display());
+        } else {
+            let _ = std::fs::remove_dir_all(&dir);
+        }
         return Ok(());
     }
     let t0 = std::time::Instant::now();
@@ -1249,7 +1258,11 @@ fn bench_ops(args: &Args) -> Result<(), Failure> {
         }
         s
     }));
-    let _ = std::fs::remove_dir_all(&dir);
+    if keep_bench_file {
+        eprintln!("bench fixture retained at {}", dir.display());
+    } else {
+        let _ = std::fs::remove_dir_all(&dir);
+    }
     if args.flag("--json") {
         emit(&json!({"spec": format!("{spec:?}"), "measures": m.iter().map(perf::Measure::json).collect::<Vec<_>>()}), true);
     } else {
@@ -1527,7 +1540,9 @@ fn adv3d_bench_comp(p: &mut effectcraft_engine::project::Project) -> Option<Item
 /// warm; "up/dn MB" are the GPU's uploads / readbacks per warm GPU frame.
 fn bench_gpu(s: &Session, args: &Args) -> Result<(), Failure> {
     use effectcraft_render::Backend;
+    let gpu_init_start = std::time::Instant::now();
     let gpu = effectcraft_gpu::Gpu::try_headless().map_err(|e| Failure::Error(format!("--gpu: no usable GPU adapter ({e})")))?;
+    let gpu_init_ms = gpu_init_start.elapsed().as_secs_f64() * 1000.0;
     let n = args.num("--n")?.unwrap_or(10.0).max(1.0) as usize;
     // Every comp, plus an adjustment-layer comp built for the benchmark (the main comp under a
     // full-frame adjustment layer with a GPU effect stack) and an Advanced 3D comp (`--adv3d`:
@@ -1545,22 +1560,42 @@ fn bench_gpu(s: &Session, args: &Args) -> Result<(), Failure> {
         }
     };
     let project = &project;
+    note!("GPU: {} — median of {n} runs (ms/frame)", effectcraft_render::Accelerator::name(&gpu));
+    note!("GPU init (adapter + eager pipelines): {gpu_init_ms:.2} ms");
     if args.flag("--gpu-only") {
         let Some(cid) = comps.first().copied() else { return Ok(()) };
         let Some(comp) = project.comp(cid) else { return Ok(()) };
         let t = Tick::from_seconds_f64(args.num("--time")?.unwrap_or(3.0).min(comp.duration.seconds() * 0.5));
         let scale = args.num("--scale")?.unwrap_or(1.0);
-        let mut renderer = Renderer::new(project, s.footage.as_ref(), RenderOpts { scale, backend: Backend::Gpu, ..Default::default() });
-        renderer.expr = s.expr.as_deref();
-        renderer.accel = Some(&gpu);
+        let mut r = Renderer::new(project, s.footage.as_ref(), RenderOpts { scale, backend: Backend::Gpu, ..Default::default() });
+        r.expr = s.expr.as_deref();
+        r.accel = Some(&gpu);
+        let transfers = gpu.context().transfer_stats();
+        let pool = gpu.context().pool_stats();
         let start = std::time::Instant::now();
-        let frame = renderer.comp_frame(cid, t);
+        let frame = r.comp_frame(cid, t);
         let first_frame_ms = start.elapsed().as_secs_f64() * 1000.0;
         gpu.wait();
-        note!("GPU-only first frame: {}x{} {first_frame_ms:.2} ms", frame.width, frame.height);
+        let pixel_hash = frame
+            .data
+            .iter()
+            .flatten()
+            .flat_map(|channel| channel.to_bits().to_le_bytes())
+            .fold(0xcbf29ce484222325, |hash, byte| (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3));
+        let transfers_after = gpu.context().transfer_stats();
+        let pool_after = gpu.context().pool_stats();
+        note!("GPU-only first frame: {}x{} {first_frame_ms:.2} ms, hash {pixel_hash:016x}", frame.width, frame.height);
+        note!(
+            "  uploads {} ({:.1} MB), readbacks {} ({:.1} MB), texture pool {}/{} hits/misses",
+            transfers_after.uploads - transfers.uploads,
+            (transfers_after.upload_bytes - transfers.upload_bytes) as f64 / (1u64 << 20) as f64,
+            transfers_after.readbacks - transfers.readbacks,
+            (transfers_after.readback_bytes - transfers.readback_bytes) as f64 / (1u64 << 20) as f64,
+            pool_after.0 - pool.0,
+            pool_after.1 - pool.1,
+        );
         return Ok(());
     }
-    note!("GPU: {} — median of {n} runs (ms/frame)", effectcraft_render::Accelerator::name(&gpu));
     note!(
         "{:<28} {:>5} {:>10} {:>9} {:>9} {:>9} {:>9} {:>9} {:>8} {:>9} {:>9} {:>11}",
         "comp",
@@ -1591,9 +1626,13 @@ fn bench_gpu(s: &Session, args: &Args) -> Result<(), Failure> {
             let cpu_cold = time_ms(n, || {
                 std::hint::black_box(mk(Backend::Cpu, None));
             });
+            let cold_transfers_before = gpu.context().transfer_stats();
+            let cold_pool_before = gpu.context().pool_stats();
             let gpu_cold = time_ms(n, || {
                 std::hint::black_box(mk(Backend::Gpu, None));
             });
+            let cold_transfers = gpu.context().transfer_stats();
+            let cold_pool = gpu.context().pool_stats();
             let cache = LayerCache::default();
             let cpu_warm = time_ms(n, || {
                 std::hint::black_box(mk(Backend::Cpu, Some(&cache)));
@@ -1639,10 +1678,27 @@ fn bench_gpu(s: &Session, args: &Args) -> Result<(), Failure> {
                 })
                 .count();
             let pct = 100.0 * off as f64 / a.data.len().max(1) as f64;
+            let pixel_hash = |data: &[[f32; 4]]| {
+                data.iter()
+                    .flatten()
+                    .flat_map(|channel| channel.to_bits().to_le_bytes())
+                    .fold(0xcbf29ce484222325, |hash, byte| (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3))
+            };
+            let (cpu_hash, gpu_hash) = (pixel_hash(&a.data), pixel_hash(&b.data));
             let speedup = cpu_warm / gpu_warm.max(1e-9);
             note!(
                 "{name:<28} {label:>5} {size:>10} {cpu_cold:>9.2} {gpu_cold:>9.2} {cpu_warm:>9.2} {gpu_warm:>9.2} {view:>9.2} {speedup:>7.2}x {auto:>9.2} {pct:>8.3}% {traffic:>11}"
             );
+            note!(
+                "  cold profile: uploads {} ({:.1} MB), readbacks {} ({:.1} MB), texture pool {}/{} hits/misses",
+                cold_transfers.uploads - cold_transfers_before.uploads,
+                (cold_transfers.upload_bytes - cold_transfers_before.upload_bytes) as f64 / (1u64 << 20) as f64,
+                cold_transfers.readbacks - cold_transfers_before.readbacks,
+                (cold_transfers.readback_bytes - cold_transfers_before.readback_bytes) as f64 / (1u64 << 20) as f64,
+                cold_pool.0 - cold_pool_before.0,
+                cold_pool.1 - cold_pool_before.1,
+            );
+            note!("  output hash: cpu {cpu_hash:016x}; gpu {gpu_hash:016x}; exact pixels match: {}", a.data == b.data);
         }
     }
     Ok(())
