@@ -620,11 +620,7 @@ impl Project {
             comp_times: Option<serde_json::Value>,
         }
 
-        #[cfg(not(target_arch = "wasm32"))]
-        let parsed = simd_json::serde::from_slice::<ProjectFile>(bytes);
-        #[cfg(target_arch = "wasm32")]
-        let parsed = serde_json::from_slice::<ProjectFile>(bytes);
-        let file = parsed.map_err(|e| ProjectError::Invalid(e.to_string()))?;
+        let file: ProjectFile = serde_json::from_slice(bytes).map_err(|e| ProjectError::Invalid(e.to_string()))?;
         let saved_by = file.saved_by.as_ref().and_then(serde_json::Value::as_str).map(str::to_string);
         let view = SavedView {
             active_comp: file.active_comp.as_ref().and_then(serde_json::Value::as_u64).map(ItemId),
