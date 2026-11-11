@@ -17,6 +17,52 @@ use effectcraft_time::Tick;
 use crate::context::{Enc, GpuImage};
 use crate::ops;
 
+/// Two canvases whose pixels differ only in `dirty`; ordinary bounded layers can copy that
+/// rectangle forward, then update their own dispatch area in the next canvas.
+struct PingPongCanvas {
+    images: [GpuImage; 2],
+    front: usize,
+    dirty: Option<(u32, u32, u32, u32)>,
+}
+
+impl PingPongCanvas {
+    fn new(e: &mut Enc, canvas: &GpuImage) -> Self {
+        let mut a = e.scratch(canvas.width, canvas.height);
+        let mut b = e.scratch(canvas.width, canvas.height);
+        e.copy_image(canvas, &a);
+        e.copy_image(canvas, &b);
+        a.levels = canvas.levels;
+        b.levels = canvas.levels;
+        Self { images: [a, b], front: 0, dirty: None }
+    }
+
+    fn draw(
+        &mut self,
+        e: &mut Enc,
+        src: &GpuImage,
+        matrix: &effectcraft_geom::Mat3,
+        opts: ops::WarpOptions,
+        levels: Option<f32>,
+        quantize_source: bool,
+    ) -> bool {
+        let next = 1 - self.front;
+        let current = self.images[self.front].clone();
+        match ops::warp_q_pingpong(e, &current, &mut self.images[next], src, matrix, opts, levels, self.dirty, quantize_source) {
+            ops::PingPongWarp::Unsupported => false,
+            ops::PingPongWarp::Unchanged => true,
+            ops::PingPongWarp::Drawn(region) => {
+                self.front = next;
+                self.dirty = Some(region);
+                true
+            }
+        }
+    }
+
+    fn finish(self, canvas: &mut GpuImage) {
+        *canvas = self.images[self.front].clone();
+    }
+}
+
 /// The size [`render`] renders `comp_id` at, without rendering it.
 pub(crate) fn frame_size(r: &Renderer, comp_id: ItemId, t: Tick) -> Option<(u32, u32)> {
     let ctx = r.eval_ctx(comp_id, t)?;
@@ -109,15 +155,16 @@ fn draw_comp<'a>(e: &mut Enc, r: &Renderer<'a>, ctx: &EvalCtx<'a>, canvas: &mut 
                         let prepared_by_ping_pong = if st.plain && opacity > 0.0 {
                             let placement = r.placement(ctx, layer, &st.body);
                             if let [matrix] = placement.matrices.as_slice() {
+                                let src = if compact_8bit_sources { e.g.upload_buf_8bit(&st.body, st.quantize_source())? } else { e.g.upload_buf(&st.body)? };
                                 let ping_pong = ping_pong.get_or_insert_with(|| PingPongCanvas::new(e, canvas));
-                                let opts = ops::WarpOptions { sampling: placement.sampling, mode: layer.blend_mode, opacity, seed: placement.seed };
-                                if let (Some(color), Some(size)) = (st.solid_color, st.solid_size) {
-                                    ping_pong.draw_solid(e, color, size, matrix, opts, levels, quantize_source)
-                                } else {
-                                    let src =
-                                        if compact_8bit_sources { e.g.upload_buf_8bit(&st.body, st.quantize_source())? } else { e.g.upload_buf(&st.body)? };
-                                    ping_pong.draw(e, &src, matrix, opts, levels, quantize_source)
-                                }
+                                ping_pong.draw(
+                                    e,
+                                    &src,
+                                    matrix,
+                                    ops::WarpOptions { sampling: placement.sampling, mode: layer.blend_mode, opacity, seed: placement.seed },
+                                    levels,
+                                    quantize_source,
+                                )
                             } else {
                                 false
                             }

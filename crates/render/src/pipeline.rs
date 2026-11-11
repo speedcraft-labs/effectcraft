@@ -1023,6 +1023,176 @@ impl<'a> Renderer<'a> {
         }
     }
 
+    /// Parallel source processing is safe when every layer can be prepared without reading the
+    /// current comp canvas. The row batch below keeps each output pixel's layer order intact.
+    fn can_prepare_layers_parallel(&self) -> bool {
+        self.depth == 0
+            && self.profile.is_none()
+            && self.active_accel().is_none()
+            && self.opts.roi.is_none()
+            && self.opts.view.is_none()
+            && self.outer.is_none()
+            && self.collapse3d.is_none()
+            && self.inherited.is_none()
+            && !self.through_lost
+            && self.through.iter().all(Option::is_none)
+    }
+
+    fn can_prepare_layer(&self, layer: &Layer) -> bool {
+        !layer.is_3d()
+            && !layer.switches.adjustment
+            && !layer.switches.collapse
+            && !layer.preserve_transparency
+            && layer.track_matte.is_none()
+            && layer.parent.is_none()
+            && !layer.blend_mode.is_stencil()
+            && self.quality(layer) != Quality::Wireframe
+            && !props_have_expression(&layer.props, 0)
+    }
+
+    /// Whether this top-level 2D layer can have its CPU pixels prepared in parallel for a GPU
+    /// compositor. The workers only build ordinary layer buffers; all GPU calls remain on the
+    /// compositor thread.
+    pub fn can_prepare_gpu_layer(&self, layer: &Layer) -> bool {
+        self.depth == 0
+            && self.profile.is_none()
+            && self.opts.roi.is_none()
+            && self.opts.view.is_none()
+            && self.outer.is_none()
+            && self.collapse3d.is_none()
+            && self.inherited.is_none()
+            && !self.through_lost
+            && self.through.iter().all(Option::is_none)
+            && self.can_prepare_layer(layer)
+            && !matches!(layer.source, LayerSource::Comp { .. })
+            && !(layer.switches.effects && layer.effects().is_some_and(|fx| !fx.children.is_empty()))
+    }
+
+    /// Prepare a bounded batch in parallel for an accelerator that still composites each layer
+    /// in stack order. The CPU-only renderer clone keeps worker tasks away from the GPU backend.
+    pub fn prepare_gpu_layer_batch(&self, ctx: &EvalCtx, layers: &[&Layer], occluded: &[bool], width: u32, height: u32) -> Option<Vec<Option<StyledLayer>>> {
+        if layers.len() != occluded.len() || layers.iter().any(|layer| !self.can_prepare_gpu_layer(layer)) {
+            return None;
+        }
+        let mut cpu = self.clone();
+        cpu.accel = None;
+        let mut unquantized = cpu.clone();
+        unquantized.pipe.levels = None;
+        Some(
+            layers
+                .par_iter()
+                .zip(occluded.par_iter())
+                .map(|(&layer, &skip)| {
+                    if skip || cpu.layer_opacity(ctx, layer) <= 0.0 || cpu.layer_outside_canvas(ctx, layer, width, height) {
+                        return None;
+                    }
+                    // With no layer cache, plain layers can upload their masked source directly;
+                    // the GPU quantizes each source texel before sampling, matching the CPU's
+                    // pre-transform quantization while avoiding a full CPU image pass. Preserve
+                    // the regular path whenever cached buffers, styles, motion blur or a blend
+                    // space conversion make that ordering observable elsewhere.
+                    let defer_quantize = self.cache.is_none()
+                        && self.pipe.levels.is_some()
+                        && self.pipe.to_blend().is_none()
+                        && !cpu.mb_on(ctx, layer)
+                        && !styles::active(ctx, layer);
+                    let renderer = if defer_quantize { &unquantized } else { &cpu };
+                    renderer.styled_for_draw(ctx, layer, None).map(|mut st| {
+                        st.quantize_source = defer_quantize;
+                        renderer.styled_to_blend(st)
+                    })
+                })
+                .collect(),
+        )
+    }
+
+    /// Prepare bounded batches so a 5,000-layer frame never retains thousands of full layer
+    /// buffers at once. The source pass is parallel; affine rows then visit the prepared layers
+    /// in stack order, so every pixel sees the same blend and quantisation sequence.
+    fn draw_comp_parallel_prepared(&self, ctx: &EvalCtx<'a>, layers: &[&Layer], occluded: &[bool], canvas: &mut Image, blank: &mut bool) {
+        const BATCH: usize = 32;
+        for start in (0..layers.len()).step_by(BATCH) {
+            let end = (start + BATCH).min(layers.len());
+            let prepared: Vec<_> = layers[start..end]
+                .par_iter()
+                .enumerate()
+                .map(|(offset, layer)| {
+                    if occluded[start + offset] || self.layer_outside_canvas(ctx, layer, canvas.width, canvas.height) {
+                        return None;
+                    }
+                    let opacity = ctx.opacity(layer) as f32 * self.opacity_mul;
+                    if opacity <= 0.0 || self.empty_precomp(ctx, layer) {
+                        return None;
+                    }
+                    self.styled_for_draw(ctx, layer, None).map(|st| (self.styled_to_blend(st), opacity))
+                })
+                .collect();
+
+            let row_plans: Option<Vec<_>> = if canvas.width > 0 {
+                prepared
+                    .par_iter()
+                    .zip(layers[start..end].par_iter())
+                    .enumerate()
+                    .map(|(offset, (prepared, layer))| -> Option<Option<_>> {
+                        let Some((st, opacity)) = prepared else { return Some(None) };
+                        if !st.plain {
+                            return None;
+                        }
+                        let placement = self.placement(ctx, layer, &st.body);
+                        let [matrix] = placement.matrices.as_slice() else { return None };
+                        let layer_blank = *blank && offset == 0;
+                        let footprint = self.footprint(ctx, layer, &st.body, *opacity, layer_blank);
+                        let quantize = if footprint == Region::Empty { None } else { self.pipe.levels };
+                        let opts = WarpOpts { sampling: placement.sampling, opacity: *opacity, mode: layer.blend_mode, seed: layer.id.0 as u32, clip: None };
+                        let plan = effectcraft_raster::prepare_warp_rows(
+                            &st.body.img,
+                            matrix,
+                            &opts,
+                            canvas.width,
+                            canvas.height,
+                            quantize,
+                            self.source_is_known_opaque(ctx, layer),
+                        )?;
+                        Some(Some(plan))
+                    })
+                    .collect::<Option<Vec<_>>>()
+            } else {
+                None
+            };
+
+            if let Some(row_plans) = row_plans {
+                let width = canvas.width as usize;
+                const TILE_ROWS: usize = 8;
+                let rows_per_tile = width * TILE_ROWS;
+                let mut tile_plans = vec![Vec::new(); canvas.height.div_ceil(TILE_ROWS as u32) as usize];
+                for plan in row_plans.iter().flatten() {
+                    let (y0, y1) = plan.y_bounds();
+                    if y0 < y1 {
+                        for tile_y in y0 / TILE_ROWS..=(y1 - 1) / TILE_ROWS {
+                            tile_plans[tile_y].push(plan);
+                        }
+                    }
+                }
+                canvas.data.par_chunks_mut(rows_per_tile).enumerate().for_each(|(tile_y, tile)| {
+                    for (dy, row) in tile.chunks_mut(width).enumerate() {
+                        let y = tile_y * TILE_ROWS + dy;
+                        for plan in &tile_plans[tile_y] {
+                            plan.blend_row(y, row);
+                        }
+                    }
+                });
+            } else {
+                let mut draw_blank = *blank;
+                for (layer, prepared) in layers[start..end].iter().zip(prepared) {
+                    let changed = prepared.map_or(Region::Empty, |(st, opacity)| self.draw_prepared_layer(ctx, layer, st, canvas, opacity, draw_blank));
+                    self.pipe.quantize_region(canvas, changed);
+                    draw_blank = false;
+                }
+            }
+            *blank = false;
+        }
+    }
+
     /// Evaluate an effect instance's parameters.
     fn effect_params(&self, ctx: &EvalCtx, layer: &Layer, g: &effectcraft_project::PropGroup) -> Params {
         // Nested groups (Paint strokes, Puppet meshes and pins) are flattened too.
@@ -1553,6 +1723,36 @@ impl<'a> Renderer<'a> {
             self.pipe.quantize(&mut buf.img);
         }
         Some(buf)
+    }
+
+    /// Directly build the minified source for a plain solid. The normal raster path first fills
+    /// the full-resolution solid, then box-filters it for minification; every level of that box
+    /// filter is the same uniform pixel, so these allocations and copies are redundant.
+    pub(crate) fn plain_solid_mip(&self, ctx: &EvalCtx, layer: &Layer) -> Option<Buf> {
+        if self.accel.is_some()
+            || layer.is_3d()
+            || layer.switches.adjustment
+            || layer.switches.collapse
+            || self.blurred(ctx, layer)
+            || layer.masks().is_some_and(|m| !m.children.is_empty())
+            || (layer.switches.effects && layer.effects().is_some_and(|fx| fx.groups().any(|g| g.enabled)))
+            || styles::active(ctx, layer)
+            || layer.track_matte.is_some()
+            || layer.preserve_transparency
+        {
+            return None;
+        }
+        let LayerSource::Solid { item } = &layer.source else { return None };
+        let ItemKind::Solid(sol) = &self.project.item(*item)?.kind else { return None };
+        let scale = self.opts.scale;
+        let (full_w, full_h) = (((sol.width as f64 * scale).ceil() as u32).max(1), ((sol.height as f64 * scale).ceil() as u32).max(1));
+        let (factor, width, height) = self.solid_mip(ctx, layer, full_w, full_h, scale)?;
+        let mut color = sol.color;
+        if let Some(conv) = self.pipe.authored_in() {
+            color = conv.apply(color);
+        }
+        let px = self.pipe.quantize_px([color[0], color[1], color[2], 1.0]);
+        Some(Buf { img: Image::filled(width, height, px), offset: [0.0; 2], scale: scale * factor })
     }
 
     /// Fully processed layer buffer (source → masks → effects → layer styles, flattened).

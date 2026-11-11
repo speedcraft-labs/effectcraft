@@ -51,7 +51,7 @@ impl<'a> Renderer<'a> {
     pub(crate) fn styled(&self, ctx: &EvalCtx, layer: &Layer, mut timing: Option<&mut LayerTiming>) -> Option<StyledLayer> {
         let (content, ckey, files) = self.content_buf_timed(ctx, layer, timing.as_deref_mut())?;
         if !styles::active(ctx, layer) {
-            return Some(StyledLayer { passes: vec![], body: content.clone(), content, key: ckey, ckey, plain: true, files });
+            return Some(StyledLayer { passes: vec![], body: content.clone(), content, key: ckey, ckey, plain: true, quantize_source: false });
         }
         let modes = styles::pass_modes(ctx, layer);
         let key = ckey.map(|k| cache::styles_key(ctx, layer, k));
@@ -70,8 +70,7 @@ impl<'a> Renderer<'a> {
                 })
                 .collect();
             if let Some(passes) = passes {
-                let files = with_kept_files(files, &kept_files);
-                return Some(StyledLayer { passes, body, content, key, ckey, plain: false, files });
+                return Some(StyledLayer { passes, body, content, key, ckey, plain: false, quantize_source: false });
             }
         }
         let t0 = web_time::Instant::now();
@@ -82,23 +81,16 @@ impl<'a> Renderer<'a> {
             t.cached = false;
             t.effects.push(("layerStyles".into(), t0.elapsed().as_secs_f64() * 1e3));
         }
-        // The buffers the cache keeps (another worker's, if it kept them first), made of the
-        // content's files; the styled layer then lists the files of every buffer it holds.
-        let mut kept_files = vec![];
-        let (body, f) = self.keep(key, Arc::new(st.body), &files);
-        kept_files.push(f);
-        let passes: Vec<_> = st
-            .passes
-            .into_iter()
-            .enumerate()
-            .map(|(i, (b, m))| {
-                let (b, f) = self.keep(key.map(|k| cache::derive(k, i as u64 + 1)), Arc::new(b), &files);
-                kept_files.push(f);
-                (b, m)
-            })
-            .collect();
-        let files = with_kept_files(files, &kept_files);
-        Some(StyledLayer { passes, body, content, key, ckey, plain: false, files })
+        let mut body = Arc::new(st.body);
+        let mut passes: Vec<_> = st.passes.into_iter().map(|(b, m)| (Arc::new(b), m)).collect();
+        // The buffers the cache keeps (another worker's, if it kept them first).
+        if let (Some(c), Some(k)) = (self.cache_to_keep(), key) {
+            body = c.insert(k, body);
+            for (i, (b, _)) in passes.iter_mut().enumerate() {
+                *b = c.insert(cache::derive(k, i as u64 + 1), b.clone());
+            }
+        }
+        Some(StyledLayer { passes, body, content, key, ckey, plain: false, quantize_source: false })
     }
 
     /// The styled layer's buffers in the blending space.
@@ -154,6 +146,28 @@ impl<'a> Renderer<'a> {
     fn buf_matrix(&self, ctx: &EvalCtx, layer: &Layer, buf: &Buf) -> Mat3 {
         let (l2c, _) = ctx.layer_to_comp(layer);
         self.place_matrix(self.outer.map_or(l2c, |o| o * l2c), buf)
+    }
+
+    /// The raster mip dimensions a plain solid would use for its current transform. Solid pixels
+    /// are uniform, so a caller can construct the final mip directly instead of filling and then
+    /// halving the full-resolution source image.
+    pub(crate) fn solid_mip(&self, ctx: &EvalCtx, layer: &Layer, width: u32, height: u32, source_scale: f64) -> Option<(f64, u32, u32)> {
+        let buf = Buf { img: Image::new(width, height), offset: [0.0; 2], scale: source_scale };
+        let m = self.buf_matrix(ctx, layer, &buf);
+        let mut scale = m.mean_scale();
+        if !m.is_affine() || scale >= 0.5 {
+            return None;
+        }
+        let (mut w, mut h) = (width.div_ceil(2).max(1), height.div_ceil(2).max(1));
+        let mut factor = 0.5;
+        scale *= 2.0;
+        while scale < 0.5 && w > 1 && h > 1 {
+            w = w.div_ceil(2).max(1);
+            h = h.div_ceil(2).max(1);
+            factor *= 0.5;
+            scale *= 2.0;
+        }
+        Some((factor, w, h))
     }
 
     /// Buffer pixel → output pixel matrix for a layer → (top-level) comp matrix.
@@ -426,6 +440,78 @@ impl<'a> Renderer<'a> {
         None
     }
 
+    /// Solid and alpha-ignored still sources are fully opaque before transform. Their warped
+    /// bilinear path can skip the per-layer transparency-tile scan; masks, effects and styles
+    /// may introduce transparent pixels, so those sources keep the general path.
+    pub(crate) fn source_is_known_opaque(&self, ctx: &EvalCtx, layer: &Layer) -> bool {
+        let (item, solid) = match layer.source {
+            LayerSource::Solid { item } => (item, true),
+            LayerSource::Footage { item } => (item, false),
+            _ => return false,
+        };
+        if layer.masks().is_some_and(|m| !m.children.is_empty())
+            || layer.switches.effects && layer.effects().is_some_and(|fx| fx.groups().any(|group| group.enabled))
+            || styles::active(ctx, layer)
+        {
+            return false;
+        }
+        if solid {
+            self.project.item(item).is_some_and(|it| it.proxy.is_none() && matches!(&it.kind, ItemKind::Solid(_)))
+        } else {
+            self.project.item(ctx.media_item(layer, item)).is_some_and(|it| {
+                it.proxy.is_none()
+                    && matches!(&it.kind, ItemKind::Footage(f) if f.kind == effectcraft_project::FootageKind::Still && f.alpha == effectcraft_project::AlphaMode::Ignore && !f.invert_alpha)
+            })
+        }
+    }
+
+    /// Whether a plain precomp layer has nothing to draw at its nested time. Rendering an empty
+    /// comp would allocate and warp a full-frame transparent image, so skip that work when it
+    /// cannot change the result.
+    pub(crate) fn empty_precomp(&self, ctx: &EvalCtx, layer: &Layer) -> bool {
+        if !matches!(layer.source, LayerSource::Comp { .. })
+            || layer.switches.adjustment
+            || layer.blend_mode != BlendMode::Normal
+            || layer.track_matte.is_some()
+            || layer.preserve_transparency
+            || (layer.switches.effects && layer.effects().is_some_and(|fx| fx.groups().any(|g| g.enabled)))
+            || styles::active(ctx, layer)
+        {
+            return false;
+        }
+        let Some((sub, comp_id, time, _)) = self.precomp_source(ctx, layer) else { return false };
+        let Some(nested_ctx) = sub.eval_ctx(comp_id, time) else { return false };
+        if nested_ctx.comp.layers.iter().any(|l| l.environment && l.switches.video && l.is_active_at(time)) {
+            return false;
+        }
+        sub.visible_layers(&nested_ctx).is_empty()
+    }
+
+    /// The source and style buffers a 2D layer will place. Plain solids can go straight to their
+    /// final mip; other layers use the regular source → masks → effects → styles path.
+    pub(crate) fn styled_for_draw(&self, ctx: &EvalCtx, layer: &Layer, timing: Option<&mut LayerTiming>) -> Option<StyledLayer> {
+        if let Some(buf) = self.plain_solid_mip(ctx, layer) {
+            let body = Arc::new(buf);
+            return Some(StyledLayer { passes: vec![], body: body.clone(), content: body, key: None, ckey: None, plain: true, quantize_source: false });
+        }
+        self.styled(ctx, layer, timing)
+    }
+
+    /// Composite precomputed buffers for a plain 2D layer in the original stack order.
+    pub(crate) fn draw_prepared_layer(&self, ctx: &EvalCtx, layer: &Layer, st: StyledLayer, canvas: &mut Image, opacity: f32, blank: bool) -> Region {
+        if st.plain {
+            let footprint = self.footprint(ctx, layer, &st.body, opacity, blank);
+            let quantize = if footprint == Region::Empty { None } else { self.pipe.levels };
+            match self.composite_layer(ctx, layer, &st.body, canvas, opacity, quantize) {
+                Some(_) if quantize.is_some() => Region::Empty,
+                drawn => narrow(footprint, drawn),
+            }
+        } else {
+            self.composite_styled(ctx, layer, &st, canvas, opacity);
+            Region::Full
+        }
+    }
+
     /// Draw a 2D layer into `canvas`; returns the region it may have changed.
     pub(crate) fn draw_layer(&self, ctx: &EvalCtx, layer: &Layer, canvas: &mut Image, blank: bool) -> Region {
         let opacity = ctx.opacity(layer) as f32 * self.opacity_mul;
@@ -634,8 +720,15 @@ pub struct StyledLayer {
     ckey: Option<u64>,
     /// No layer styles: composite `body` the usual way.
     pub plain: bool,
-    /// The source files the layer's buffers were made of (see [`crate::reads`]).
-    pub(crate) files: Arc<crate::reads::ReadFiles>,
+    /// The GPU will quantize these unquantized source pixels before sampling.
+    pub(crate) quantize_source: bool,
+}
+
+impl StyledLayer {
+    /// Whether the accelerator should quantize body texels before filtering and blending them.
+    pub fn quantize_source(&self) -> bool {
+        self.quantize_source
+    }
 }
 
 /// Where a layer buffer lands (see [`Renderer::placement`]).
