@@ -723,8 +723,8 @@ pub(crate) fn c(r: f64, g: f64, b: f64) -> Value {
 }
 
 #[test]
-fn small_gaussian_matches_the_cpu_and_fractional_box_blur_falls_back() {
-    // #1939: keep the exact sampled Gaussian on the GPU; fractional box radii still use CPU.
+fn small_blurs_fall_back_to_the_cpu() {
+    // #1939: small Gaussian sigmas and fractional box radii render on the CPU kernel.
     for (id, vals) in [("ec.blur.gaussian", [("blurriness", n(0.9))]), ("ec.blur.fastbox", [("radius", n(1.5))])] {
         let mut s = Scene::new(BitDepth::Bpc32);
         let bg = s.solid([0.15, 0.1, 0.2], 97, 61);

@@ -406,45 +406,6 @@ fn gaussian_sample(@builtin(global_invocation_id) gid: vec3<u32>) {
     textureStore(out, p, sum);
 }
 
-// The CPU's small-sigma Gaussian uses f64 weights and accumulates taps in order before
-// rounding back to f32. Each weight is packed as a high/low f32 pair; double-single arithmetic
-// preserves that accumulation closely enough to retain the CPU's final f32 rounding.
-fn gaussian_exact_weight(index: u32) -> vec2<f32> {
-    let first = index * 2u;
-    let second = first + 1u;
-    return vec2<f32>(P.f[1u + first / 4u][first % 4u], P.f[1u + second / 4u][second % 4u]);
-}
-
-@compute @workgroup_size(16, 16)
-fn gaussian_sample_exact(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let dims = out_dims();
-    let p = vec2<i32>(gid.xy);
-    if (p.x >= dims.x || p.y >= dims.y) { return; }
-    let radius = i32(P.u[0].x);
-    let vertical = P.u[0].y != 0u;
-    let clamp_edges = P.u[0].z != 0u;
-    var sum_hi = vec4<f32>(0.0);
-    var sum_lo = vec4<f32>(0.0);
-    for (var tap = 0u; tap <= u32(radius * 2); tap++) {
-        let offset = i32(tap) - radius;
-        var q = p;
-        if (vertical) { q.y += offset; } else { q.x += offset; }
-        var pixel = tex_get(src, q.x, q.y);
-        if (clamp_edges) { pixel = tex_get_clamped(src, q.x, q.y); }
-        let weight = gaussian_exact_weight(tap);
-        let weight_hi = vec4<f32>(weight.x);
-        let product_hi = pixel * weight_hi;
-        let product_lo = fma(pixel, weight_hi, -product_hi) + pixel * vec4<f32>(weight.y);
-        let high = sum_hi + product_hi;
-        let bridge = high - sum_hi;
-        let error = (sum_hi - (high - bridge)) + (product_hi - bridge);
-        let tail = sum_lo + product_lo + error;
-        sum_hi = high + tail;
-        sum_lo = tail - (sum_hi - high);
-    }
-    textureStore(out, p, sum_hi + sum_lo);
-}
-
 fn gaussian_coord(line: i32, position: i32, vertical: bool) -> vec2<i32> {
     if (vertical) { return vec2<i32>(line, position); }
     return vec2<i32>(position, line);

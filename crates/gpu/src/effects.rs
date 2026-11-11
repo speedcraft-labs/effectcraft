@@ -386,34 +386,6 @@ pub(crate) fn gaussian_blur(e: &mut Enc, img: &GpuImage, sx: f64, sy: f64, repea
     cur
 }
 
-/// The raster backend's small-sigma sampled Gaussian, accumulated in CPU tap order.
-fn gaussian_blur_exact_gpu(e: &mut Enc, img: &GpuImage, sx: f64, sy: f64, repeat: bool) -> GpuImage {
-    let mut cur = img.clone();
-    for (sigma, vertical) in [(sx, false), (sy, true)] {
-        if !sigma.is_finite() || sigma <= 1e-3 {
-            continue;
-        }
-        let radius = (sigma * 3.0).ceil() as i64;
-        let mut weights: Vec<f64> = (-radius..=radius).map(|tap| (-((tap * tap) as f64) / (2.0 * sigma * sigma)).exp()).collect();
-        let total: f64 = weights.iter().sum();
-        weights.iter_mut().for_each(|weight| *weight /= total);
-
-        let mut p = Params::default();
-        p.u[0] = [radius as u32, vertical as u32, repeat as u32, 0];
-        for (tap, weight) in weights.iter().enumerate() {
-            let hi = *weight as f32;
-            let lo = (*weight - f64::from(hi)) as f32;
-            let first = tap * 2;
-            p.f[1 + first / 4][first % 4] = hi;
-            p.f[1 + (first + 1) / 4][(first + 1) % 4] = lo;
-        }
-        let out = e.scratch(cur.width, cur.height);
-        e.pixels("gaussian_sample_exact", &p, &cur, None, &out, None);
-        cur = out;
-    }
-    cur
-}
-
 fn dims_xy(dim: u32) -> (f64, f64) {
     match dim {
         1 => (1.0, 0.0),
@@ -428,6 +400,10 @@ fn gaussian(e: &mut Enc, ctx: &EffectCtx, mut b: GBuf) -> Option<GBuf> {
         return Some(b);
     }
     let (kx, ky) = dims_xy(ctx.params.e("dimensions"));
+    // EffectCraft's stand-alone Gaussian uses its sampled effect kernel below 3 px.
+    if effectcraft_raster::gaussian_is_exact(s * kx, s * ky) {
+        return None;
+    }
     let repeat = ctx.params.b("repeatEdge");
     if !repeat && !ctx.adjustment {
         b.pad(e, (s * 3.0).ceil() as u32)?;
@@ -435,12 +411,7 @@ fn gaussian(e: &mut Enc, ctx: &EffectCtx, mut b: GBuf) -> Option<GBuf> {
         // The edge it repeats is the layer's, not the painted content's (#1205).
         b.cover(e, ctx.layer_size)?;
     }
-    let (sx, sy) = (s * kx, s * ky);
-    b.img = if effectcraft_raster::gaussian_is_exact(sx, sy) {
-        gaussian_blur_exact_gpu(e, &b.img, sx, sy, repeat || ctx.adjustment)
-    } else {
-        gaussian_blur(e, &b.img, sx, sy, repeat || ctx.adjustment)
-    };
+    b.img = gaussian_blur(e, &b.img, s * kx, s * ky, repeat || ctx.adjustment);
     Some(b)
 }
 
