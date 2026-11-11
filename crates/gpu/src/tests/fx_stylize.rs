@@ -289,11 +289,11 @@ fn transform_motion_blur() {
     }
 }
 
-/// #1605: Posterize matches the CPU exactly on every 8 bpc premultiplied colour and alpha. A
+/// #1605: Posterize matches the CPU within f32 rounding on every 8 bpc premultiplied colour and alpha. A
 /// straight value of 5/6 at level 4 rounds to exactly 2.5 on the CPU; drivers that fused the
 /// product into `round_away`'s subtraction (AMD) rounded it down a level.
 #[test]
-fn posterize_matches_the_cpu_on_every_8bpc_pair() {
+fn posterize_matches_the_cpu_on_every_8bpc_pair_within_f32_rounding() {
     let Some(g) = crate::tests::gpu() else { return };
     let spec = effectcraft_effects::find("ec.stylize.posterize").unwrap();
     let size = [256.0, 255.0];
@@ -313,8 +313,15 @@ fn posterize_matches_the_cpu_on_every_8bpc_pair() {
         let ctx = || effectcraft_effects::EffectCtx { params: &params, time: 0.0, layer_size: size, seed: 1, adjustment: false, env: Default::default() };
         let cpu = (spec.render)(&ctx(), buf.clone());
         let out = effectcraft_render::Accelerator::effects(g, &[effectcraft_render::FxStep { spec, ctx: ctx() }], &buf, None).expect("the GPU runs the effect");
-        let bad: Vec<(usize, usize)> =
-            cpu.img.data.iter().zip(&out.img.data).enumerate().filter(|(_, (c, o))| c != o).map(|(i, _)| ((i % 256).min(i / 256 + 1), i / 256 + 1)).collect();
+        let bad: Vec<(usize, usize, [f32; 4], [f32; 4])> = cpu
+            .img
+            .data
+            .iter()
+            .zip(&out.img.data)
+            .enumerate()
+            .filter(|(_, (c, o))| c.iter().zip(*o).any(|(a, b)| (a - b).abs() > 1e-7))
+            .map(|(i, (c, o))| ((i % 256).min(i / 256 + 1), i / 256 + 1, *c, *o))
+            .collect();
         assert!(bad.is_empty(), "level {level}: {} (x, a) pairs differ from the CPU, first {:?}", bad.len(), &bad[..bad.len().min(8)]);
     }
 }

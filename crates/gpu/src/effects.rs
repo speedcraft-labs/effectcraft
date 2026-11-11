@@ -1,6 +1,7 @@
 //! GPU effects: the same steps as the CPU effects in `effectcraft-effects` (padding, blur
 //! radii, parameter conversions), with the pixel loops as compute kernels.
 
+use craft_blur::{Gaussian, Quality, Separable};
 use effectcraft_effects::{Buf, EffectCtx};
 use effectcraft_raster::Sampling;
 use effectcraft_render::FxStep;
@@ -253,7 +254,7 @@ fn apply(e: &mut Enc, id: &str, ctx: &EffectCtx, b: GBuf) -> Option<GBuf> {
 
 // ---------------------------------------------------------------- blurs
 
-/// raster::blur::box_radii.
+/// Kovesi radii for three box passes (raster::blur compatibility).
 pub(crate) fn box_radii(sigma: f64, n: usize) -> Vec<usize> {
     if sigma <= 0.0 {
         return vec![0; n];
@@ -293,11 +294,51 @@ pub(crate) fn box_passes(e: &mut Enc, img: &GpuImage, rx: &[usize], ry: &[usize]
     cur
 }
 
-/// raster::gaussian_blur (3 box passes per axis).
+/// craft-blur's sampled or recursive Gaussian, with one line per GPU invocation.
 pub(crate) fn gaussian_blur(e: &mut Enc, img: &GpuImage, sx: f64, sy: f64, repeat: bool) -> GpuImage {
-    let rx = if sx > 0.05 { box_radii(sx, 3) } else { vec![] };
-    let ry = if sy > 0.05 { box_radii(sy, 3) } else { vec![] };
-    box_passes(e, img, &rx, &ry, repeat)
+    let mut cur = img.clone();
+    for (sigma, vertical) in [(sx, false), (sy, true)] {
+        if sigma <= 0.0 || !sigma.is_finite() {
+            continue;
+        }
+        let sigma = sigma as f32;
+        let Ok(filter) = Gaussian::new(sigma, Quality::RecursiveRaw) else { continue };
+        let mut p = Params::default();
+        match filter.separable() {
+            Separable::Kernel(weights) => {
+                let radius = weights.len() / 2;
+                if radius > 8 {
+                    continue;
+                }
+                p.u[0] = [radius as u32, vertical as u32, repeat as u32, 0];
+                for (i, weight) in weights.iter().enumerate() {
+                    let Some(channel) = p.f.get_mut(1 + i / 4).and_then(|v| v.get_mut(i % 4)) else { break };
+                    *channel = *weight;
+                }
+                let out = e.scratch(cur.width, cur.height);
+                e.pixels("gaussian_sample", &p, &cur, None, &out, None);
+                cur = out;
+            }
+            Separable::Recursive(coefficients) => {
+                p.f[0] = [coefficients.feedback[0] as f32, coefficients.feedback[1] as f32, coefficients.feedback[2] as f32, coefficients.gain as f32];
+                for (row, boundary) in coefficients.boundary.iter().enumerate() {
+                    let Some(dst) = p.f.get_mut(row + 1) else { break };
+                    for (channel, value) in dst.iter_mut().zip(boundary) {
+                        *channel = *value as f32;
+                    }
+                }
+                p.u[0] = [vertical as u32, repeat as u32, 0, 0];
+                let lines = if vertical { (cur.width, 1) } else { (1, cur.height) };
+                let forward = e.scratch(cur.width, cur.height);
+                e.dispatch("gaussian_forward", &p, crate::context::KernelImages { src: &cur, aux: None, out: &forward }, None, lines);
+                let out = e.scratch(cur.width, cur.height);
+                e.dispatch("gaussian_backward", &p, crate::context::KernelImages { src: &forward, aux: Some(&cur), out: &out }, None, lines);
+                cur = out;
+            }
+            Separable::Boxes(_) => {}
+        }
+    }
+    cur
 }
 
 fn dims_xy(dim: u32) -> (f64, f64) {
@@ -314,7 +355,7 @@ fn gaussian(e: &mut Enc, ctx: &EffectCtx, mut b: GBuf) -> Option<GBuf> {
         return Some(b);
     }
     let (kx, ky) = dims_xy(ctx.params.e("dimensions"));
-    // Small sigmas use the CPU's sampled kernel (#1939).
+    // EffectCraft's stand-alone Gaussian uses its sampled effect kernel below 3 px.
     if effectcraft_raster::gaussian_is_exact(s * kx, s * ky) {
         return None;
     }
