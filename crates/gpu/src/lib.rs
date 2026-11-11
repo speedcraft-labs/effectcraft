@@ -92,7 +92,6 @@ mod yuv;
 use std::sync::Arc;
 
 pub use context::{GpuContext, GpuImage, TransferStats};
-pub use diagnostics::{ScopedError, ScopedErrorObserver};
 use effectcraft_effects::Buf;
 use effectcraft_project::ItemId;
 use effectcraft_raster::Image;

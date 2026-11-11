@@ -19,7 +19,7 @@ const COMP_FRAME_CACHE_BYTES: usize = 128 * 1024 * 1024;
 const COMP_FRAME_CACHE_SINGLE: usize = 8 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct CompFrameKey {
+struct CompFrameKey {
     project: usize,
     comp: ItemId,
     time: i64,
@@ -879,19 +879,46 @@ impl<'a> Renderer<'a> {
         self.comp_frame_with(comp_id, t, false, |a| Ok::<_, std::convert::Infallible>(a.comp_frame(self, comp_id, t))).unwrap_or_else(|never| match never {})
     }
 
-    /// Render a frame, validating the accelerated attempt before starting any CPU fallback.
-    /// The caller's scope must run only the accelerator, not this whole method: a GPU fault
-    /// must release failed resources before a potentially large CPU render (#3357).
-    /// A scope error returns immediately; the caller can then retry with a fresh CPU renderer
-    /// without accelerator-produced cache entries. Healthy declines and Auto timing retain
-    /// the same behavior as [`Self::comp_frame`]. Its fallback disables acceleration for
-    /// effects too: GPU work must never escape the supplied error scope.
-    pub fn comp_frame_scoped<E>(&self, comp_id: ItemId, t: Tick, scope: impl FnOnce(&dyn Accelerator) -> Result<Option<Image>, E>) -> Result<Image, E> {
-        self.comp_frame_with(comp_id, t, true, scope)
+    fn comp_frame_cache_key(&self, comp_id: ItemId, t: Tick) -> Option<CompFrameKey> {
+        if self.depth == 0
+            || self.profile.is_some()
+            || self.active_accel().is_some()
+            || self.opts.roi.is_some()
+            || self.opts.view.is_some()
+            || self.footage.called_off()
+            || self.outer.is_some()
+            || self.collapse3d.is_some()
+            || self.through_lost
+            || self.through.iter().any(Option::is_some)
+        {
+            return None;
+        }
+        let (inherited_quality, inherited_motion_blur) = self.inherited.map_or((0, false), |(quality, motion_blur)| {
+            (
+                match quality {
+                    Quality::Best => 0,
+                    Quality::Draft => 1,
+                    Quality::Wireframe => 2,
+                },
+                motion_blur,
+            )
+        });
+        self.comp_frames.is_static(self.project, comp_id, t).then_some(CompFrameKey {
+            project: self.project as *const Project as usize,
+            comp: comp_id,
+            time: t.0,
+            scale: self.opts.scale.to_bits(),
+            options: u8::from(self.opts.motion_blur)
+                | (u8::from(self.opts.draft) << 1)
+                | (u8::from(self.opts.nested_switches) << 2)
+                | (u8::from(self.opts.guides) << 3)
+                | (u8::from(self.opts.draft_shadows) << 4)
+                | (inherited_quality << 5)
+                | (u8::from(inherited_motion_blur) << 7),
+        })
     }
 
-    fn comp_frame_with<E>(&self, comp_id: ItemId, t: Tick, scoped: bool, scope: impl FnOnce(&dyn Accelerator) -> Result<Option<Image>, E>) -> Result<Image, E> {
-        let cpu = if scoped { self.with_accel(None) } else { self.with_accel(self.accel) };
+    fn comp_frame_uncached(&self, comp_id: ItemId, t: Tick) -> Image {
         // Classic 3D runs composite on the GPU too (M12.7), so Auto sends 3D comps there as well;
         // Auto renders each comp on whichever compositor measured faster ([`AutoPick`]).
         if self.depth == 0

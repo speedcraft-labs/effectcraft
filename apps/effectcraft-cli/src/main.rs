@@ -1541,9 +1541,7 @@ fn adv3d_bench_comp(p: &mut effectcraft_engine::project::Project) -> Option<Item
 /// warm; "up/dn MB" are the GPU's uploads / readbacks per warm GPU frame.
 fn bench_gpu(s: &Session, args: &Args) -> Result<(), Failure> {
     use effectcraft_render::Backend;
-    let gpu_init_start = std::time::Instant::now();
     let gpu = effectcraft_gpu::Gpu::try_headless().map_err(|e| Failure::Error(format!("--gpu: no usable GPU adapter ({e})")))?;
-    let gpu_init_ms = gpu_init_start.elapsed().as_secs_f64() * 1000.0;
     let n = args.num("--n")?.unwrap_or(10.0).max(1.0) as usize;
     // Every comp, plus an adjustment-layer comp built for the benchmark (the main comp under a
     // full-frame adjustment layer with a GPU effect stack) and an Advanced 3D comp (`--adv3d`:
@@ -1562,53 +1560,6 @@ fn bench_gpu(s: &Session, args: &Args) -> Result<(), Failure> {
     };
     let project = &project;
     note!("GPU: {} — median of {n} runs (ms/frame)", effectcraft_render::Accelerator::name(&gpu));
-    note!("GPU init (adapter + eager pipelines): {gpu_init_ms:.2} ms");
-    if args.flag("--gpu-only") {
-        let Some(cid) = comps.first().copied() else { return Ok(()) };
-        let Some(comp) = project.comp(cid) else { return Ok(()) };
-        let t = Tick::from_seconds_f64(args.num("--time")?.unwrap_or(3.0).min(comp.duration.seconds() * 0.5));
-        let scale = args.num("--scale")?.unwrap_or(1.0);
-        let mut r = Renderer::new(project, s.footage.as_ref(), RenderOpts { scale, backend: Backend::Gpu, ..Default::default() });
-        r.expr = s.expr.as_deref();
-        r.accel = Some(&gpu);
-        let transfers = gpu.context().transfer_stats();
-        let pipelines = gpu.context().pipeline_build_stats();
-        let precomps = gpu.context().static_precomp_stats();
-        let pool = gpu.context().pool_stats();
-        let start = std::time::Instant::now();
-        let frame = r.comp_frame(cid, t);
-        let first_frame_ms = start.elapsed().as_secs_f64() * 1000.0;
-        gpu.wait();
-        let pixel_hash = frame
-            .data
-            .iter()
-            .flatten()
-            .flat_map(|channel| channel.to_bits().to_le_bytes())
-            .fold(0xcbf29ce484222325, |hash, byte| (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3));
-        let transfers_after = gpu.context().transfer_stats();
-        let pipelines_after = gpu.context().pipeline_build_stats();
-        let precomps_after = gpu.context().static_precomp_stats();
-        let pool_after = gpu.context().pool_stats();
-        note!("GPU-only first frame: {}x{} {first_frame_ms:.2} ms, hash {pixel_hash:016x}", frame.width, frame.height);
-        note!(
-            "  shader modules {} ({:.2} ms), lazy pipelines {} ({:.2} ms), pipeline cache {}/{} hits; static precomps {}/{} hits/misses; uploads {} ({:.1} MB), readbacks {} ({:.1} MB), texture pool {}/{} hits/misses",
-            pipelines_after.shader_modules - pipelines.shader_modules,
-            (pipelines_after.shader_module_ns - pipelines.shader_module_ns) as f64 / 1.0e6,
-            pipelines_after.pipelines - pipelines.pipelines,
-            (pipelines_after.pipeline_ns - pipelines.pipeline_ns) as f64 / 1.0e6,
-            pipelines_after.cache_hits - pipelines.cache_hits,
-            pipelines_after.requests - pipelines.requests,
-            precomps_after.hits - precomps.hits,
-            precomps_after.misses - precomps.misses,
-            transfers_after.uploads - transfers.uploads,
-            (transfers_after.upload_bytes - transfers.upload_bytes) as f64 / (1u64 << 20) as f64,
-            transfers_after.readbacks - transfers.readbacks,
-            (transfers_after.readback_bytes - transfers.readback_bytes) as f64 / (1u64 << 20) as f64,
-            pool_after.0 - pool.0,
-            pool_after.1 - pool.1,
-        );
-        return Ok(());
-    }
     note!(
         "{:<28} {:>5} {:>10} {:>9} {:>9} {:>9} {:>9} {:>9} {:>8} {:>9} {:>9} {:>11}",
         "comp",
@@ -1639,17 +1590,9 @@ fn bench_gpu(s: &Session, args: &Args) -> Result<(), Failure> {
             let cpu_cold = time_ms(n, || {
                 std::hint::black_box(mk(Backend::Cpu, None));
             });
-            let cold_transfers_before = gpu.context().transfer_stats();
-            let cold_pipelines_before = gpu.context().pipeline_build_stats();
-            let cold_precomps_before = gpu.context().static_precomp_stats();
-            let cold_pool_before = gpu.context().pool_stats();
             let gpu_cold = time_ms(n, || {
                 std::hint::black_box(mk(Backend::Gpu, None));
             });
-            let cold_transfers = gpu.context().transfer_stats();
-            let cold_pipelines = gpu.context().pipeline_build_stats();
-            let cold_precomps = gpu.context().static_precomp_stats();
-            let cold_pool = gpu.context().pool_stats();
             let cache = LayerCache::default();
             let cpu_warm = time_ms(n, || {
                 std::hint::black_box(mk(Backend::Cpu, Some(&cache)));
@@ -1695,35 +1638,10 @@ fn bench_gpu(s: &Session, args: &Args) -> Result<(), Failure> {
                 })
                 .count();
             let pct = 100.0 * off as f64 / a.data.len().max(1) as f64;
-            let pixel_hash = |data: &[[f32; 4]]| {
-                data.iter()
-                    .flatten()
-                    .flat_map(|channel| channel.to_bits().to_le_bytes())
-                    .fold(0xcbf29ce484222325, |hash, byte| (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3))
-            };
-            let (cpu_hash, gpu_hash) = (pixel_hash(&a.data), pixel_hash(&b.data));
             let speedup = cpu_warm / gpu_warm.max(1e-9);
             note!(
                 "{name:<28} {label:>5} {size:>10} {cpu_cold:>9.2} {gpu_cold:>9.2} {cpu_warm:>9.2} {gpu_warm:>9.2} {view:>9.2} {speedup:>7.2}x {auto:>9.2} {pct:>8.3}% {traffic:>11}"
             );
-            note!(
-                "  cold profile: shader modules {} ({:.2} ms), lazy pipelines {} ({:.2} ms), pipeline cache {}/{} hits; static precomps {}/{} hits/misses; uploads {} ({:.1} MB), readbacks {} ({:.1} MB), texture pool {}/{} hits/misses",
-                cold_pipelines.shader_modules - cold_pipelines_before.shader_modules,
-                (cold_pipelines.shader_module_ns - cold_pipelines_before.shader_module_ns) as f64 / 1.0e6,
-                cold_pipelines.pipelines - cold_pipelines_before.pipelines,
-                (cold_pipelines.pipeline_ns - cold_pipelines_before.pipeline_ns) as f64 / 1.0e6,
-                cold_pipelines.cache_hits - cold_pipelines_before.cache_hits,
-                cold_pipelines.requests - cold_pipelines_before.requests,
-                cold_precomps.hits - cold_precomps_before.hits,
-                cold_precomps.misses - cold_precomps_before.misses,
-                cold_transfers.uploads - cold_transfers_before.uploads,
-                (cold_transfers.upload_bytes - cold_transfers_before.upload_bytes) as f64 / (1u64 << 20) as f64,
-                cold_transfers.readbacks - cold_transfers_before.readbacks,
-                (cold_transfers.readback_bytes - cold_transfers_before.readback_bytes) as f64 / (1u64 << 20) as f64,
-                cold_pool.0 - cold_pool_before.0,
-                cold_pool.1 - cold_pool_before.1,
-            );
-            note!("  output hash: cpu {cpu_hash:016x}; gpu {gpu_hash:016x}; exact pixels match: {}", a.data == b.data);
         }
     }
     Ok(())

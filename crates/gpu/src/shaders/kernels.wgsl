@@ -16,8 +16,8 @@ fn out_dims() -> vec2<i32> {
 @compute @workgroup_size(16, 16)
 fn warp_blend(@builtin(global_invocation_id) gid: vec3<u32>) {
     let dims = out_dims();
-    let x = i32(gid.x + P.u[3].x);
-    let y = i32(gid.y + P.u[3].y);
+    let x = i32(gid.x);
+    let y = i32(gid.y);
     if (x >= dims.x || y >= dims.y) {
         return;
     }

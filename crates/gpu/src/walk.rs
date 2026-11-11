@@ -81,7 +81,7 @@ fn draw_comp<'a>(e: &mut Enc, r: &Renderer<'a>, ctx: &EvalCtx<'a>, canvas: &mut 
         // A device that ran out of memory (or was lost) on an earlier layer fails every later
         // one: give the frame back to the CPU now instead of drawing the rest of the comp.
         e.g.check_health().ok()?;
-        let full_quantize = if visible[i].is_3d() {
+        if visible[i].is_3d() {
             let mut j = i;
             while j < visible.len() && visible[j].is_3d() {
                 j += 1;
@@ -213,15 +213,13 @@ fn draw_collapsed<'a>(
     composite_iso(e, r, ctx, layer, iso, canvas, opacity)
 }
 
-fn draw_layer(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, canvas: &mut GpuImage) -> Option<bool> {
+fn draw_layer(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, canvas: &mut GpuImage) -> Option<()> {
     let out = draw_layer_on(e, r, ctx, layer, canvas);
     e.mem_gate();
     out
 }
 
-/// `true` means placement or a no-op has already left the canvas quantised; more complex paths
-/// need the compositor's full-frame quantisation after this layer.
-fn draw_layer_on(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, canvas: &mut GpuImage) -> Option<bool> {
+fn draw_layer_on(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, canvas: &mut GpuImage) -> Option<()> {
     if layer.switches.adjustment {
         if draw_adjustment(e, r, ctx, layer, canvas).is_some() {
             return Some(());
@@ -243,9 +241,9 @@ fn draw_layer_on(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, canvas
     if let Some(done) = draw_resident_fx(e, r, ctx, layer, canvas, opacity) {
         return done;
     }
-    let Some(st) = r.styled_layer(ctx, layer) else { return Some(true) };
+    let Some(st) = r.styled_layer(ctx, layer) else { return Some(()) };
     if st.plain {
-        return composite_layer(e, r, ctx, layer, &st.body, canvas, opacity).map(|()| true);
+        return composite_layer(e, r, ctx, layer, &st.body, canvas, opacity);
     }
     // Layer styles: exterior passes with their own modes, then the body; the layer's opacity
     // fades the whole stack; knockout and channel switches as on the CPU.
@@ -309,7 +307,7 @@ fn draw_resident_fx(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, can
     };
     let pipe = r.pipe();
     // `layer_input` is in effect space: run the stack there, then back to layer space.
-    let mut fx = crate::effects::GpuFx::new(e, src, offset, scale, pipe.levels);
+    let mut fx = crate::effects::GpuFx::new(e, src, input.offset, input.scale, pipe.levels);
     let origin = r.run_layer_effects_on(ctx, layer, &mut fx);
     let Some((mut img, mut offset, scale)) = fx.finish() else { return Some(None) };
     offset = [offset[0] - origin[0] * scale, offset[1] - origin[1] * scale];
