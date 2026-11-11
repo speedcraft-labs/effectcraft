@@ -26,7 +26,8 @@
 //! effectcraft-cli render F.ecproj --queue                    render the project's Render Queue
 //! effectcraft-cli bench [--comp C] [--time S] [--scale K] [--n N] [--play N] [--gpu [--adv3d] [--gpu-only]]   render timings
 //!     (--gpu: CPU vs GPU ms/frame for every comp at Full and Half)
-//! effectcraft-cli bench --ops [--small] [--layers N] [--comps N] [--footage N]   everyday-operation timings
+//!     (--gpu-only: one cold GPU frame for perf profiling)
+//! effectcraft-cli bench --ops [--small] [--layers N] [--comps N] [--footage N] [--realistic]   everyday-operation timings
 //!     on a large generated project (open, save, auto-save, undo/redo, timeline, Project panel)
 //! effectcraft-cli bench --roto [--frames N] [--sam2 model.safetensors] [--mobilesam mobile_sam.pt] [--fixes] [--clip FRAMES --truth MASKS] [--json]   Roto Brush trackers on synthetic clips with known mattes
 //!     (classical engine, MobileSAM and SAM 2.1 (any installed size) when installed; IoU, flicker, re-appearance, seconds per frame)
@@ -129,8 +130,9 @@ const USAGE: &str = "usage: effectcraft-cli <info|commands|exec|run|props|get|se
   render/render-frame --template T.ectemplate [--values V.json]   render one template instance
   bench [--comp C] [--time S] [--scale K] [--n N] [--play N] [--gpu [--adv3d] [--gpu-only]]   per-layer/effect render timings;
                                            --play N renders N consecutive frames with/without the layer cache;
-                                           --gpu compares CPU and GPU ms/frame for every comp at Full and Half
-  bench --ops [--small] [--layers N] [--comps N] [--footage N]
+                                           --gpu compares CPU and GPU ms/frame for every comp at Full and Half;
+                                           --gpu-only renders one GPU frame for perf profiling
+  bench --ops [--small] [--layers N] [--comps N] [--footage N] [--realistic]
                                            everyday operations on a large generated project: startup, open,
                                            save, auto-save, edits + undo/redo, timeline, Project panel
   bench --roto [--frames N] [--sam2 FILE] [--mobilesam FILE] [--fixes] [--clip FRAMES_DIR --truth MASKS_DIR] [--json]
@@ -215,7 +217,6 @@ const FLAGS: &[&str] = &[
     "--demo",
     "--empty",
     "--gpu",
-    "--gpu-only",
     "--list",
     "--schemas",
     "--enabled",
@@ -227,6 +228,7 @@ const FLAGS: &[&str] = &[
     "--roto",
     "--small",
     "--adv3d",
+    "--gpu-only",
     "--autosave",
     "--keep-going",
     "--progress",
@@ -1074,7 +1076,7 @@ fn bench_cmd(args: &Args) -> Result<(), Failure> {
     if let Some(c) = args.opt("--comp") {
         s.execute("comp.open", json!({"comp": c})).map_err(|e| Failure::Error(e.to_string()))?;
     }
-    if args.flag("--gpu") {
+    if args.flag("--gpu") || args.flag("--gpu-only") {
         return bench_gpu(&s, args);
     }
     let cid = s.active_comp_id().ok_or_else(|| Failure::Error("no composition".into()))?;
@@ -1543,6 +1545,21 @@ fn bench_gpu(s: &Session, args: &Args) -> Result<(), Failure> {
         }
     };
     let project = &project;
+    if args.flag("--gpu-only") {
+        let Some(cid) = comps.first().copied() else { return Ok(()) };
+        let Some(comp) = project.comp(cid) else { return Ok(()) };
+        let t = Tick::from_seconds_f64(args.num("--time")?.unwrap_or(3.0).min(comp.duration.seconds() * 0.5));
+        let scale = args.num("--scale")?.unwrap_or(1.0);
+        let mut renderer = Renderer::new(project, s.footage.as_ref(), RenderOpts { scale, backend: Backend::Gpu, ..Default::default() });
+        renderer.expr = s.expr.as_deref();
+        renderer.accel = Some(&gpu);
+        let start = std::time::Instant::now();
+        let frame = renderer.comp_frame(cid, t);
+        let first_frame_ms = start.elapsed().as_secs_f64() * 1000.0;
+        gpu.wait();
+        note!("GPU-only first frame: {}x{} {first_frame_ms:.2} ms", frame.width, frame.height);
+        return Ok(());
+    }
     note!("GPU: {} — median of {n} runs (ms/frame)", effectcraft_render::Accelerator::name(&gpu));
     note!(
         "{:<28} {:>5} {:>10} {:>9} {:>9} {:>9} {:>9} {:>9} {:>8} {:>9} {:>9} {:>11}",
