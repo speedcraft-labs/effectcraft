@@ -20,15 +20,7 @@ pub struct GpuFootageSourceKey {
     time: Tick,
     scale: u64,
     proxy: bool,
-    static_source: bool,
     quantize_source: bool,
-}
-
-impl GpuFootageSourceKey {
-    /// Whether the source is a still image whose upload can be reused across frames.
-    pub fn is_static(&self) -> bool {
-        self.static_source
-    }
 }
 
 /// A motion-blur shutter: the comp's, or for a collapsed precomp's layers the outermost
@@ -53,11 +45,38 @@ impl Shutter {
     }
 }
 
-/// `files` (a content's) with the files of the buffers made of it that the layer cache kept:
-/// `files` itself when they are all its own.
-fn with_kept_files(files: Arc<crate::reads::ReadFiles>, kept: &[Arc<crate::reads::ReadFiles>]) -> Arc<crate::reads::ReadFiles> {
-    if kept.iter().all(|f| Arc::ptr_eq(f, &files)) {
-        return files;
+impl<'a> Renderer<'a> {
+    /// Identity for a decoded footage texture that can be shared by duplicate plain layers in
+    /// this frame. The GPU cache is encoder-local, so project edits cannot stale the entry.
+    pub fn gpu_footage_source_key(&self, ctx: &EvalCtx, layer: &Layer, quantize_source: bool) -> Option<GpuFootageSourceKey> {
+        if !self.cache_static_comps
+            || self.profile.is_some()
+            || layer.switches.collapse
+            || self.blurred(ctx, layer)
+            || frame_blend_mode(ctx, layer) != super::FrameBlend::Off
+            || layer.masks().is_some_and(|m| !m.children.is_empty())
+            || layer.switches.effects && layer.effects().is_some_and(|fx| !fx.children.is_empty())
+            || styles::active(ctx, layer)
+        {
+            return None;
+        }
+        let LayerSource::Footage { item } = &layer.source else { return None };
+        let item = ctx.media_item(layer, *item);
+        let ItemKind::Footage(f) = &self.project.item(item)?.kind else { return None };
+        if !f.has_video || f.missing {
+            return None;
+        }
+        let proxy = self.proxy_for(item);
+        let source = proxy.unwrap_or(f);
+        let time = if source.kind == super::FootageKind::Still { Tick::ZERO } else { ctx.source_time(layer) };
+        Some(GpuFootageSourceKey {
+            project: self.project as *const _ as usize,
+            item,
+            time,
+            scale: self.opts.scale.to_bits(),
+            proxy: proxy.is_some(),
+            quantize_source,
+        })
     }
     let mut all = (*files).clone();
     kept.iter().for_each(|f| all.extend(f));
