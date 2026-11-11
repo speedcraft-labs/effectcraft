@@ -1779,32 +1779,52 @@ impl GpuContext {
         if let Some(t) = self.pictures.lock().ok().and_then(|mut p| p.get(img)) {
             return Some(t);
         }
-        let tex = self.upload_image(img)?;
-        if let Ok(mut p) = self.pictures.lock() {
-            p.insert(img, tex.clone(), crate::upload::PICTURE_BUDGET.min(self.upload_budget() / 4));
-        }
-        Some(tex)
-    }
-
-    /// Entries in the footage picture cache.
-    #[cfg(test)]
-    pub(crate) fn picture_entries(&self) -> usize {
-        self.pictures.lock().map(|p| p.len()).unwrap_or_default()
-    }
-
-    /// The upload staging buffers (tests).
-    #[cfg(test)]
-    pub(crate) fn upload_staging(&self) -> &crate::upload::Staging {
-        &self.upload_staging
-    }
-
-    /// A render is done: drop the footage picture textures and the upload staging buffers
-    /// (the next render's pictures upload again; their textures come from the pool).
-    pub fn trim_uploads(&self) {
-        if let Ok(mut p) = self.pictures.lock() {
-            p.clear();
-        }
-        self.upload_staging.clear();
+        let byte_len = img.data.len() * 4;
+        // write_texture copies this slice before returning; keep the high-water buffer for the next layer.
+        RGBA8_UPLOAD_SCRATCH.with(|scratch| {
+            let mut storage = scratch.borrow_mut();
+            if storage.len() < byte_len {
+                storage.resize(byte_len, 0);
+            }
+            let bytes = &mut storage[..byte_len];
+            if quantize {
+                bytes.par_chunks_exact_mut(4).zip(img.data.par_iter()).with_min_len(4096).for_each(|(dst, px)| {
+                    let alpha = ((px[3].clamp(0.0, 1.0) * 255.0 + 0.5) as u32).min(255) as u8;
+                    let a = alpha as f32 / 255.0;
+                    // The input clamp bounds the scaled channel to [0, 255.5], and float-to-u8
+                    // conversion saturates at 255, so a second clamp is unnecessary.
+                    dst[0] = (px[0].clamp(0.0, a) * 255.0 + 0.5) as u8;
+                    dst[1] = (px[1].clamp(0.0, a) * 255.0 + 0.5) as u8;
+                    dst[2] = (px[2].clamp(0.0, a) * 255.0 + 0.5) as u8;
+                    dst[3] = alpha;
+                });
+            } else {
+                bytes.par_chunks_exact_mut(4).zip(img.data.par_iter()).with_min_len(4096).for_each(|(dst, px)| {
+                    dst[0] = (px[0].clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+                    dst[1] = (px[1].clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+                    dst[2] = (px[2].clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+                    dst[3] = (px[3].clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+                });
+            }
+            let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("8-bit layer source"),
+                size: wgpu::Extent3d { width: img.width.max(1), height: img.height.max(1), depth_or_array_layers: 1 },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+            self.transfers.count(true, byte_len);
+            self.queue.write_texture(
+                wgpu::TexelCopyTextureInfo { texture: &texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+                bytes,
+                wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(img.width * 4), rows_per_image: Some(img.height) },
+                wgpu::Extent3d { width: img.width, height: img.height, depth_or_array_layers: 1 },
+            );
+            Some(GpuImage::new(texture, img.width, img.height))
+        })
     }
 
     /// Entries in the layer upload cache.
