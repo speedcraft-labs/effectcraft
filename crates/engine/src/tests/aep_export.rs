@@ -141,7 +141,7 @@ fn with_sequence(dir: &str, sep: &str, document: &str) -> (Session, std::sync::A
         path: files[0].clone(),
         kind: FootageKind::Sequence,
         frame_rate: effectcraft_time::FrameRate::new(25, 1),
-        sequence: files,
+        sequence: files.into(),
         width: 64,
         height: 48,
         has_video: true,
