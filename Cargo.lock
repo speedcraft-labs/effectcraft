@@ -1178,14 +1178,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "craft-resample"
-version = "0.1.0"
-source = "git+https://github.com/storytold/craft-libs?rev=fd21a0a80a8e4f4c183a8e0da0953e1b033b817d#fd21a0a80a8e4f4c183a8e0da0953e1b033b817d"
-dependencies = [
- "rayon",
-]
-
-[[package]]
 name = "craft-ui"
 version = "0.1.0"
 source = "git+https://github.com/storytold/craft-libs?rev=e11f9d9aebea5f6b8e74643c1ea1ed172ba5f545#e11f9d9aebea5f6b8e74643c1ea1ed172ba5f545"
@@ -1538,8 +1530,6 @@ name = "effectcraft-effects"
 version = "0.23.1"
 dependencies = [
  "chrono",
- "craft-blur",
- "craft-resample",
  "effectcraft-color",
  "effectcraft-geom",
  "effectcraft-keyframe",
@@ -1654,7 +1644,6 @@ name = "effectcraft-gpu"
 version = "0.23.1"
 dependencies = [
  "bytemuck",
- "craft-resample",
  "effectcraft-color",
  "effectcraft-effects",
  "effectcraft-geom",
@@ -1837,7 +1826,6 @@ name = "effectcraft-pdf"
 version = "0.23.1"
 dependencies = [
  "craft-pdf",
- "craft-resample",
  "effectcraft-raster",
  "effectcraft-svg",
  "effectcraft-text",
@@ -1889,7 +1877,6 @@ name = "effectcraft-raster"
 version = "0.23.1"
 dependencies = [
  "craft-blur",
- "craft-resample",
  "effectcraft-color",
  "effectcraft-geom",
  "rayon",

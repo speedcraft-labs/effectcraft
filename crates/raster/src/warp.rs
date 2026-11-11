@@ -1,6 +1,5 @@
 //! Projective warps composited straight into a destination (the layer transform step).
 
-use craft_resample::downsample2_clamped_rgba;
 use effectcraft_color::{BlendMode, blend_pixel};
 use effectcraft_geom::{Mat3, Rect, vec2};
 use rayon::prelude::*;
@@ -33,10 +32,23 @@ impl Default for WarpOpts {
 
 /// Box-filter halving (for minification).
 fn half(src: &Image) -> Image {
-    if let Some((width, height, data)) = downsample2_clamped_rgba(&src.data, src.width as usize, src.height as usize) {
-        return Image { width: width as u32, height: height as u32, data };
-    }
-    Image::new(src.width.div_ceil(2).max(1), src.height.div_ceil(2).max(1))
+    let w = src.width.div_ceil(2).max(1);
+    let h = src.height.div_ceil(2).max(1);
+    let mut out = Image::new(w, h);
+    out.rows_mut().for_each(|(y, row)| {
+        for (x, px) in row.iter_mut().enumerate() {
+            let (sx, sy) = (2 * x as i64, 2 * y as i64);
+            let mut acc = [0.0f32; 4];
+            for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+                let p = src.get_clamped(sx + dx, sy + dy);
+                for c in 0..4 {
+                    acc[c] += p[c];
+                }
+            }
+            *px = acc.map(|v| v * 0.25);
+        }
+    });
+    out
 }
 
 /// Draw `src` transformed by `m` (src pixel space → dst pixel space) onto `dst` with blending.
