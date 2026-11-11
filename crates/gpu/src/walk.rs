@@ -17,52 +17,6 @@ use effectcraft_time::Tick;
 use crate::context::{Enc, GpuImage};
 use crate::ops;
 
-/// Two canvases whose pixels differ only in `dirty`; ordinary bounded layers can copy that
-/// rectangle forward, then update their own dispatch area in the next canvas.
-struct PingPongCanvas {
-    images: [GpuImage; 2],
-    front: usize,
-    dirty: Option<(u32, u32, u32, u32)>,
-}
-
-impl PingPongCanvas {
-    fn new(e: &mut Enc, canvas: &GpuImage) -> Self {
-        let mut a = e.scratch(canvas.width, canvas.height);
-        let mut b = e.scratch(canvas.width, canvas.height);
-        e.copy_image(canvas, &a);
-        e.copy_image(canvas, &b);
-        a.levels = canvas.levels;
-        b.levels = canvas.levels;
-        Self { images: [a, b], front: 0, dirty: None }
-    }
-
-    fn draw(
-        &mut self,
-        e: &mut Enc,
-        src: &GpuImage,
-        matrix: &effectcraft_geom::Mat3,
-        opts: ops::WarpOptions,
-        levels: Option<f32>,
-        quantize_source: bool,
-    ) -> bool {
-        let next = 1 - self.front;
-        let current = self.images[self.front].clone();
-        match ops::warp_q_pingpong(e, &current, &mut self.images[next], src, matrix, opts, levels, self.dirty, quantize_source) {
-            ops::PingPongWarp::Unsupported => false,
-            ops::PingPongWarp::Unchanged => true,
-            ops::PingPongWarp::Drawn(region) => {
-                self.front = next;
-                self.dirty = Some(region);
-                true
-            }
-        }
-    }
-
-    fn finish(self, canvas: &mut GpuImage) {
-        *canvas = self.images[self.front].clone();
-    }
-}
-
 /// The size [`render`] renders `comp_id` at, without rendering it.
 pub(crate) fn frame_size(r: &Renderer, comp_id: ItemId, t: Tick) -> Option<(u32, u32)> {
     let ctx = r.eval_ctx(comp_id, t)?;
@@ -122,76 +76,11 @@ fn on_cpu(e: &mut Enc, canvas: &mut GpuImage, f: impl FnOnce(&mut Image)) -> Opt
 fn draw_comp<'a>(e: &mut Enc, r: &Renderer<'a>, ctx: &EvalCtx<'a>, canvas: &mut GpuImage) -> Option<()> {
     let visible = r.visible_layers(ctx);
     let levels = r.pipe().levels;
-    // Quantizing uploaded texels is equivalent to quantizing CPU-rendered sources only when
-    // the renderer is already in the blending space. A color-space conversion must keep its
-    // full-precision input until after conversion.
-    let compact_8bit_sources = levels == Some(255.0) && r.pipe().to_blend().is_none();
     let mut i = 0;
     while i < visible.len() {
         // A device that ran out of memory (or was lost) on an earlier layer fails every later
         // one: give the frame back to the CPU now instead of drawing the rest of the comp.
         e.g.check_health().ok()?;
-        if occluded[i] {
-            i += 1;
-            continue;
-        }
-        if r.can_prepare_gpu_layer(visible[i]) {
-            let mut end = i + 1;
-            while end < visible.len() && r.can_prepare_gpu_layer(visible[end]) {
-                end += 1;
-            }
-            if end - i >= 16 {
-                const BATCH: usize = 32;
-                let mut ping_pong: Option<PingPongCanvas> = None;
-                for start in (i..end).step_by(BATCH) {
-                    let stop = (start + BATCH).min(end);
-                    let prepared = r.prepare_gpu_layer_batch(ctx, &visible[start..stop], &occluded[start..stop], canvas.width, canvas.height)?;
-                    for (offset, st) in prepared.into_iter().enumerate() {
-                        e.g.check_health().ok()?;
-                        let Some(st) = st else { continue };
-                        let layer = visible[start + offset];
-                        let opacity = r.layer_opacity(ctx, layer);
-                        let quantize_source = st.quantize_source() || compact_8bit_sources;
-                        let prepared_by_ping_pong = if st.plain && opacity > 0.0 {
-                            let placement = r.placement(ctx, layer, &st.body);
-                            if let [matrix] = placement.matrices.as_slice() {
-                                let src = if compact_8bit_sources { e.g.upload_buf_8bit(&st.body, st.quantize_source())? } else { e.g.upload_buf(&st.body)? };
-                                let ping_pong = ping_pong.get_or_insert_with(|| PingPongCanvas::new(e, canvas));
-                                ping_pong.draw(
-                                    e,
-                                    &src,
-                                    matrix,
-                                    ops::WarpOptions { sampling: placement.sampling, mode: layer.blend_mode, opacity, seed: placement.seed },
-                                    levels,
-                                    quantize_source,
-                                )
-                            } else {
-                                false
-                            }
-                        } else {
-                            false
-                        };
-                        if !prepared_by_ping_pong && let Some(ping_pong) = ping_pong.take() {
-                            ping_pong.finish(canvas);
-                        }
-                        let full_quantize = if prepared_by_ping_pong {
-                            e.mem_gate();
-                            false
-                        } else {
-                            !draw_prepared_layer(e, r, ctx, layer, canvas, st)?
-                        };
-                        if full_quantize && let Some(l) = levels {
-                            *canvas = ops::quantize(e, canvas, l);
-                        }
-                    }
-                }
-                if let Some(ping_pong) = ping_pong {
-                    ping_pong.finish(canvas);
-                }
-                i = end;
-                continue;
-            }
-        }
         let full_quantize = if visible[i].is_3d() {
             let mut j = i;
             while j < visible.len() && visible[j].is_3d() {
@@ -324,13 +213,15 @@ fn draw_collapsed<'a>(
     composite_iso(e, r, ctx, layer, iso, canvas, opacity)
 }
 
-fn draw_layer(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, canvas: &mut GpuImage) -> Option<()> {
+fn draw_layer(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, canvas: &mut GpuImage) -> Option<bool> {
     let out = draw_layer_on(e, r, ctx, layer, canvas);
     e.mem_gate();
     out
 }
 
-fn draw_layer_on(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, canvas: &mut GpuImage) -> Option<()> {
+/// `true` means placement or a no-op has already left the canvas quantised; more complex paths
+/// need the compositor's full-frame quantisation after this layer.
+fn draw_layer_on(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, canvas: &mut GpuImage) -> Option<bool> {
     if layer.switches.adjustment {
         if draw_adjustment(e, r, ctx, layer, canvas).is_some() {
             return Some(());
@@ -352,12 +243,9 @@ fn draw_layer_on(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, canvas
     if let Some(done) = draw_resident_fx(e, r, ctx, layer, canvas, opacity) {
         return done;
     }
-    if let Some(done) = draw_picture(e, r, ctx, layer, canvas, opacity) {
-        return done;
-    }
-    let Some(st) = r.styled_layer(ctx, layer) else { return Some(()) };
+    let Some(st) = r.styled_layer(ctx, layer) else { return Some(true) };
     if st.plain {
-        return composite_layer(e, r, ctx, layer, &st.body, canvas, opacity);
+        return composite_layer(e, r, ctx, layer, &st.body, canvas, opacity).map(|()| true);
     }
     // Layer styles: exterior passes with their own modes, then the body; the layer's opacity
     // fades the whole stack; knockout and channel switches as on the CPU.
@@ -434,52 +322,6 @@ fn draw_resident_fx(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, can
     // The placement only reads the buffer's size, offset and scale.
     let shape = Buf { img: Image { width: img.width, height: img.height, data: Vec::new() }, offset, scale };
     Some(place_src(e, r, ctx, layer, &shape, img, canvas, layer.blend_mode, opacity, pipe.levels).map(|c| *canvas = c))
-}
-
-/// Shared footage pictures ([`picture`]); tests turn it off to compare.
-pub(crate) static SHARED_PICTURES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
-
-/// The layer's source as the decoded footage picture (`Renderer::footage_picture`), unless
-/// sharing is off or per-layer timings are being recorded (those time the layer-cache path).
-fn picture(r: &Renderer, ctx: &EvalCtx, layer: &Layer) -> Option<effectcraft_render::FootagePicture> {
-    if !SHARED_PICTURES.load(std::sync::atomic::Ordering::Relaxed) || r.profile.is_some() {
-        return None;
-    }
-    r.footage_picture(ctx, layer)
-}
-
-/// A footage layer without effects or layer styles whose source is the decoded picture as it
-/// is (`Renderer::footage_picture`) and needs no conversion to the blending space: placed
-/// straight from the picture's texture, uploaded once per frame and shared by every layer that
-/// shows the same frame, instead of from a copy per layer in the layer cache, uploaded per
-/// layer. The pixels are the same: the layer-cache buffer is that picture, copied. `None`: not
-/// this kind of layer; `Some(None)`: the GPU failed.
-fn draw_picture(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, canvas: &mut GpuImage, opacity: f32) -> Option<Option<()>> {
-    if (layer.switches.effects && layer.effects().is_some_and(|f| !f.children.is_empty())) || styles::active(ctx, layer) || r.pipe().to_blend().is_some() {
-        return None;
-    }
-    let p = picture(r, ctx, layer)?;
-    if p.img.is_empty() {
-        return Some(Some(()));
-    }
-    let Some(src) = e.g.upload_picture(&p.img) else { return Some(None) };
-    // The placement only reads the buffer's size, offset and scale.
-    let shape = Buf { img: Image { width: p.img.width, height: p.img.height, data: Vec::new() }, offset: [0.0; 2], scale: p.scale };
-    Some(composite_src(e, r, ctx, layer, &shape, src, canvas, opacity))
-}
-
-/// [`composite_layer`] of a GPU image `src` shaped like `shape`.
-#[allow(clippy::too_many_arguments)]
-fn composite_src(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, shape: &Buf, src: GpuImage, canvas: &mut GpuImage, opacity: f32) -> Option<()> {
-    if opacity <= 0.0 {
-        return Some(());
-    }
-    if r.track_matte(ctx, layer).is_none() && !layer.preserve_transparency {
-        *canvas = place_src(e, r, ctx, layer, shape, src, canvas, layer.blend_mode, opacity, r.pipe().levels)?;
-        return Some(());
-    }
-    let iso = place_src(e, r, ctx, layer, shape, src, &e.zeros(canvas.width, canvas.height), BlendMode::Normal, 1.0, None)?;
-    composite_iso(e, r, ctx, layer, iso, canvas, opacity)
 }
 
 /// A 2D precomp layer, its nested comp rendered resident on the GPU (`walk::render` one level
@@ -574,9 +416,7 @@ fn composite_layer(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, buf:
     let matte = r.track_matte(ctx, layer).is_some();
     if !matte && !layer.preserve_transparency {
         // The comp is quantised after the layer (8/16 bpc) in the same pass.
-        let source_is_8bit = r.pipe().levels == Some(255.0) && r.pipe().to_blend().is_none();
-        let src = if source_is_8bit { e.g.upload_buf_8bit(buf, quantize_source)? } else { e.g.upload_buf(buf)? };
-        *canvas = place_src(e, r, ctx, layer, buf, src, canvas, layer.blend_mode, opacity, r.pipe().levels, quantize_source || source_is_8bit)?;
+        *canvas = place(e, r, ctx, layer, buf, canvas, layer.blend_mode, opacity, r.pipe().levels)?;
         return Some(());
     }
     // Render in isolation, then matte / preserve transparency, then blend.

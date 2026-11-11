@@ -51,7 +51,7 @@ impl<'a> Renderer<'a> {
     pub(crate) fn styled(&self, ctx: &EvalCtx, layer: &Layer, mut timing: Option<&mut LayerTiming>) -> Option<StyledLayer> {
         let (content, ckey, files) = self.content_buf_timed(ctx, layer, timing.as_deref_mut())?;
         if !styles::active(ctx, layer) {
-            return Some(StyledLayer { passes: vec![], body: content.clone(), content, key: ckey, ckey, plain: true, quantize_source: false });
+            return Some(StyledLayer { passes: vec![], body: content.clone(), content, key: ckey, ckey, plain: true });
         }
         let modes = styles::pass_modes(ctx, layer);
         let key = ckey.map(|k| cache::styles_key(ctx, layer, k));
@@ -70,7 +70,7 @@ impl<'a> Renderer<'a> {
                 })
                 .collect();
             if let Some(passes) = passes {
-                return Some(StyledLayer { passes, body, content, key, ckey, plain: false, quantize_source: false });
+                return Some(StyledLayer { passes, body, content, key, ckey, plain: false });
             }
         }
         let t0 = web_time::Instant::now();
@@ -90,7 +90,7 @@ impl<'a> Renderer<'a> {
                 *b = c.insert(cache::derive(k, i as u64 + 1), b.clone());
             }
         }
-        Some(StyledLayer { passes, body, content, key, ckey, plain: false, quantize_source: false })
+        Some(StyledLayer { passes, body, content, key, ckey, plain: false })
     }
 
     /// The styled layer's buffers in the blending space.
@@ -492,7 +492,7 @@ impl<'a> Renderer<'a> {
     pub(crate) fn styled_for_draw(&self, ctx: &EvalCtx, layer: &Layer, timing: Option<&mut LayerTiming>) -> Option<StyledLayer> {
         if let Some(buf) = self.plain_solid_mip(ctx, layer) {
             let body = Arc::new(buf);
-            return Some(StyledLayer { passes: vec![], body: body.clone(), content: body, key: None, ckey: None, plain: true, quantize_source: false });
+            return Some(StyledLayer { passes: vec![], body: body.clone(), content: body, key: None, ckey: None, plain: true });
         }
         self.styled(ctx, layer, timing)
     }
@@ -552,6 +552,136 @@ impl<'a> Renderer<'a> {
             }
         }
         changed
+    }
+
+    /// Skip bounded 2D layers whose complete draw footprint is covered by later opaque solids.
+    /// The input is in bottom-to-top order; coverage is accumulated from top to bottom.
+    pub(crate) fn occluded_bounded_layers(&self, ctx: &EvalCtx, layers: &[&Layer], width: u32, height: u32) -> Vec<bool> {
+        let mut culled = vec![false; layers.len()];
+        if layers.len() < 64 || width == 0 || height == 0 {
+            return culled;
+        }
+        let cols = (width as usize).div_ceil(OCCLUSION_TILE);
+        let rows = (height as usize).div_ceil(OCCLUSION_TILE);
+        let Some(cells) = cols.checked_mul(rows).filter(|&n| n <= 1 << 20) else { return culled };
+        let mut covered = vec![false; cells];
+        let mut uncovered = cells;
+
+        for (index, layer) in layers.iter().enumerate().rev() {
+            // Later opaque layers cover every output tile. No earlier 2D layer can then change
+            // the final frame, regardless of its source type, effects, matte or blend mode.
+            if uncovered == 0 {
+                if !layer.is_3d() {
+                    culled[index] = true;
+                }
+                continue;
+            }
+            let Some(bounds) = self.simple_layer_bounds(ctx, layer, width, height) else { continue };
+            if bounds.draw[0] >= bounds.draw[2] || bounds.draw[1] >= bounds.draw[3] {
+                culled[index] = true;
+                continue;
+            }
+            let tx0 = bounds.draw[0] / OCCLUSION_TILE;
+            let tx1 = bounds.draw[2].div_ceil(OCCLUSION_TILE).min(cols);
+            let ty0 = bounds.draw[1] / OCCLUSION_TILE;
+            let ty1 = bounds.draw[3].div_ceil(OCCLUSION_TILE).min(rows);
+            if (ty0..ty1).all(|y| (tx0..tx1).all(|x| covered[y * cols + x])) {
+                culled[index] = true;
+                continue;
+            }
+
+            if Self::can_occlude_layer(ctx, layer, self) {
+                let tile = OCCLUSION_TILE as f64;
+                let ox0 = ((bounds.opaque[0].max(0.0) / tile).ceil() as usize).min(cols);
+                let ox1 = ((bounds.opaque[2].min(width as f64) / tile).floor() as usize).min(cols);
+                let oy0 = ((bounds.opaque[1].max(0.0) / tile).ceil() as usize).min(rows);
+                let oy1 = ((bounds.opaque[3].min(height as f64) / tile).floor() as usize).min(rows);
+                for y in oy0..oy1 {
+                    for x in ox0..ox1 {
+                        let cell = y * cols + x;
+                        if !covered[cell] {
+                            covered[cell] = true;
+                            uncovered -= 1;
+                        }
+                    }
+                }
+            }
+        }
+        culled
+    }
+
+    /// Conservative output-space bounds for a bounded source with no feature that can extend its
+    /// pixels. Masks can only reduce the footprint; effects, styles and collapse can grow it.
+    fn simple_layer_bounds(&self, ctx: &EvalCtx, layer: &Layer, width: u32, height: u32) -> Option<OpaqueBounds> {
+        if !matches!(layer.source, LayerSource::Solid { .. } | LayerSource::Footage { .. } | LayerSource::Comp { .. })
+            || layer.is_3d()
+            || layer.switches.collapse
+            || layer.switches.adjustment
+            || self.quality(layer) == Quality::Wireframe
+            || self.blurred(ctx, layer)
+            || layer.effects().is_some_and(|g| g.groups().any(|e| e.enabled))
+            || styles::active(ctx, layer)
+        {
+            return None;
+        }
+
+        let (source_width, source_height) = ctx.source_size(layer);
+        if source_width == 0 || source_height == 0 {
+            return None;
+        }
+        // Transparent pixels still matter to masks and blending, so use the complete source
+        // rectangle rather than inspecting pixel alpha.
+        let source_bounds = Rect::from_size(source_width as f64, source_height as f64);
+        let (layer_to_comp, _) = ctx.layer_to_comp(layer);
+        let layer_to_output = self.outer.map_or(layer_to_comp, |outer| outer * layer_to_comp);
+        let matrix = self.out_matrix() * Mat3::scale(vec2(self.opts.scale, self.opts.scale)) * layer_to_output;
+        if !matrix.is_affine() || ((matrix.0[0][1] != 0.0 || matrix.0[1][0] != 0.0) && Self::can_occlude_layer(ctx, layer, self)) {
+            return None;
+        }
+        let bounds = matrix.map_rect(&source_bounds);
+        let [x0, y0, x1, y1] = [bounds.x0, bounds.y0, bounds.x1, bounds.y1];
+        if ![x0, y0, x1, y1].into_iter().all(f64::is_finite) {
+            return None;
+        }
+        let to_px = |v: f64, max: u32| (v as i64).clamp(0, max as i64) as usize;
+        let draw = [to_px((x0 - 1.0).floor(), width), to_px((y0 - 1.0).floor(), height), to_px((x1 + 1.0).ceil(), width), to_px((y1 + 1.0).ceil(), height)];
+        Some(OpaqueBounds { draw, opaque: [x0 + 1.0, y0 + 1.0, x1 - 1.0, y1 - 1.0] })
+    }
+
+    /// Whether a bounded, non-expanding 2D layer cannot touch this output canvas.
+    pub(crate) fn layer_outside_canvas(&self, ctx: &EvalCtx, layer: &Layer, width: u32, height: u32) -> bool {
+        self.simple_layer_bounds(ctx, layer, width, height).is_some_and(|bounds| bounds.draw[0] >= bounds.draw[2] || bounds.draw[1] >= bounds.draw[3])
+    }
+
+    /// Simple normal solids and footage explicitly interpreted without alpha can add covered
+    /// tiles for later culling. This only uses source metadata, so the culling pass doesn't decode
+    /// media it would otherwise never need.
+    fn can_occlude_layer(ctx: &EvalCtx, layer: &Layer, r: &Renderer<'_>) -> bool {
+        let opaque_source = match &layer.source {
+            LayerSource::Solid { item } => r.proxy_for(*item).is_none() && matches!(r.project.item(*item).map(|i| &i.kind), Some(ItemKind::Solid(_))),
+            LayerSource::Footage { item } => {
+                let item = ctx.media_item(layer, *item);
+                r.proxy_for(item).is_none()
+                    && r.project.item(item).is_some_and(
+                        |i| matches!(&i.kind, ItemKind::Footage(f) if f.has_video && !f.missing && f.alpha == effectcraft_project::AlphaMode::Ignore && !f.invert_alpha),
+                    )
+            }
+            _ => false,
+        };
+        opaque_source
+            && !layer.is_3d()
+            && !layer.switches.adjustment
+            && !layer.switches.collapse
+            && layer.parent.is_none()
+            && layer.blend_mode == BlendMode::Normal
+            && layer.track_matte.is_none()
+            && !layer.preserve_transparency
+            && !r.blurred(ctx, layer)
+            && ctx.opacity(layer) as f32 * r.opacity_mul == 1.0
+            && r.quality(layer) != Quality::Wireframe
+            && !layer.masks().is_some_and(|m| !m.children.is_empty())
+            && !layer.effects().is_some_and(|g| g.groups().any(|e| e.enabled))
+            && !styles::active(ctx, layer)
     }
 
     /// Composite a styled layer: exterior passes with their own modes, then the body with the
@@ -720,15 +850,6 @@ pub struct StyledLayer {
     ckey: Option<u64>,
     /// No layer styles: composite `body` the usual way.
     pub plain: bool,
-    /// The GPU will quantize these unquantized source pixels before sampling.
-    pub(crate) quantize_source: bool,
-}
-
-impl StyledLayer {
-    /// Whether the accelerator should quantize body texels before filtering and blending them.
-    pub fn quantize_source(&self) -> bool {
-        self.quantize_source
-    }
 }
 
 /// Where a layer buffer lands (see [`Renderer::placement`]).
