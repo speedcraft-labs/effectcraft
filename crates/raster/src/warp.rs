@@ -516,8 +516,7 @@ fn affine_rows<const TRACK_CHANGES: bool>(
         }
         if changed.a < changed.b { [changed.a, y, changed.b, y + 1] } else { empty }
     };
-    let workers = rayon::current_num_threads().clamp(1, 8);
-    let rows = dst.data.par_chunks_mut(w).enumerate().skip(y0).take(y1 - y0).with_min_len((y1 - y0).div_ceil(workers).max(1));
+    let rows = dst.data.par_chunks_mut(w).enumerate().skip(y0).take(y1 - y0);
     if TRACK_CHANGES {
         rows.map(|(y, row)| draw_row(y, row)).reduce(|| empty, union)
     } else {
