@@ -287,7 +287,7 @@ fn quantize_rect(img: &mut Image, r: PxRect, levels: f32) {
             quantize_row(&mut img.data[y * w..(y + 1) * w]);
         }
     } else {
-        img.data[r.y0 as usize * w..r.y1 as usize * w].par_chunks_mut(w).with_min_len(rows.div_ceil(4).max(1)).for_each(quantize_row);
+        img.data[r.y0 as usize * w..r.y1 as usize * w].par_chunks_mut(w).for_each(quantize_row);
     }
 }
 
