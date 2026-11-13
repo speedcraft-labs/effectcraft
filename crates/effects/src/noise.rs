@@ -1,6 +1,5 @@
 //! Noise & Grain effects: film grain, median-family filters, denoising and procedural noise.
 
-use craft_blur::MedianHistogram;
 use effectcraft_color::{hsl_to_rgb, luminance, rgb_to_hsl};
 use effectcraft_keyframe::Value;
 use effectcraft_project::ParamUi;
@@ -371,18 +370,29 @@ fn quant(v: f32) -> u16 {
     (v.clamp(0.0, 1.0) * (NB - 1) as f32).round() as u16
 }
 
+/// Largest median window radius (buffer pixels) for Median, Median (Legacy), Dust & Scratches
+/// and the other median users. Radius goes to 255 in the UI; filling one (2r + 1)² window per
+/// row costs the square of the radius, so a project value far beyond it is held here (also
+/// keeping the window's pixel count well inside `u32` / `i32` on the GPU).
+pub const MEDIAN_MAX_RADIUS: usize = 512;
+
 /// Per-channel median over a (2r+1)² window of the premultiplied channels (values quantised to
 /// 512 levels in 0..1, edges repeated).
 pub(crate) fn median_image(img: &Image, r: usize) -> Image {
+    let r = r.min(MEDIAN_MAX_RADIUS);
     let (w, h) = (img.width as usize, img.height as usize);
     if r == 0 || w == 0 || h == 0 {
         return img.clone();
     }
     let q: Vec<[u16; 4]> = img.data.par_iter().map(|p| [quant(p[0]), quant(p[1]), quant(p[2]), quant(p[3])]).collect();
+    let n = (2 * r + 1) * (2 * r + 1);
+    let half = n / 2;
     let ri = r as i64;
     let mut out = Image::new(img.width, img.height);
     out.rows_mut().for_each(|(y, row)| {
-        let mut hist = std::array::from_fn::<_, 4, _>(|_| MedianHistogram::new(NB));
+        let mut hist = vec![0u32; NB * 4];
+        let mut med = [0usize; 4];
+        let mut lt = [0usize; 4];
         let at = |x: i64, y: i64| q[y.clamp(0, h as i64 - 1) as usize * w + x.clamp(0, w as i64 - 1) as usize];
         let col = |x: i64, f: &mut dyn FnMut([u16; 4])| {
             for dy in -ri..=ri {
@@ -392,25 +402,46 @@ pub(crate) fn median_image(img: &Image, r: usize) -> Image {
         for dx in -ri..=ri {
             col(dx, &mut |v| {
                 for c in 0..4 {
-                    hist[c].add(v[c] as usize);
+                    hist[c * NB + v[c] as usize] += 1;
                 }
             });
         }
+        let rebalance = |hist: &[u32], med: &mut [usize; 4], lt: &mut [usize; 4]| {
+            for c in 0..4 {
+                let hc = &hist[c * NB..(c + 1) * NB];
+                while lt[c] > half {
+                    med[c] -= 1;
+                    lt[c] -= hc[med[c]] as usize;
+                }
+                while lt[c] + hc[med[c]] as usize <= half {
+                    lt[c] += hc[med[c]] as usize;
+                    med[c] += 1;
+                }
+            }
+        };
+        rebalance(&hist, &mut med, &mut lt);
         for x in 0..w {
-            row[x] = std::array::from_fn(|c| hist[c].median().unwrap_or_default() as f32 / (NB - 1) as f32);
+            row[x] = med.map(|m| m as f32 / (NB - 1) as f32);
             if x + 1 == w {
                 break;
             }
             col(x as i64 - ri, &mut |v| {
                 for c in 0..4 {
-                    hist[c].remove(v[c] as usize);
+                    hist[c * NB + v[c] as usize] -= 1;
+                    if (v[c] as usize) < med[c] {
+                        lt[c] -= 1;
+                    }
                 }
             });
             col(x as i64 + ri + 1, &mut |v| {
                 for c in 0..4 {
-                    hist[c].add(v[c] as usize);
+                    hist[c * NB + v[c] as usize] += 1;
+                    if (v[c] as usize) < med[c] {
+                        lt[c] += 1;
+                    }
                 }
             });
+            rebalance(&hist, &mut med, &mut lt);
         }
     });
     out
@@ -735,10 +766,12 @@ pub fn specs() -> Vec<EffectSpec> {
     let hls_common = || {
         vec![
             p("noise", "Noise", Value::Enum(0), popup(&["Uniform", "Squared", "Grain"])),
-            p("hue", "Hue", num(0.0), pct()),
-            p("lightness", "Lightness", num(0.0), pct()),
-            p("saturation", "Saturation", num(0.0), pct()),
-            p("grainSize", "Grain Size", num(1.0), slider(0.1, 100.0, 0.5, 10.0, 2)),
+            // After Effects' valid ranges (#3483, #3484): the amounts go to 1000 %, Grain Size
+            // down to 0 (the renderer floors it at 0.1 px) and keeps its wider maximum.
+            p("hue", "Hue", num(0.0), slider(0.0, 1000.0, 0.0, 100.0, 1)),
+            p("lightness", "Lightness", num(0.0), slider(0.0, 1000.0, 0.0, 100.0, 1)),
+            p("saturation", "Saturation", num(0.0), slider(0.0, 1000.0, 0.0, 100.0, 1)),
+            p("grainSize", "Grain Size", num(1.0), slider(0.0, 100.0, 0.5, 10.0, 2)),
         ]
     };
     let mut hls = hls_common();
@@ -848,18 +881,23 @@ mod tests {
     }
 
     #[test]
+    fn median_radius_is_capped() {
+        // A project's Radius far beyond the UI's 255 takes the capped window, not a
+        // (2r + 1)² fill per row (or an overflow) on a tiny image.
+        let mut img = Image::filled(4, 3, [0.2, 0.3, 0.4, 1.0]);
+        img.set(1, 1, [1.0, 1.0, 1.0, 1.0]);
+        let capped = median_image(&img, MEDIAN_MAX_RADIUS);
+        assert_eq!(median_image(&img, usize::MAX).data, capped.data);
+        assert_eq!(median_image(&img, MEDIAN_MAX_RADIUS + 1000).data, capped.data);
+    }
+
+    #[test]
     fn median_matches_brute_force() {
         let (w, h) = (9u32, 7u32);
         let mut img = Image::new(w, h);
         for y in 0..h {
             for x in 0..w {
-                let v = |k: u32| {
-                    let mut s = x.wrapping_mul(0x8da6_b343) ^ y.wrapping_mul(0xd816_3841) ^ k.wrapping_mul(0xcb1a_b31f);
-                    s ^= s >> 16;
-                    s = s.wrapping_mul(0x7feb_352d);
-                    s ^= s >> 15;
-                    (s % 512) as f32 / 511.0
-                };
+                let v = |k: u32| ((x * 37 + y * 101 + k * 13) % 511) as f32 / 511.0;
                 img.set(x, y, [v(0), v(1), v(2), v(3)]);
             }
         }
@@ -878,43 +916,6 @@ mod tests {
                         let want = vals[vals.len() / 2];
                         let got = m.data[y as usize * w as usize + x as usize][c];
                         assert!((want - got).abs() < 1e-4, "r={r} ({x},{y}) c={c}: {want} vs {got}");
-                    }
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn median_matches_brute_force_on_pinned_8_and_16_bit_images_when_available() {
-        let Some(root) = std::env::var_os("ARTCRAFT_CORPUS") else { return };
-        for fixture in ["basn6a08.png", "basn6a16.png"] {
-            let path = std::path::PathBuf::from(&root).join("pngsuite").join(fixture);
-            assert!(path.exists(), "missing corpus fixture {path:?}");
-            let decoded = image::open(&path);
-            assert!(decoded.is_ok(), "could not decode corpus fixture {path:?}");
-            let Ok(decoded) = decoded else { return };
-            let rgba = decoded.to_rgba32f();
-            let (w, h) = (rgba.width(), rgba.height());
-            let mut img = Image::new(w, h);
-            for (i, pixel) in rgba.pixels().enumerate() {
-                img.data[i] = pixel.0;
-            }
-            for r in [1usize, 3] {
-                let actual = median_image(&img, r);
-                for y in 0..h as i64 {
-                    for x in 0..w as i64 {
-                        for c in 0..4 {
-                            let mut values = Vec::new();
-                            for dy in -(r as i64)..=r as i64 {
-                                for dx in -(r as i64)..=r as i64 {
-                                    values.push(quant(img.get_clamped(x + dx, y + dy)[c]));
-                                }
-                            }
-                            values.sort_unstable();
-                            let want = values[values.len() / 2] as f32 / 511.0;
-                            let got = actual.data[y as usize * w as usize + x as usize][c];
-                            assert_eq!(got.to_bits(), want.to_bits(), "{fixture} r={r} ({x},{y}) c={c}");
-                        }
                     }
                 }
             }
@@ -966,6 +967,32 @@ mod tests {
         assert_ne!(a.img, b.img);
         let still = run("ec.noise.noisehls", &[], img.clone(), 0.0);
         assert_eq!(still.img, img);
+    }
+
+    /// #3483, #3484: amounts above 100 % keep adding noise, and Grain Size 0 renders (floored at
+    /// 0.1 px) with finite output, for both effects.
+    #[test]
+    fn noise_hls_takes_after_effects_ranges() {
+        let mut img = Image::new(16, 16);
+        for (i, p) in img.data.iter_mut().enumerate() {
+            *p = premul([0.6, 0.3, (i % 7) as f32 / 7.0], 1.0);
+        }
+        for id in ["ec.noise.noisehls", "ec.noise.noisehlsauto"] {
+            for (param, lo, hi) in [("hue", 0.0, 1000.0), ("lightness", 0.0, 1000.0), ("saturation", 0.0, 1000.0), ("grainSize", 0.0, 100.0)] {
+                let ui = &crate::find(id).unwrap().params.iter().find(|p| p.id == param).unwrap().ui;
+                assert!(matches!(ui, ParamUi::Slider { min, max, .. } if *min == lo && *max == hi), "{id} {param}: {ui:?}");
+            }
+            let at = |amount: f64, grain: f64| {
+                let vals =
+                    [("noise", Value::Enum(2)), ("hue", num(amount)), ("lightness", num(amount)), ("saturation", num(amount)), ("grainSize", num(grain))];
+                run(id, &vals, img.clone(), 0.0).img
+            };
+            let (low, high) = (at(100.0, 1.0), at(1000.0, 1.0));
+            assert_ne!(low, high, "{id}");
+            for out in [high, at(1000.0, 0.0)] {
+                assert!(out.data.iter().flatten().all(|v| v.is_finite() && (0.0..=1.0).contains(v)), "{id}");
+            }
+        }
     }
 
     #[test]

@@ -28,8 +28,6 @@ web-time = { workspace = true }
 pollster = { workspace = true }
 
 [dev-dependencies]
-craft-resample = { workspace = true }
-craft-bench = { package = "craft-bench", git = "https://github.com/speedcraft-labs/craft-libs", branch = "algo/integration" }
 effectcraft-text = { workspace = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]

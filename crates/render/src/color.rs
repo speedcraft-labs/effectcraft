@@ -266,11 +266,10 @@ fn quantize_rect(img: &mut Image, r: PxRect, levels: f32) {
     let inv = 1.0 / levels;
     let w = img.width as usize;
     let (x0, x1) = (r.x0 as usize, r.x1 as usize);
-    let rows = (r.y1 - r.y0) as usize;
-    let quantize_row = |row: &mut [[f32; 4]]| {
-        // Runs of all-zero pixels (+0.0 in every channel) quantise to themselves: skip them in
-        // blocks (sparse shape, precomp and glow buffers are mostly empty).
-        let (blocks, rest) = row[x0..x1].as_chunks_mut::<16>();
+    img.data[r.y0 as usize * w..r.y1 as usize * w].par_chunks_mut(w).for_each(|row| {
+        // Runs of all-zero pixels (+0.0 in every channel) quantise to themselves: skip them a
+        // cache line at a time (sparse shape, precomp and glow buffers are mostly empty).
+        let (blocks, rest) = row[x0..x1].as_chunks_mut::<4>();
         for b in blocks {
             if b.as_flattened().iter().fold(0, |a, v| a | v.to_bits()) != 0 {
                 for p in b {
@@ -281,14 +280,7 @@ fn quantize_rect(img: &mut Image, r: PxRect, levels: f32) {
         for p in rest {
             quantize_px(p, levels, inv);
         }
-    };
-    if rows.saturating_mul(x1 - x0) <= 32 * 1024 {
-        for y in r.y0 as usize..r.y1 as usize {
-            quantize_row(&mut img.data[y * w..(y + 1) * w]);
-        }
-    } else {
-        img.data[r.y0 as usize * w..r.y1 as usize * w].par_chunks_mut(w).for_each(quantize_row);
-    }
+    });
 }
 
 /// Convert premultiplied pixels (on straight colour).
