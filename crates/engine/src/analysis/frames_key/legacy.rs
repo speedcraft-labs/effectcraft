@@ -111,7 +111,9 @@ impl std::fmt::Debug for FootageText<'_> {
             .field("loop_count", loop_count)
             .field("codec", codec)
             .field("missing", &self.missing)
-            .field("sequence", sequence)
+            // `SequenceFiles` now stores raw JSON lazily; old releases hashed the Vec's Debug
+            // text, so keep that exact representation for persisted legacy analysis keys.
+            .field("sequence", &**sequence)
             .field("color_profile", color_profile)
             .field("layer", layer)
             .field("fields", fields)
