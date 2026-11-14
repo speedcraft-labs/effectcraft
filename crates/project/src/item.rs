@@ -4,6 +4,22 @@ use super::layer::LayerSource;
 use super::settings::{APP_VERSION, ProjectError, ProjectSettings, SCHEMA_VERSION, SavedView};
 use super::{Arc, BTreeMap, Deserialize, FrameRate, Label, Project, Serialize, Tick, file_check, limits};
 
+fn parse_project_items(items: BTreeMap<ItemId, &serde_json::value::RawValue>) -> Result<BTreeMap<ItemId, Item>, serde_json::Error> {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        use rayon::prelude::*;
+
+        items
+            .into_par_iter()
+            .map(|(id, raw)| serde_json::from_str::<Item>(raw.get()).map(|item| (id, item)))
+            .collect()
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        items.into_iter().map(|(id, raw)| serde_json::from_str::<Item>(raw.get()).map(|item| (id, item))).collect()
+    }
+}
+
 /// `base` numbered with the lowest counter from 2 for which `taken` is false: a copy of an item or
 /// another layer of the same name. A number set off by a space is a counter and is replaced
 /// (`Red Solid 1` → `Red Solid 2`, `shot 2` → `shot 3`); digits that end a word belong to the
@@ -408,10 +424,11 @@ impl Project {
     /// rescan a large file for each small metadata object.
     pub fn from_file_json_repaired(bytes: &[u8]) -> Result<(Project, Vec<String>, SavedView, Option<String>), ProjectError> {
         #[derive(Deserialize)]
-        struct ProjectFile {
+        struct ProjectFile<'a> {
             schema: u32,
             settings: ProjectSettings,
-            items: BTreeMap<ItemId, Item>,
+            #[serde(borrow)]
+            items: BTreeMap<ItemId, &'a serde_json::value::RawValue>,
             next_id: u64,
             #[serde(default)]
             render_queue: Vec<super::render_queue::RenderQueueItem>,
@@ -444,10 +461,11 @@ impl Project {
                 .and_then(serde_json::Value::as_object)
                 .map_or_else(BTreeMap::new, |o| o.iter().filter_map(|(k, v)| Some((ItemId(k.parse().ok()?), Tick(v.as_i64()?)))).collect()),
         };
+        let items = parse_project_items(file.items).map_err(|e| ProjectError::Invalid(e.to_string()))?;
         let p = Project {
             schema: file.schema,
             settings: file.settings,
-            items: file.items,
+            items,
             next_id: file.next_id,
             render_queue: file.render_queue,
             render_templates: file.render_templates,
