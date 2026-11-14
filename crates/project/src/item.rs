@@ -399,7 +399,65 @@ impl Project {
     /// was corrected (a composition of a billion pixels, a zero frame rate…), so a corrupt or
     /// hostile file still opens, within bounds, and the user can be told what changed.
     pub fn from_json_repaired(s: &str) -> Result<(Project, Vec<String>), ProjectError> {
-        let mut p: Project = serde_json::from_str(s).map_err(|e| ProjectError::Invalid(e.to_string()))?;
+        let p: Project = serde_json::from_str(s).map_err(|e| ProjectError::Invalid(e.to_string()))?;
+        Self::repair(p)
+    }
+
+    /// Parse a project file and its editor metadata in one pass. The project file stores
+    /// `savedBy` and the saved view next to the project fields, so parsing them separately would
+    /// rescan a large file for each small metadata object.
+    pub fn from_file_json_repaired(bytes: &[u8]) -> Result<(Project, Vec<String>, SavedView, Option<String>), ProjectError> {
+        #[derive(Deserialize)]
+        struct ProjectFile {
+            schema: u32,
+            settings: ProjectSettings,
+            items: BTreeMap<ItemId, Item>,
+            next_id: u64,
+            #[serde(default)]
+            render_queue: Vec<super::render_queue::RenderQueueItem>,
+            #[serde(default)]
+            render_templates: super::render_templates::RenderTemplates,
+            #[serde(default)]
+            render_prefs: super::render_queue::RenderQueuePrefs,
+            #[serde(default, rename = "savedBy")]
+            saved_by: Option<serde_json::Value>,
+            #[serde(default, rename = "activeComp")]
+            active_comp: Option<serde_json::Value>,
+            #[serde(default, rename = "openComps")]
+            open_comps: Option<serde_json::Value>,
+            #[serde(default, rename = "compTimes")]
+            comp_times: Option<serde_json::Value>,
+        }
+
+        let file: ProjectFile = serde_json::from_slice(bytes).map_err(|e| ProjectError::Invalid(e.to_string()))?;
+        let saved_by = file.saved_by.as_ref().and_then(serde_json::Value::as_str).map(str::to_string);
+        let view = SavedView {
+            active_comp: file.active_comp.as_ref().and_then(serde_json::Value::as_u64).map(ItemId),
+            open_comps: file
+                .open_comps
+                .as_ref()
+                .and_then(serde_json::Value::as_array)
+                .map_or_else(Vec::new, |a| a.iter().filter_map(serde_json::Value::as_u64).map(ItemId).collect()),
+            comp_times: file
+                .comp_times
+                .as_ref()
+                .and_then(serde_json::Value::as_object)
+                .map_or_else(BTreeMap::new, |o| o.iter().filter_map(|(k, v)| Some((ItemId(k.parse().ok()?), Tick(v.as_i64()?)))).collect()),
+        };
+        let p = Project {
+            schema: file.schema,
+            settings: file.settings,
+            items: file.items,
+            next_id: file.next_id,
+            render_queue: file.render_queue,
+            render_templates: file.render_templates,
+            render_prefs: file.render_prefs,
+        };
+        let (project, repaired) = Self::repair(p)?;
+        Ok((project, repaired, view, saved_by))
+    }
+
+    fn repair(mut p: Project) -> Result<(Project, Vec<String>), ProjectError> {
         craft_ecproj_format::check_schema(p.schema).map_err(|e| ProjectError::Invalid(e.to_string()))?;
         p.fix_next_id();
         let mut notes = vec![];

@@ -269,6 +269,18 @@ fn project_files_remember_the_open_comps() {
     assert_eq!(crate::saved_view(&not_a_map), crate::SavedView { comp_times: Default::default(), ..view });
 }
 
+#[test]
+fn file_open_parses_project_and_metadata_together() {
+    let (p, cid) = project_with_layer();
+    let view = crate::SavedView { active_comp: Some(cid), open_comps: vec![cid], comp_times: [(cid, Tick(42))].into() };
+    let text = p.to_file_json_with_view(&view, false).unwrap();
+    let (opened, repaired, parsed_view, saved_by) = Project::from_file_json_repaired(text.as_bytes()).unwrap();
+    assert_eq!(opened, p);
+    assert!(repaired.is_empty());
+    assert_eq!(parsed_view, view);
+    assert_eq!(saved_by.as_deref(), Some(crate::APP_VERSION));
+}
+
 /// The Project panel's "used N times": layers in every comp that use the item directly, a precomp
 /// counted by the comps it is nested in, and an unused item used by nothing.
 #[test]
