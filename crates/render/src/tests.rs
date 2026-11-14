@@ -286,6 +286,18 @@ fn precomp_and_3d_render() {
 }
 
 #[test]
+fn empty_precomp_renders_transparent() {
+    let (mut p, cid, comp) = setup();
+    let nested = Comp::new(200, 100, FrameRate::FPS_30, Tick::from_seconds_f64(2.0));
+    let nested_id = p.add_item("Empty", Label::Sandstone, None, ItemKind::Comp(nested.into()));
+    let layer = build::layer(&mut p, &comp, "Empty precomp", LayerSource::Comp { item: nested_id }, (200, 100), None);
+    p.comp_mut(cid).unwrap().layers.push(layer);
+
+    let image = render_frame(&p, cid, Tick::ZERO, 1.0);
+    assert!(image.data.iter().all(|pixel| *pixel == [0.0; 4]));
+}
+
+#[test]
 fn effects_run_in_pipeline() {
     let (mut p, cid, comp) = setup();
     let mut l = solid(&mut p, &comp, [1.0, 1.0, 1.0], 50, 50);
