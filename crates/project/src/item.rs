@@ -1,22 +1,196 @@
 use super::comp::Comp;
 use super::footage::{Footage, FootageKind, Proxy, Solid};
-use super::layer::LayerSource;
+use super::layer::{Layer, LayerSource};
 use super::settings::{APP_VERSION, ProjectError, ProjectSettings, SCHEMA_VERSION, SavedView};
 use super::{Arc, BTreeMap, Deserialize, FrameRate, Label, Project, Serialize, Tick, file_check, limits};
+
+#[derive(Deserialize)]
+struct ProjectItemParts<'a> {
+    id: ItemId,
+    name: String,
+    label: Label,
+    #[serde(default)]
+    comment: String,
+    #[serde(default)]
+    parent: Option<ItemId>,
+    #[serde(borrow)]
+    kind: &'a serde_json::value::RawValue,
+    #[serde(default)]
+    proxy: Option<Box<Proxy>>,
+}
+
+#[derive(Deserialize)]
+struct ProjectCompParts<'a> {
+    width: u32,
+    height: u32,
+    pixel_aspect: f64,
+    frame_rate: FrameRate,
+    duration: Tick,
+    display_start: Tick,
+    background: [f32; 3],
+    work_area: (Tick, Tick),
+    #[serde(borrow)]
+    layers: Vec<&'a serde_json::value::RawValue>,
+    #[serde(default)]
+    markers: Vec<super::settings::Marker>,
+    shutter_angle: f64,
+    shutter_phase: f64,
+    motion_blur_samples: u32,
+    #[serde(default = "comp_adaptive_limit_default")]
+    motion_blur_adaptive_limit: u32,
+    #[serde(default)]
+    renderer: super::comp::Renderer,
+    #[serde(default)]
+    hide_shy: bool,
+    #[serde(default = "comp_default_true")]
+    enable_motion_blur: bool,
+    #[serde(default = "comp_default_true")]
+    enable_frame_blending: bool,
+    #[serde(default)]
+    draft_3d: bool,
+    #[serde(default)]
+    preserve_frame_rate: bool,
+    #[serde(default)]
+    preserve_resolution: bool,
+    #[serde(default)]
+    poster_time: Tick,
+    #[serde(default)]
+    global_light: super::styles::GlobalLight,
+    #[serde(default)]
+    guides: Vec<super::comp::Guide>,
+    #[serde(default)]
+    essential: Option<super::essential::EssentialGraphics>,
+    #[serde(default)]
+    resolution: super::comp::Resolution,
+}
+
+impl ProjectCompParts<'_> {
+    fn into_comp(self) -> Result<Comp, serde_json::Error> {
+        let layers = parse_project_layers(self.layers)?;
+        Ok(Comp {
+            width: self.width,
+            height: self.height,
+            pixel_aspect: self.pixel_aspect,
+            frame_rate: self.frame_rate,
+            duration: self.duration,
+            display_start: self.display_start,
+            background: self.background,
+            work_area: self.work_area,
+            layers,
+            markers: self.markers,
+            shutter_angle: self.shutter_angle,
+            shutter_phase: self.shutter_phase,
+            motion_blur_samples: self.motion_blur_samples,
+            motion_blur_adaptive_limit: self.motion_blur_adaptive_limit,
+            renderer: self.renderer,
+            hide_shy: self.hide_shy,
+            enable_motion_blur: self.enable_motion_blur,
+            enable_frame_blending: self.enable_frame_blending,
+            draft_3d: self.draft_3d,
+            preserve_frame_rate: self.preserve_frame_rate,
+            preserve_resolution: self.preserve_resolution,
+            poster_time: self.poster_time,
+            global_light: self.global_light,
+            guides: self.guides,
+            essential: self.essential,
+            resolution: self.resolution,
+        })
+    }
+}
+
+fn comp_adaptive_limit_default() -> u32 {
+    128
+}
+
+fn comp_default_true() -> bool {
+    true
+}
+
+struct ProjectItemKindVisitor;
+
+impl<'de> serde::de::Visitor<'de> for ProjectItemKindVisitor {
+    type Value = ItemKind;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("an EffectCraft project item kind")
+    }
+
+    fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
+    where
+        M: serde::de::MapAccess<'de>,
+    {
+        use serde::de::Error;
+
+        let Some(first_key) = map.next_key::<String>()? else {
+            return Err(M::Error::custom("missing item kind discriminator"));
+        };
+        if first_key != "type" {
+            return Err(M::Error::custom("item kind discriminator is not first"));
+        }
+        let tag = map.next_value::<String>()?;
+        match tag.as_str() {
+            "Folder" => {
+                while map.next_key::<serde::de::IgnoredAny>()?.is_some() {
+                    let _: serde::de::IgnoredAny = map.next_value()?;
+                }
+                Ok(ItemKind::Folder)
+            }
+            "Comp" => {
+                let comp = ProjectCompParts::deserialize(serde::de::value::MapAccessDeserializer::new(map))?;
+                comp.into_comp().map(Arc::new).map(ItemKind::Comp).map_err(M::Error::custom)
+            }
+            "Footage" => Footage::deserialize(serde::de::value::MapAccessDeserializer::new(map)).map(ItemKind::Footage),
+            "Solid" => Solid::deserialize(serde::de::value::MapAccessDeserializer::new(map)).map(ItemKind::Solid),
+            _ => Err(M::Error::unknown_variant(&tag, &["Folder", "Comp", "Footage", "Solid"])),
+        }
+    }
+}
+
+fn parse_project_kind(raw: &serde_json::value::RawValue) -> Result<ItemKind, serde_json::Error> {
+    let fast = (|| {
+        let mut deserializer = serde_json::Deserializer::from_str(raw.get());
+        let kind = serde::Deserializer::deserialize_map(&mut deserializer, ProjectItemKindVisitor)?;
+        deserializer.end().map(|()| kind)
+    })();
+    fast.or_else(|_| serde_json::from_str(raw.get()))
+}
+
+fn parse_project_item(raw: &serde_json::value::RawValue) -> Result<Item, serde_json::Error> {
+    let item: ProjectItemParts<'_> = serde_json::from_str(raw.get())?;
+    Ok(Item {
+        id: item.id,
+        name: item.name,
+        label: item.label,
+        comment: item.comment,
+        parent: item.parent,
+        kind: parse_project_kind(item.kind)?,
+        proxy: item.proxy,
+    })
+}
+
+fn parse_project_layers(layers: Vec<&serde_json::value::RawValue>) -> Result<super::Layers, serde_json::Error> {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        use rayon::prelude::*;
+
+        layers.into_par_iter().map(|raw| serde_json::from_str::<Layer>(raw.get())).collect::<Result<Vec<_>, _>>().map(super::Layers::from)
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        layers.into_iter().map(|raw| serde_json::from_str::<Layer>(raw.get())).collect::<Result<Vec<_>, _>>().map(super::Layers::from)
+    }
+}
 
 fn parse_project_items(items: BTreeMap<ItemId, &serde_json::value::RawValue>) -> Result<BTreeMap<ItemId, Item>, serde_json::Error> {
     #[cfg(not(target_arch = "wasm32"))]
     {
         use rayon::prelude::*;
 
-        items
-            .into_par_iter()
-            .map(|(id, raw)| serde_json::from_str::<Item>(raw.get()).map(|item| (id, item)))
-            .collect()
+        items.into_par_iter().map(|(id, raw)| parse_project_item(raw).map(|item| (id, item))).collect()
     }
     #[cfg(target_arch = "wasm32")]
     {
-        items.into_iter().map(|(id, raw)| serde_json::from_str::<Item>(raw.get()).map(|item| (id, item))).collect()
+        items.into_iter().map(|(id, raw)| parse_project_item(raw).map(|item| (id, item))).collect()
     }
 }
 

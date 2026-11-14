@@ -281,6 +281,18 @@ fn file_open_parses_project_and_metadata_together() {
     assert_eq!(saved_by.as_deref(), Some(crate::APP_VERSION));
 }
 
+#[test]
+fn file_open_does_not_panic_on_a_malformed_layer() {
+    let (p, _) = project_with_layer();
+    let text = p.to_file_json_with_view(&crate::SavedView::default(), false).unwrap();
+    let hostile = text.replacen("\"layers\": [", "\"layers\": [null, ", 1);
+    assert_ne!(hostile, text);
+
+    let result = std::panic::catch_unwind(|| Project::from_file_json_repaired(hostile.as_bytes()));
+    assert!(result.is_ok(), "project parser panicked on a malformed layer");
+    assert!(result.unwrap().is_err());
+}
+
 /// The Project panel's "used N times": layers in every comp that use the item directly, a precomp
 /// counted by the comps it is nested in, and an unused item used by nothing.
 #[test]
