@@ -1567,10 +1567,18 @@ fn bench_gpu(s: &Session, args: &Args) -> Result<(), Failure> {
                 })
                 .count();
             let pct = 100.0 * off as f64 / a.data.len().max(1) as f64;
+            let pixel_hash = |data: &[[f32; 4]]| {
+                data.iter()
+                    .flatten()
+                    .flat_map(|channel| channel.to_bits().to_le_bytes())
+                    .fold(0xcbf29ce484222325, |hash, byte| (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3))
+            };
+            let (cpu_hash, gpu_hash) = (pixel_hash(&a.data), pixel_hash(&b.data));
             let speedup = cpu_warm / gpu_warm.max(1e-9);
             note!(
                 "{name:<28} {label:>5} {size:>10} {cpu_cold:>9.2} {gpu_cold:>9.2} {cpu_warm:>9.2} {gpu_warm:>9.2} {view:>9.2} {speedup:>7.2}x {auto:>9.2} {pct:>8.3}% {traffic:>11}"
             );
+            note!("  output hash: cpu {cpu_hash:016x}; gpu {gpu_hash:016x}; exact pixels match: {}", a.data == b.data);
         }
     }
     Ok(())
