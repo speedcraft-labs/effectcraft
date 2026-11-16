@@ -315,6 +315,7 @@ impl Default for Session {
     /// empty history, events and journal, and a fresh process-wide IME stamp (`u64::MAX` when the
     /// allocator is exhausted).
     fn default() -> Self {
+        effectcraft_render::configure_parallelism();
         let project = Arc::new(Project::default());
         Session {
             saved_project: project.clone(),

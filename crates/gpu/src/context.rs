@@ -28,7 +28,20 @@ const ENTRIES: &[&str] = &[
 /// (building all ~200 up front kept Chrome's GPU process busy past its watchdog, #1590, and
 /// FXC took over a minute, #613), and one that fails to build (a driver's shader compiler
 /// rejecting it) leaves its effects to the CPU instead of turning the whole compositor off.
-const EFFECT_ENTRIES: &[&str] = &["box_h", "box_v", "directional", "glow_bright", "glow_combine", "shadow_make", "shadow_combine", "pointwise"];
+const EFFECT_ENTRIES: &[&str] = &[
+    "box_h",
+    "box_v",
+    "gaussian_sample",
+    "gaussian_sample_exact",
+    "gaussian_forward",
+    "gaussian_backward",
+    "directional",
+    "glow_bright",
+    "glow_combine",
+    "shadow_make",
+    "shadow_combine",
+    "pointwise",
+];
 
 /// Entry points that also bind group 1 (four read-only storage buffers; see
 /// [`Enc::dispatch_ext`]). Like the effect kernels, one that fails to build (FXC on DirectX 12

@@ -32,7 +32,7 @@ fn png(path: &Path, level: u8) -> String {
 /// An image sequence of `n` PNG frames in `dir`.
 fn sequence(dir: &Path, n: usize) -> Footage {
     let files: Vec<String> = (0..n).map(|i| png(&dir.join(format!("seq_{i:04}.png")), 20 + i as u8 * 10)).collect();
-    let mut f = Footage { kind: FootageKind::Sequence, sequence: files.into(), frame_rate: RATE, ..crate::probe(dir.join("seq_0000.png")).unwrap() };
+    let mut f = Footage { kind: FootageKind::Sequence, sequence: files, frame_rate: RATE, ..crate::probe(dir.join("seq_0000.png")).unwrap() };
     f.sync_sequence_duration();
     f
 }
