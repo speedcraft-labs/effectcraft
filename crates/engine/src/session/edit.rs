@@ -199,15 +199,15 @@ impl Session {
         self.replace_project_inner(p, path, true);
     }
 
-    /// Replace a project already repaired by `Project::from_file_json_repaired`.
-    ///
-    /// The file reader has already raised `next_id` above every item, layer and property UID.
-    /// Avoid walking those 5,000-layer property trees a second time during file open.
+    /// Replace a project whose file parser already repaired its identifiers.
     pub(crate) fn replace_repaired_project(&mut self, p: Project, path: Option<String>) {
         self.replace_project_inner(p, path, false);
     }
 
     fn replace_project_inner(&mut self, mut p: Project, path: Option<String>, fix_ids: bool) {
+        // Work still running for the closed project stops reading it (see `project_closed`).
+        self.project_closed.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.project_closed = Arc::default();
         if self.stop_render()
             && let Some(mut job) = self.render_job.take()
         {
@@ -235,13 +235,13 @@ impl Session {
             p.fix_next_id();
         }
         upgrade_effects(&mut p);
-        // The media layer keys decoded frames by path: files of the new project may have changed
-        // since an earlier project decoded them (#1070).
-        for it in p.items.values() {
-            if let effectcraft_project::ItemKind::Footage(f) = &it.kind {
-                self.forget_decoded(f);
-            }
+        // Let go of what the closed project's footage and proxies decoded (frames, decoders,
+        // models), and of what the new project's files decoded under an earlier project: the
+        // media layer keys them by path, and the files may have changed since (#1070).
+        for f in super::render::project_footage(&self.project).chain(super::render::project_footage(&p)) {
+            super::render::forget_files(self.footage.as_ref(), f);
         }
+        self.drop_crypto_probe();
         self.layer_cache.clear();
         self.project = Arc::new(p);
         // The set of footage effects read the channels of is sent again, even when it is empty.
@@ -251,6 +251,9 @@ impl Session {
         self.path = path;
         self.bump();
         self.mark_saved();
+        // The viewers' RAM preview shows the closed project's frames, whose comp ids can collide
+        // with the new project's.
+        self.events.push(Event::PurgeCaches);
         let first = self.project.comps().next().map(|(id, _)| *id);
         if let Some(c) = first {
             self.open_comp(c);
@@ -271,26 +274,13 @@ pub fn upgrade_effects(p: &mut Project) {
     let mut bounds = std::collections::HashMap::new();
     for (cid, c) in p.comps() {
         for l in &c.layers {
-            // Current-schema files only need bounds for layers whose effects are migrated. A
-            // previous schema also needs source bounds for Clone/effect-space coordinate shifts.
-            if to_effect_space || l.effects().is_some_and(|fx| !fx.children.is_empty()) {
-                bounds.insert((*cid, l.id), effectcraft_render::effect_bounds(p, c, l));
-            }
+            bounds.insert((*cid, l.id), effectcraft_render::effect_bounds(p, c, l));
         }
     }
     let mut next = p.next_id;
     for (cid, it) in p.items.iter_mut() {
         let effectcraft_project::ItemKind::Comp(c) = &mut it.kind else { continue };
         for l in &mut std::sync::Arc::make_mut(c).layers {
-            if matches!(&l.source, effectcraft_project::LayerSource::Shape)
-                && let Some(contents) = l.props.sub_mut("contents")
-            {
-                effectcraft_project::build::upgrade_shape_contents(&mut effectcraft_project::build::Ids(&mut next), contents);
-            }
-            let Some(fx) = l.props.sub_mut("effects") else { continue };
-            if fx.children.is_empty() {
-                continue;
-            }
             let (size, origin) = bounds.get(&(*cid, l.id)).copied().unwrap_or(([100.0, 100.0], [0.0; 2]));
             // Effect space starts at the bounds' top-left: positions move by minus that corner.
             // Adjustment layers run their effects on the comp below as it is: nothing moves.
@@ -300,6 +290,10 @@ pub fn upgrade_effects(p: &mut Project) {
                 Some(id) => bounds.get(&(*cid, effectcraft_project::LayerId(id))).map_or([0.0; 2], |b| shift(b.1)),
                 None => d,
             };
+            if let Some(contents) = l.props.sub_mut("contents") {
+                effectcraft_project::build::upgrade_shape_contents(&mut effectcraft_project::build::Ids(&mut next), contents);
+            }
+            let Some(fx) = l.props.sub_mut("effects") else { continue };
             for n in &mut fx.children {
                 let effectcraft_project::Node::Group(g) = n else { continue };
                 let effectcraft_project::GroupKind::Effect { effect } = &g.kind else { continue };

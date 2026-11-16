@@ -5,8 +5,9 @@ use std::process::Command;
 
 use serde_json::Value;
 
-const REV: &str = "e11f9d9aebea5f6b8e74643c1ea1ed172ba5f545";
-const PACKAGES: &[(&str, &str)] = &[("craft-pdf", "0.1.0"), ("hayro-syntax", "0.7.2"), ("hayro-jbig2", "0.3.0")];
+const UPSTREAM_REV: &str = "808730f49b9637b7909fe2ae56f9d63fdb100cae";
+const SPEEDCRAFT_REV: &str = "e6a02334d33acee60909033154a1a43088399ea5";
+const PACKAGES: &[(&str, &str)] = &[("craft-pdf", "0.1.0"), ("craft-ps", "0.1.0"), ("hayro-syntax", "0.7.2"), ("hayro-jbig2", "0.3.0")];
 
 pub fn run(root: &Path) -> Result<(), String> {
     let output = Command::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()))
@@ -26,14 +27,17 @@ pub fn run(root: &Path) -> Result<(), String> {
 fn validate(metadata: &Value) -> Result<(), String> {
     let packages = metadata.get("packages").and_then(Value::as_array).ok_or("cargo metadata has no packages")?;
     let nodes = metadata.pointer("/resolve/nodes").and_then(Value::as_array).ok_or("cargo metadata has no resolved nodes")?;
-    let source = format!("git+https://github.com/storytold/craft-libs?rev={REV}#{REV}");
+    let sources = [
+        format!("git+https://github.com/storytold/craft-libs?rev={UPSTREAM_REV}#{UPSTREAM_REV}"),
+        format!("git+https://github.com/speedcraft-labs/craft-libs?rev={SPEEDCRAFT_REV}#{SPEEDCRAFT_REV}"),
+    ];
     for (name, version) in PACKAGES {
         let matches: Vec<_> = packages.iter().filter(|p| p["name"] == *name).collect();
-        if matches.len() != 1 || matches[0]["version"] != *version || matches[0]["source"] != source {
-            return Err(format!("{name}: expected exactly {version} from {source}"));
+        if matches.len() != 1 || matches[0]["version"] != *version || !sources.iter().any(|source| matches[0]["source"] == *source) {
+            return Err(format!("{name}: expected exactly {version} from one of {}", sources.join(" or ")));
         }
     }
-    for (name, allowed) in [("craft-pdf", "read"), ("hayro-syntax", "std")] {
+    for (name, allowed) in [("craft-pdf", "read"), ("craft-ps", "read"), ("hayro-syntax", "std")] {
         let package = packages.iter().find(|p| p["name"] == name).ok_or_else(|| format!("missing {name}"))?;
         let node = nodes.iter().find(|n| n["id"] == package["id"]).ok_or_else(|| format!("{name}: missing resolved node"))?;
         let features = node["features"].as_array().ok_or_else(|| format!("{name}: missing resolved features"))?;
@@ -58,16 +62,28 @@ mod tests {
 
     fn metadata() -> Value {
         let packages: Vec<_> = PACKAGES.iter().map(|(name, version)| {
-            json!({"id": name, "name": name, "version": version, "source": format!("git+https://github.com/storytold/craft-libs?rev={REV}#{REV}")})
+            json!({"id": name, "name": name, "version": version, "source": format!("git+https://github.com/storytold/craft-libs?rev={UPSTREAM_REV}#{UPSTREAM_REV}")})
         }).collect();
         json!({"packages": packages, "resolve": {"nodes": [
-            {"id": "hayro-syntax", "features": ["std"]}, {"id": "craft-pdf", "features": ["read"]}
+            {"id": "hayro-syntax", "features": ["std"]}, {"id": "craft-pdf", "features": ["read"]},
+            {"id": "craft-ps", "features": ["read"]}
         ]}})
     }
 
     #[test]
     fn accepts_the_pinned_parser_only_graph() {
         assert!(validate(&metadata()).is_ok());
+    }
+
+    #[test]
+    fn accepts_the_current_speedcraft_parser_pin() {
+        let mut m = metadata();
+        if let Some(packages) = m["packages"].as_array_mut() {
+            for package in packages {
+                package["source"] = format!("git+https://github.com/speedcraft-labs/craft-libs?rev={SPEEDCRAFT_REV}#{SPEEDCRAFT_REV}").into();
+            }
+        }
+        assert!(validate(&m).is_ok());
     }
 
     #[test]

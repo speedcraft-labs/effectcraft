@@ -19,10 +19,7 @@ use rayon::prelude::*;
 
 pub use blur::{box_blur, directional_blur, gaussian_blur, gaussian_blur_exact, gaussian_is_exact, radial_blur};
 pub use channels3d::AuxChannels;
-pub use warp::{
-    PreparedWarpRows, Sampling, WarpOpts, accumulate_warp, composite_warp, composite_warp_changed, composite_warp_changed_opaque, composite_warp_quantized,
-    composite_warp_quantized_opaque, composite_warp_reference, prepare_warp_rows, resample,
-};
+pub use warp::{Sampling, WarpOpts, accumulate_warp, composite_warp, composite_warp_changed, composite_warp_reference, resample};
 
 pub type Px = [f32; 4];
 

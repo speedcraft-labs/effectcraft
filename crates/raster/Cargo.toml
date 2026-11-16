@@ -10,8 +10,7 @@ rust-version.workspace = true
 workspace = true
 
 [dependencies]
-craft-resample = { workspace = true }
-craft-blur = { workspace = true }
+craft-exr = { workspace = true }
 effectcraft-geom = { workspace = true }
 effectcraft-color = { workspace = true }
 rayon = { workspace = true }

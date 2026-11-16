@@ -11,7 +11,7 @@ workspace = true
 
 [dependencies]
 craft-blur = { workspace = true }
-craft-resample = { workspace = true }
+craft-cms = { version = "0.1.0", git = "https://github.com/speedcraft-labs/craft-libs", rev = "e6a02334d33acee60909033154a1a43088399ea5" }
 effectcraft-geom = { workspace = true }
 effectcraft-color = { workspace = true }
 effectcraft-keyframe = { workspace = true }
@@ -27,4 +27,3 @@ chrono = { workspace = true }
 
 [dev-dependencies]
 image = { workspace = true, features = ["png"] }
-
