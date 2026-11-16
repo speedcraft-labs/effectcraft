@@ -273,7 +273,7 @@ fn nested_values_are_written_as_fixed_words() {
     let p = std::sync::Arc::make_mut(&mut s.project);
     if let Some(ItemKind::Footage(f)) = p.item_mut(ItemId(1)).map(|i| &mut i.kind) {
         f.kind = FootageKind::Sequence;
-        f.sequence = vec!["a_0001.png".into(), "a_0002.png".into()];
+        f.sequence = vec!["a_0001.png".into(), "a_0002.png".into()].into();
         f.alpha = AlphaMode::Premultiplied;
         f.premul_color = [0.5, 0.25, 1.0];
         f.fields = FieldOrder::UpperFirst;

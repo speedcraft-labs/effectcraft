@@ -309,7 +309,7 @@ fn import_footage(project: &mut Project, cx: &mut Ctx<'_>, item: &AepItem<'_, '_
         has_audio: kind == FootageKind::Audio || (kind == FootageKind::Video && f.audio_sample_rate.is_some()),
         missing: !present,
         placed_page,
-        sequence,
+        sequence: sequence.into(),
         layer: source_layer(&f, &name, &mut cx.col),
         ..Footage::default()
     };
